@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::model::{ConsumerId, Manifest, Proposal, ValidationOutcome};
 
 pub mod cargo;
+pub mod cargo_manifest_editor;
 pub mod github_actions;
 
 /// Identifies an ecosystem by short name. Matches the string stored on
