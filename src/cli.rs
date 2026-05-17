@@ -124,6 +124,14 @@ pub struct AnalyzeArgs {
     /// Git remote to push to when `--apply-pr` is set. Defaults to `origin`.
     #[arg(long, default_value = "origin")]
     pub remote: String,
+
+    /// Project entry point. Accepts a manifest file (e.g. `Cargo.toml`,
+    /// `.github/workflows/ci.yml`) or a directory. With a manifest file,
+    /// the file's repo root is inferred and only the matching ecosystem
+    /// runs. With a directory, every configured ecosystem runs against it.
+    /// Overrides `--repo` and any `--ecosystem` value.
+    #[arg(long, value_name = "PATH")]
+    pub project: Option<PathBuf>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -189,6 +197,13 @@ impl ApplyMode {
 }
 
 fn analyze_command(args: AnalyzeArgs) -> Result<()> {
+    let project_scope = ProjectScope::resolve(&args)?;
+    let mut args = args;
+    // Override --repo / --ecosystem with whatever --project resolved to.
+    args.repo = project_scope.repo_root.clone();
+    if let Some(eco) = project_scope.ecosystem_restriction {
+        args.ecosystem = Some(eco);
+    }
     if !args.repo.is_dir() {
         return Err(Error::RepoNotFound(args.repo));
     }
@@ -1163,6 +1178,87 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
+/// Resolved scope for `--project`. When set, narrows the repo root
+/// AND restricts the run to a single ecosystem (inferred from the
+/// manifest filename).
+#[derive(Debug, Clone)]
+struct ProjectScope {
+    repo_root: PathBuf,
+    ecosystem_restriction: Option<EcosystemSelector>,
+}
+
+impl ProjectScope {
+    fn resolve(args: &AnalyzeArgs) -> Result<Self> {
+        let Some(path) = args.project.as_deref() else {
+            return Ok(ProjectScope {
+                repo_root: args.repo.clone(),
+                ecosystem_restriction: None,
+            });
+        };
+        if !path.exists() {
+            return Err(Error::other(format!(
+                "--project path `{}` does not exist",
+                path.display()
+            )));
+        }
+        if path.is_dir() {
+            return Ok(ProjectScope {
+                repo_root: path.to_path_buf(),
+                ecosystem_restriction: None,
+            });
+        }
+        // path is a file — infer ecosystem and repo root.
+        let (eco, repo_root) = infer_project_scope_from_manifest(path).ok_or_else(|| {
+            Error::other(format!(
+                "--project file `{}` is not a recognized manifest. \
+                 Supported: Cargo.toml (cargo), .github/workflows/*.yml (github-actions).",
+                path.display()
+            ))
+        })?;
+        Ok(ProjectScope {
+            repo_root,
+            ecosystem_restriction: Some(eco),
+        })
+    }
+}
+
+/// Infer (ecosystem, repo_root) from a manifest file path.
+///
+/// Recognized manifests:
+/// - `<root>/Cargo.toml` → cargo, root = parent
+/// - `<root>/.github/workflows/<name>.yml` → github-actions, root = `<root>`
+/// - `<root>/.github/actions/<name>/action.yml` → github-actions, root = `<root>`
+fn infer_project_scope_from_manifest(path: &Path) -> Option<(EcosystemSelector, PathBuf)> {
+    let filename = path.file_name()?.to_str()?;
+    if filename.eq_ignore_ascii_case("Cargo.toml") {
+        let parent = path.parent()?.to_path_buf();
+        return Some((EcosystemSelector::Cargo, parent));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "yml" | "yaml") {
+        // Walk parents to find `.github` then take its parent as repo root.
+        let mut cursor = path.parent();
+        while let Some(dir) = cursor {
+            if dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(".github"))
+            {
+                return Some((
+                    EcosystemSelector::GithubActions,
+                    dir.parent()?.to_path_buf(),
+                ));
+            }
+            cursor = dir.parent();
+        }
+    }
+    None
+}
+
 /// Construct the [`Validator`] for this run.
 ///
 /// `--gate-cmd` / `--gate-file` short-circuit auto-selection by wrapping
@@ -1297,6 +1393,7 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -1364,11 +1461,149 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
         assert!(ecosystem_enabled(&args, &cargo));
         assert!(ecosystem_enabled(&args, &gha));
+    }
+
+    // -------------------------------------------------------------------------
+    // --project flag + ProjectScope::resolve
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_cli_accepts_project_flag() {
+        let cli = parse_cli(["assay", "analyze", "--project", "path/to/Cargo.toml"]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(
+            args.project.as_deref(),
+            Some(std::path::Path::new("path/to/Cargo.toml"))
+        );
+    }
+
+    #[test]
+    fn project_scope_resolves_directory_as_repo_root_without_restriction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            project: Some(tmp.path().to_path_buf()),
+            ..default_test_args()
+        };
+        let scope = ProjectScope::resolve(&args).expect("directory project resolves");
+        assert_eq!(scope.repo_root, tmp.path());
+        assert!(scope.ecosystem_restriction.is_none());
+    }
+
+    #[test]
+    fn project_scope_resolves_cargo_toml_to_cargo_ecosystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            project: Some(manifest.clone()),
+            ..default_test_args()
+        };
+        let scope = ProjectScope::resolve(&args).expect("Cargo.toml resolves");
+        assert_eq!(scope.repo_root, tmp.path());
+        assert_eq!(scope.ecosystem_restriction, Some(EcosystemSelector::Cargo));
+    }
+
+    #[test]
+    fn project_scope_resolves_workflow_yaml_to_github_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workflows = tmp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let workflow = workflows.join("ci.yml");
+        std::fs::write(&workflow, "name: ci\n").unwrap();
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            project: Some(workflow),
+            ..default_test_args()
+        };
+        let scope = ProjectScope::resolve(&args).expect("workflow yaml resolves");
+        assert_eq!(scope.repo_root, tmp.path());
+        assert_eq!(
+            scope.ecosystem_restriction,
+            Some(EcosystemSelector::GithubActions)
+        );
+    }
+
+    #[test]
+    fn project_scope_resolves_composite_action_to_github_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let action_dir = tmp.path().join(".github").join("actions").join("my-action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        let action_file = action_dir.join("action.yml");
+        std::fs::write(
+            &action_file,
+            "runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n",
+        )
+        .unwrap();
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            project: Some(action_file),
+            ..default_test_args()
+        };
+        let scope = ProjectScope::resolve(&args).expect("composite action resolves");
+        assert_eq!(scope.repo_root, tmp.path());
+        assert_eq!(
+            scope.ecosystem_restriction,
+            Some(EcosystemSelector::GithubActions)
+        );
+    }
+
+    #[test]
+    fn project_scope_errors_on_unrecognized_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let weird = tmp.path().join("Makefile");
+        std::fs::write(&weird, "all:\n\techo hi\n").unwrap();
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            project: Some(weird),
+            ..default_test_args()
+        };
+        let err = ProjectScope::resolve(&args).expect_err("unrecognized manifest must fail");
+        assert!(
+            err.to_string().contains("not a recognized manifest"),
+            "error should explain: {err}"
+        );
+    }
+
+    #[test]
+    fn project_scope_errors_when_path_does_not_exist() {
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            project: Some(std::path::PathBuf::from(
+                "/nonexistent/path/zzz/assay/Cargo.toml",
+            )),
+            ..default_test_args()
+        };
+        let err = ProjectScope::resolve(&args).expect_err("missing path must fail");
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    /// Default AnalyzeArgs for tests that only care about a few fields.
+    fn default_test_args() -> AnalyzeArgs {
+        AnalyzeArgs {
+            repo: ".".into(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
+            remote: "origin".into(),
+            project: None,
+        }
     }
 
     #[test]
@@ -1458,6 +1693,7 @@ mod tests {
             gate_cmd: Some("make test".into()),
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
         // The Validator field isn't pub, but `validate` against an empty
@@ -1505,6 +1741,7 @@ mod tests {
             gate_cmd: None,
             gate_file: Some(script),
             remote: "origin".into(),
+            project: None,
         };
         // Just needs to not error during construction.
         build_validator(&args).expect("gate-file should always build");
@@ -1531,6 +1768,7 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -1571,6 +1809,7 @@ mod tests {
             gate_cmd: Some("true".into()),
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -2122,6 +2361,7 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -2146,6 +2386,7 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -2168,6 +2409,7 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -2192,6 +2434,7 @@ mod tests {
             gate_cmd: None,
             gate_file: None,
             remote: "origin".into(),
+            project: None,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
