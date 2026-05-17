@@ -241,7 +241,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             ExecutorChoice::Host => ValidatorExecutor::Host,
             ExecutorChoice::Docker => ValidatorExecutor::Docker,
         };
-        let validator = Validator::new(validator_executor);
+        let validator = Validator::auto(&args.repo, validator_executor)?;
 
         for (eco_idx, proposal) in &all_proposals {
             let ecosystem = registry[*eco_idx].as_ref();

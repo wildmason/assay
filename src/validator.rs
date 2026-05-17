@@ -581,6 +581,48 @@ impl Validator {
         self
     }
 
+    /// Auto-select the right backend for `project_root` (plan §C.4.c
+    /// selection logic).
+    ///
+    /// Picks [`ForgeRunBackend`] when `forge` is on PATH AND the project
+    /// has a `.github/workflows/` directory; otherwise falls back to
+    /// [`BuildTestBackend::infer`]'s manifest-derived commands. Errors if
+    /// neither applies (no `forge` AND no recognized manifest).
+    ///
+    /// CustomBackend (`--gate-cmd` / `--gate-file`) is selected via an
+    /// explicit `Validator::with_backend(...)` in a later commit when that
+    /// CLI surface lands; this method ignores gate overrides.
+    pub fn auto(project_root: &Path, executor: ValidatorExecutor) -> Result<Self> {
+        Self::auto_with(project_root, executor, forge_on_path())
+    }
+
+    /// Pure helper: same as [`Self::auto`] but takes the forge-on-PATH
+    /// signal as an explicit parameter so the selection logic is
+    /// unit-testable without depending on the dev machine's PATH.
+    fn auto_with(
+        project_root: &Path,
+        executor: ValidatorExecutor,
+        forge_present: bool,
+    ) -> Result<Self> {
+        if forge_present && project_root.join(".github").join("workflows").is_dir() {
+            return Ok(Self::with_backend(Box::new(ForgeRunBackend::new(
+                PathBuf::from("forge"),
+                executor,
+            ))));
+        }
+        if let Some(backend) = BuildTestBackend::infer(project_root) {
+            return Ok(Self::with_backend(Box::new(backend)));
+        }
+        Err(Error::other(format!(
+            "no validator backend applicable to `{}`: \
+             `forge` is not on PATH (or no .github/workflows/ present) AND \
+             no recognized build/test manifest (Cargo.toml) was detected. \
+             Install `forge`, ship a manifest the BuildTest backend understands, \
+             or pass an explicit backend (a future commit will expose `--gate-cmd`).",
+            project_root.display(),
+        )))
+    }
+
     /// Validate a proposal by running every workflow in `workflow_paths`
     /// against the working tree at `workspace`. Returns a single
     /// `ValidationOutcome` summarizing the union (any failure → failure).
@@ -684,6 +726,14 @@ fn workflow_log_stem(workflow: &Path) -> String {
     } else {
         raw
     }
+}
+
+/// Detect whether `forge` is on PATH by spawning `forge --version` and
+/// checking that the call succeeded (the binary was found and ran). Any
+/// non-Io error from spawn is treated as "not present" since we can't use
+/// the binary anyway.
+fn forge_on_path() -> bool {
+    Command::new("forge").arg("--version").output().is_ok()
 }
 
 // =============================================================================
@@ -1176,6 +1226,56 @@ mod tests {
                 );
             }
             other => panic!("expected SetupFailure, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Validator::auto backend selection (plan §C.4.c)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn auto_with_picks_forge_run_when_present_and_workflows_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".github").join("workflows")).unwrap();
+        let validator = Validator::auto_with(tmp.path(), ValidatorExecutor::Docker, true)
+            .expect("backend should be selectable");
+        assert_eq!(validator.backend.name(), "forge-run");
+    }
+
+    #[test]
+    fn auto_with_falls_back_to_build_test_when_forge_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let validator = Validator::auto_with(tmp.path(), ValidatorExecutor::Docker, false)
+            .expect("BuildTest fallback should apply");
+        assert_eq!(validator.backend.name(), "build-test-cargo");
+    }
+
+    #[test]
+    fn auto_with_falls_back_to_build_test_when_workflows_dir_missing() {
+        // forge_present=true but no .github/workflows/ — the first branch
+        // fails its second condition, so the BuildTest fallback wins.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let validator = Validator::auto_with(tmp.path(), ValidatorExecutor::Docker, true)
+            .expect("BuildTest fallback should apply when no workflows dir");
+        assert_eq!(validator.backend.name(), "build-test-cargo");
+    }
+
+    #[test]
+    fn auto_with_errors_when_nothing_applicable() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty tempdir: no Cargo.toml, no .github/workflows/, forge missing.
+        let result = Validator::auto_with(tmp.path(), ValidatorExecutor::Docker, false);
+        match result {
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("no validator backend applicable"),
+                    "error should explain the failure: {msg}"
+                );
+            }
+            Ok(_) => panic!("should fail when no backend applies"),
         }
     }
 }
