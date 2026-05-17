@@ -99,14 +99,10 @@ impl DependencyEcosystem for CargoEcosystem {
 
     fn affected_consumers(
         &self,
-        _proposal: &Proposal,
-        _tree: &Path,
+        proposal: &Proposal,
+        tree: &Path,
     ) -> Result<Vec<crate::model::ConsumerId>> {
-        // Stub for Commit F. The real implementation walks `cargo metadata`
-        // to enumerate workspace members consuming the bumped crate and
-        // returns only those member names. Empty `Vec` here means the
-        // Reporter renders a flat (non-workspace) report.
-        Ok(Vec::new())
+        resolve_cargo_consumers(proposal, tree)
     }
 
     fn apply_proposal(&self, _proposal: &Proposal, tree_path: &Path) -> Result<()> {
@@ -560,6 +556,130 @@ fn sanitize_id_segment(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Resolve which workspace members consume the bumped crate. Returns
+/// sorted, deduped names of members that reach a package matching
+/// `proposal.subject` via the cargo dependency graph.
+///
+/// Returns an empty `Vec` when the bumped crate isn't in the dep graph
+/// at all (e.g. the workspace doesn't consume it after all). Failures
+/// (`cargo metadata` errors, missing Cargo.toml) propagate.
+///
+/// This is the Resolver stage from plan §C.3.5: per-proposal
+/// workspace-member dep-graph filtering so the Reporter can produce
+/// per-consumer rows for only members that actually use the bumped
+/// crate. The plan's pipeline runs the Resolver after Applier (so the
+/// post-apply `Cargo.lock` is what's resolved), but for the trait-method
+/// surface we just run against whatever tree is passed in.
+fn resolve_cargo_consumers(
+    proposal: &Proposal,
+    tree: &Path,
+) -> Result<Vec<crate::model::ConsumerId>> {
+    use cargo_metadata::MetadataCommand;
+
+    let manifest_path = tree.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Err(Error::InvalidManifest {
+            path: manifest_path,
+            message: "Cargo.toml not found in tree (cargo metadata cannot resolve)".into(),
+        });
+    }
+
+    let metadata = MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .exec()
+        .map_err(|e| Error::other(format!("cargo metadata failed: {e}")))?;
+
+    Ok(find_workspace_consumers_in_metadata(
+        &metadata,
+        &proposal.subject,
+    ))
+}
+
+/// Pure graph-walk helper: given parsed `cargo metadata` output and a
+/// target crate name, return the names of workspace members that reach
+/// the target through any transitive dependency edge.
+///
+/// Split out from `resolve_cargo_consumers` so the graph-walking logic
+/// can be exercised against real `cargo metadata` output from synthetic
+/// workspace fixtures without intermediating constructors.
+fn find_workspace_consumers_in_metadata(
+    metadata: &cargo_metadata::Metadata,
+    target_name: &str,
+) -> Vec<crate::model::ConsumerId> {
+    use std::collections::{HashMap, HashSet};
+
+    // Collect every PackageId whose name matches the target. Multiple
+    // versions of the same crate produce multiple matching IDs — any one
+    // suffices for reachability.
+    let target_ids: HashSet<&cargo_metadata::PackageId> = metadata
+        .packages
+        .iter()
+        .filter(|p| p.name == target_name)
+        .map(|p| &p.id)
+        .collect();
+
+    if target_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(resolve) = &metadata.resolve else {
+        return Vec::new();
+    };
+
+    // Build adjacency: PackageId -> resolved dep PackageIds.
+    let dep_graph: HashMap<&cargo_metadata::PackageId, &[cargo_metadata::PackageId]> = resolve
+        .nodes
+        .iter()
+        .map(|n| (&n.id, n.dependencies.as_slice()))
+        .collect();
+
+    // For each workspace member, BFS to determine if any target is
+    // reachable. The set of reachable nodes from each member is small in
+    // practice; we don't memoize across members for v1 simplicity.
+    let mut consumers: Vec<crate::model::ConsumerId> = Vec::new();
+    for member_id in &metadata.workspace_members {
+        // A crate doesn't consume itself — if a workspace member IS the
+        // bumped target, skip it. The Reporter renders the bumped crate
+        // as the proposal row; consumers are the OTHER members affected.
+        if target_ids.contains(member_id) {
+            continue;
+        }
+        if can_reach_any(member_id, &target_ids, &dep_graph)
+            && let Some(pkg) = metadata.packages.iter().find(|p| &p.id == member_id)
+        {
+            consumers.push(pkg.name.clone());
+        }
+    }
+    consumers.sort();
+    consumers.dedup();
+    consumers
+}
+
+fn can_reach_any(
+    start: &cargo_metadata::PackageId,
+    targets: &std::collections::HashSet<&cargo_metadata::PackageId>,
+    graph: &std::collections::HashMap<&cargo_metadata::PackageId, &[cargo_metadata::PackageId]>,
+) -> bool {
+    use std::collections::HashSet;
+
+    let mut visited: HashSet<&cargo_metadata::PackageId> = HashSet::new();
+    let mut queue: Vec<&cargo_metadata::PackageId> = vec![start];
+    while let Some(pid) = queue.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if targets.contains(pid) {
+            return true;
+        }
+        if let Some(deps) = graph.get(pid) {
+            for d in deps.iter() {
+                queue.push(d);
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +883,118 @@ mod tests {
         assert_eq!(workflows.len(), 2);
         assert!(workflows.iter().any(|p| p.ends_with("ci.yml")));
         assert!(workflows.iter().any(|p| p.ends_with("release.yaml")));
+    }
+
+    // -------------------------------------------------------------------------
+    // affected_consumers (Resolver — plan §C.3.5)
+    // -------------------------------------------------------------------------
+
+    /// Helper: scaffolds a synthetic Cargo workspace with members named
+    /// `a`, `b`, `c` where the supplied closure decides each member's deps.
+    /// Empty src/lib.rs files keep the manifests valid for `cargo metadata`.
+    fn build_workspace_with(root: &Path, dep_lines: &[(&str, &str)]) {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\", \"c\"]\n",
+        )
+        .unwrap();
+        let mut deps_per_member: BTreeMap<&str, &str> = BTreeMap::new();
+        for (member, dep_line) in dep_lines {
+            deps_per_member.insert(member, dep_line);
+        }
+        for member in ["a", "b", "c"] {
+            let dir = root.join(member);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::create_dir(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+            let deps = deps_per_member.get(member).unwrap_or(&"");
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn proposal_for(subject: &str) -> Proposal {
+        Proposal {
+            id: format!("cargo-{subject}-bump"),
+            ecosystem: EcosystemName::Cargo.as_str().into(),
+            kind: ProposalKind::Version,
+            subject: subject.into(),
+            from: "0.1.0".into(),
+            to: "0.2.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+        }
+    }
+
+    #[test]
+    fn affected_consumers_lists_workspace_members_consuming_target() {
+        // Workspace: a and c depend on b; b stands alone.
+        // affected_consumers(b) should return [a, c] — b is NOT its own
+        // consumer.
+        let tmp = tempfile::tempdir().unwrap();
+        build_workspace_with(
+            tmp.path(),
+            &[
+                ("a", "b = { path = \"../b\" }"),
+                ("c", "b = { path = \"../b\" }"),
+            ],
+        );
+        let eco = CargoEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for("b"), tmp.path())
+            .unwrap();
+        assert_eq!(consumers, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn affected_consumers_returns_empty_when_target_absent_from_workspace() {
+        // No member depends on `nowhere-crate`; no package named that exists
+        // in the workspace. Resolver returns empty.
+        let tmp = tempfile::tempdir().unwrap();
+        build_workspace_with(tmp.path(), &[]);
+        let eco = CargoEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for("nowhere-crate"), tmp.path())
+            .unwrap();
+        assert!(
+            consumers.is_empty(),
+            "non-consumed target should yield empty list: {consumers:?}"
+        );
+    }
+
+    #[test]
+    fn affected_consumers_excludes_self_when_target_is_workspace_member() {
+        // Only `b` itself "consumes" b's identity — but the Resolver should
+        // not list b as a consumer of itself. With no other members
+        // depending on b, the result is empty.
+        let tmp = tempfile::tempdir().unwrap();
+        build_workspace_with(tmp.path(), &[]); // nobody depends on b
+        let eco = CargoEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for("b"), tmp.path())
+            .unwrap();
+        assert!(
+            consumers.is_empty(),
+            "b should not be its own consumer: {consumers:?}"
+        );
+    }
+
+    #[test]
+    fn affected_consumers_rejects_tree_without_cargo_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let eco = CargoEcosystem;
+        let result = eco.affected_consumers(&proposal_for("anything"), tmp.path());
+        match result {
+            Err(Error::InvalidManifest { path, .. }) => {
+                assert!(path.ends_with("Cargo.toml"));
+            }
+            other => panic!("expected InvalidManifest, got {other:?}"),
+        }
     }
 }
