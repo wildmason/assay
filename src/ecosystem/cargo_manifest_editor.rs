@@ -18,6 +18,8 @@
 //! manifest so the caller can navigate to the workspace root and edit
 //! `[workspace.dependencies]` instead.
 
+use std::path::{Path, PathBuf};
+
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::error::{Error, Result};
@@ -239,6 +241,87 @@ fn edit_full_table_entry(
     }))
 }
 
+/// Walk every Cargo.toml in `workspace_root` (the root manifest + each
+/// resolved workspace member, via `cargo metadata --no-deps`) and apply
+/// [`update_constraint`] to each. Files that already carry the dep
+/// have their constraint widened in place; files without it are left
+/// alone.
+///
+/// Returns the **workspace-relative** paths of every Cargo.toml whose
+/// bytes changed, sorted lexicographically so the receipt is
+/// deterministic across runs.
+///
+/// `workspace_root` is the path that contains the top-level Cargo.toml.
+/// This is what the [`crate::cli::ProjectScope::resolve`] flow already
+/// hands the applier — for a Tauri project with `src-tauri/Cargo.toml`
+/// that's `<project>/src-tauri`, NOT the git root.
+pub fn apply_constraint_widening_to_workspace(
+    workspace_root: &Path,
+    crate_name: &str,
+    new_version: &str,
+) -> Result<Vec<PathBuf>> {
+    let manifests = list_workspace_manifests(workspace_root)?;
+    let mut modified: Vec<PathBuf> = Vec::new();
+    for manifest_path in &manifests {
+        let text = std::fs::read_to_string(manifest_path).map_err(|source| Error::Io {
+            path: manifest_path.clone(),
+            source,
+        })?;
+        let Some((new_text, outcome)) = update_constraint(&text, crate_name, new_version)? else {
+            continue;
+        };
+        if !outcome.changed {
+            // Workspace inheritance — this manifest carries no real
+            // constraint to widen. The corresponding edit lives in
+            // [workspace.dependencies] which the walker will find on
+            // a different iteration (the root manifest).
+            continue;
+        }
+        std::fs::write(manifest_path, new_text).map_err(|source| Error::Io {
+            path: manifest_path.clone(),
+            source,
+        })?;
+        let relative = manifest_path
+            .strip_prefix(workspace_root)
+            .unwrap_or(manifest_path)
+            .to_path_buf();
+        modified.push(relative);
+    }
+    modified.sort();
+    Ok(modified)
+}
+
+/// Resolve every Cargo.toml the workspace owns: the root manifest plus
+/// each `cargo metadata` workspace member. Returns absolute paths.
+/// Exposed `pub(crate)` so the copy-back path can mirror exactly the
+/// same manifest set when deciding which Cargo.toml files to ship from
+/// sandbox to host.
+pub(crate) fn list_workspace_manifests(workspace_root: &Path) -> Result<Vec<PathBuf>> {
+    use cargo_metadata::MetadataCommand;
+    let manifest_path = workspace_root.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Err(Error::InvalidManifest {
+            path: manifest_path,
+            message: "Cargo.toml not found in workspace root".into(),
+        });
+    }
+    let metadata = MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .no_deps()
+        .exec()
+        .map_err(|e| Error::other(format!("cargo metadata (for editor walk) failed: {e}")))?;
+    let mut paths: Vec<PathBuf> = vec![manifest_path.clone()];
+    for member_id in &metadata.workspace_members {
+        if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == member_id) {
+            let member_manifest: PathBuf = pkg.manifest_path.clone().into();
+            if !paths.iter().any(|p| p == &member_manifest) {
+                paths.push(member_manifest);
+            }
+        }
+    }
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +490,126 @@ serde = { version = 1 }
 "#;
         let result = update_constraint(toml, "serde", "1.0.0");
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // apply_constraint_widening_to_workspace — multi-manifest walker.
+    //
+    // Uses real `cargo metadata --no-deps` invocations, so these tests
+    // need a synthetic Cargo workspace tree on disk with minimal valid
+    // member crates. The fixtures intentionally mirror the same shape
+    // that the cargo.rs Resolver tests use.
+    // -------------------------------------------------------------------------
+
+    /// Set up a workspace with `members = ["a", "b"]`, each as a tiny
+    /// library crate. `dep_decls` is per-member raw TOML to inject into
+    /// each member's `[dependencies]` section; an empty string means the
+    /// member has no deps. The root manifest is written verbatim from
+    /// `root_toml`.
+    fn build_walker_fixture(root: &Path, root_toml: &str, dep_decls: &[(&str, &str)]) {
+        std::fs::write(root.join("Cargo.toml"), root_toml).unwrap();
+        let mut declared = std::collections::BTreeMap::new();
+        for (member, decl) in dep_decls {
+            declared.insert(*member, *decl);
+        }
+        for member in ["a", "b"] {
+            let dir = root.join(member);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+            let decl = declared.get(member).copied().unwrap_or("");
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{decl}\n"
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn walker_edits_workspace_dependencies_in_root_when_members_inherit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Root declares constraint via [workspace.dependencies]; both
+        // members inherit via `{ workspace = true }`. The walker must
+        // edit the root manifest exactly once and leave member manifests
+        // untouched.
+        let root_toml = "[workspace]\n\
+            resolver = \"2\"\n\
+            members = [\"a\", \"b\"]\n\
+            \n\
+            [workspace.dependencies]\n\
+            serde = \"1.0\"\n";
+        build_walker_fixture(
+            root,
+            root_toml,
+            &[
+                ("a", "serde = { workspace = true }"),
+                ("b", "serde = { workspace = true }"),
+            ],
+        );
+
+        let modified = apply_constraint_widening_to_workspace(root, "serde", "1.5.2").unwrap();
+        assert_eq!(modified, vec![PathBuf::from("Cargo.toml")]);
+        let updated_root = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            updated_root.contains(r#"serde = "1.5.2""#),
+            "root: {updated_root}"
+        );
+        // Members must NOT have been rewritten — verify the inherit shape survives.
+        let a = std::fs::read_to_string(root.join("a/Cargo.toml")).unwrap();
+        assert!(a.contains("serde = { workspace = true }"), "a: {a}");
+    }
+
+    #[test]
+    fn walker_edits_each_member_with_its_own_explicit_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // No [workspace.dependencies] — each member carries its own
+        // explicit constraint. Both must get widened.
+        let root_toml = "[workspace]\n\
+            resolver = \"2\"\n\
+            members = [\"a\", \"b\"]\n";
+        build_walker_fixture(
+            root,
+            root_toml,
+            &[("a", "serde = \"1.0\""), ("b", "serde = \"1.0\"")],
+        );
+
+        let mut modified = apply_constraint_widening_to_workspace(root, "serde", "1.5.2").unwrap();
+        modified.sort();
+        assert_eq!(
+            modified,
+            vec![PathBuf::from("a/Cargo.toml"), PathBuf::from("b/Cargo.toml")],
+        );
+        for member in ["a", "b"] {
+            let text = std::fs::read_to_string(root.join(member).join("Cargo.toml")).unwrap();
+            assert!(
+                text.contains(r#"serde = "1.5.2""#),
+                "member {member}: {text}",
+            );
+        }
+    }
+
+    #[test]
+    fn walker_returns_empty_when_no_manifest_carries_the_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_toml = "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\"]\n";
+        build_walker_fixture(root, root_toml, &[]);
+        let modified = apply_constraint_widening_to_workspace(root, "tokio", "1.42.0").unwrap();
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn walker_errors_when_root_cargo_toml_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = apply_constraint_widening_to_workspace(tmp.path(), "serde", "1.5.2")
+            .expect_err("missing Cargo.toml must surface as error");
+        assert!(
+            matches!(err, Error::InvalidManifest { .. }),
+            "expected InvalidManifest, got {err:?}",
+        );
     }
 }

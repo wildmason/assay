@@ -105,24 +105,12 @@ impl DependencyEcosystem for CargoEcosystem {
         resolve_cargo_consumers(proposal, tree)
     }
 
-    fn apply_proposal(&self, _proposal: &Proposal, tree_path: &Path) -> Result<()> {
-        apply_cargo_update_to_tree(tree_path)
+    fn apply_proposal(&self, proposal: &Proposal, tree_path: &Path) -> Result<()> {
+        apply_cargo_proposal(proposal, tree_path)
     }
 
-    fn copy_back(&self, _proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
-        let sandbox_lock = sandbox.join("Cargo.lock");
-        if !sandbox_lock.is_file() {
-            return Err(Error::other(format!(
-                "Cargo.lock missing from sandbox at `{}`; cannot copy back",
-                sandbox.display()
-            )));
-        }
-        let host_lock = host.join("Cargo.lock");
-        std::fs::copy(&sandbox_lock, &host_lock).map_err(|source| Error::Io {
-            path: host_lock,
-            source,
-        })?;
-        Ok(vec![PathBuf::from("Cargo.lock")])
+    fn copy_back(&self, proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
+        copy_back_cargo_proposal(proposal, sandbox, host)
     }
 
     fn pr_body_fragment(&self, proposal: &Proposal, outcome: &ValidationOutcome) -> String {
@@ -454,6 +442,95 @@ fn cross_check(parsed: &[CargoUpdateLine], diffed: &[CargoUpdateLine]) -> Result
             "stdout vs lockfile disagreement; only-stdout: {only_parsed:?}, only-lockfile: {only_diffed:?}, mismatched-versions: {mismatched:?}"
         ),
     })
+}
+
+/// Apply a Cargo proposal to a working tree. Tier-aware:
+///
+/// - [`BumpTier::LockfileOnly`] runs `cargo update --workspace` in place
+///   (the in-range bump cargo already detected as available).
+/// - [`BumpTier::Compatible`] / [`BumpTier::Breaking`] widen each
+///   workspace Cargo.toml's constraint on the subject crate to the
+///   proposal's `to` version, then run `cargo update --workspace` so
+///   the lockfile picks up the now-permitted version. Aborts loudly
+///   if no manifest in the workspace carries a constraint to widen —
+///   the proposer must not surface bumps the applier can't reach.
+pub fn apply_cargo_proposal(proposal: &Proposal, tree_path: &Path) -> Result<()> {
+    if !matches!(proposal.bump_tier, BumpTier::LockfileOnly) {
+        let modified =
+            crate::ecosystem::cargo_manifest_editor::apply_constraint_widening_to_workspace(
+                tree_path,
+                &proposal.subject,
+                &proposal.to,
+            )?;
+        if modified.is_empty() {
+            return Err(Error::other(format!(
+                "expected to widen the constraint for `{}` in {} workspace but no manifest carried a matching dep entry",
+                proposal.subject,
+                tree_path.display(),
+            )));
+        }
+    }
+    apply_cargo_update_to_tree(tree_path)
+}
+
+/// Copy validated changes from sandbox back to host. Always carries
+/// Cargo.lock; for non-LockfileOnly tiers also ships any Cargo.toml
+/// whose bytes differ between sandbox and host (the constraint widening
+/// done by `apply_cargo_proposal` typically lands in one manifest, but
+/// a workspace with the same dep declared in multiple members may have
+/// touched several).
+pub fn copy_back_cargo_proposal(
+    proposal: &Proposal,
+    sandbox: &Path,
+    host: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut copied: Vec<PathBuf> = Vec::new();
+
+    let sandbox_lock = sandbox.join("Cargo.lock");
+    if !sandbox_lock.is_file() {
+        return Err(Error::other(format!(
+            "Cargo.lock missing from sandbox at `{}`; cannot copy back",
+            sandbox.display()
+        )));
+    }
+    let host_lock = host.join("Cargo.lock");
+    std::fs::copy(&sandbox_lock, &host_lock).map_err(|source| Error::Io {
+        path: host_lock,
+        source,
+    })?;
+    copied.push(PathBuf::from("Cargo.lock"));
+
+    if !matches!(proposal.bump_tier, BumpTier::LockfileOnly) {
+        let manifests = crate::ecosystem::cargo_manifest_editor::list_workspace_manifests(sandbox)?;
+        for sb_manifest in manifests {
+            let rel = sb_manifest
+                .strip_prefix(sandbox)
+                .unwrap_or(&sb_manifest)
+                .to_path_buf();
+            if !sb_manifest.is_file() {
+                continue;
+            }
+            let host_manifest = host.join(&rel);
+            let sb_bytes = std::fs::read(&sb_manifest).map_err(|source| Error::Io {
+                path: sb_manifest.clone(),
+                source,
+            })?;
+            let host_bytes = std::fs::read(&host_manifest).unwrap_or_default();
+            if sb_bytes == host_bytes {
+                continue;
+            }
+            std::fs::copy(&sb_manifest, &host_manifest).map_err(|source| Error::Io {
+                path: host_manifest,
+                source,
+            })?;
+            copied.push(rel);
+        }
+        copied.sort();
+        // Dedup just in case (Cargo.lock first, manifests after).
+        copied.dedup();
+    }
+
+    Ok(copied)
 }
 
 /// Apply cargo bumps to a working tree by running `cargo update --workspace`
