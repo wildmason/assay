@@ -1918,6 +1918,7 @@ mod tests {
                     initial_classification: crate::model::Classification::Exact,
                     manifest_paths: vec![],
                     notes: vec![],
+                    bump_tier: crate::model::BumpTier::LockfileOnly,
                 },
                 tmp.path(),
                 &[],
@@ -2055,6 +2056,7 @@ mod tests {
             initial_classification: crate::model::Classification::Exact,
             manifest_paths: vec![],
             notes: vec![],
+            bump_tier: crate::model::BumpTier::LockfileOnly,
         }
     }
 

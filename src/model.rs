@@ -78,6 +78,43 @@ pub enum ProposalKind {
     ActionPin,
 }
 
+/// Upgrade-impact tier for a version-bump proposal.
+///
+/// Distinct from [`Classification`] (which describes how *closely* the
+/// validator matches the upstream contract). This describes how *invasive*
+/// the bump is to the operator's manifest — and therefore which mode of
+/// auto-apply, if any, is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BumpTier {
+    /// Bump happens entirely within the current constraint. Cargo.lock
+    /// changes; manifest doesn't. `cargo update` is sufficient. This is
+    /// what `cargo update --dry-run` surfaces today, and the only tier
+    /// assay's v1 auto-applies.
+    #[default]
+    LockfileOnly,
+    /// Newest available version is outside the current constraint but
+    /// stays within the current semver-major. Bumping requires a manifest
+    /// edit (e.g. relaxing `=1.40.5` to `^1.40.5`, or widening `~1.40` to
+    /// `^1.40`). Non-breaking by semver contract, but the operator
+    /// explicitly pinned the scope so the edit is reported, not applied.
+    Compatible,
+    /// Newest available version crosses a semver-major boundary
+    /// (`^1.40` → `2.0.0`). Bumping requires a manifest edit AND is
+    /// breaking-by-spec. Reported only — operator handles the upgrade.
+    Breaking,
+}
+
+impl BumpTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BumpTier::LockfileOnly => "lockfile-only",
+            BumpTier::Compatible => "compatible",
+            BumpTier::Breaking => "breaking",
+        }
+    }
+}
+
 /// A concrete dependency update proposed by an ecosystem's Proposer stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
@@ -100,6 +137,11 @@ pub struct Proposal {
     /// Free-form notes for the receipt and PR body.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// How invasive the bump is — drives whether assay auto-applies it.
+    /// `#[serde(default)]` so receipts written before this field existed
+    /// still deserialize cleanly with `LockfileOnly`.
+    #[serde(default)]
+    pub bump_tier: BumpTier,
 }
 
 /// Outcome of validating a proposal by running its affected workflows.
@@ -185,4 +227,45 @@ pub struct ProvenanceRecord {
     /// Optional structured payload for stage-specific details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_without_bump_tier_field_deserializes_as_lockfile_only() {
+        // Receipts written before the BumpTier field existed must still
+        // round-trip — defending the on-disk format compatibility promise.
+        let legacy_json = r#"{
+            "id": "cargo-serde-1-0-215",
+            "ecosystem": "cargo",
+            "kind": "version",
+            "subject": "serde",
+            "from": "1.0.200",
+            "to": "1.0.215",
+            "initial_classification": "exact",
+            "manifest_paths": [],
+            "notes": []
+        }"#;
+        let proposal: Proposal = serde_json::from_str(legacy_json)
+            .expect("legacy receipt without bump_tier should still parse");
+        assert_eq!(proposal.bump_tier, BumpTier::LockfileOnly);
+    }
+
+    #[test]
+    fn bump_tier_serializes_with_kebab_case_strings() {
+        // The .as_str() helper and the serde wire format must agree —
+        // both are read by the reporter, and divergence would silently
+        // break grouping.
+        for (tier, wire) in [
+            (BumpTier::LockfileOnly, "lockfile-only"),
+            (BumpTier::Compatible, "compatible"),
+            (BumpTier::Breaking, "breaking"),
+        ] {
+            assert_eq!(tier.as_str(), wire);
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+        }
+    }
 }

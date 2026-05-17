@@ -776,6 +776,7 @@ jobs:
             initial_classification: crate::model::Classification::Exact,
             manifest_paths: vec![manifest.path.clone()],
             notes: vec!["tag:v4.1.0".into()],
+            bump_tier: crate::model::BumpTier::LockfileOnly,
         };
 
         // 3. Apply.
@@ -823,6 +824,7 @@ jobs:
             initial_classification: crate::model::Classification::Exact,
             manifest_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
             notes: vec![],
+            bump_tier: crate::model::BumpTier::LockfileOnly,
         };
         let eco = GitHubActionsEcosystem;
         let modified = eco
@@ -859,6 +861,7 @@ jobs:
             initial_classification: crate::model::Classification::Exact,
             manifest_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
             notes: vec![],
+            bump_tier: crate::model::BumpTier::LockfileOnly,
         };
         let eco = GitHubActionsEcosystem;
         let err = eco

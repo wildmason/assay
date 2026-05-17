@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Classification, Manifest, ManifestKind, Proposal, ProposalKind, ValidationOutcome,
+    BumpTier, Classification, Manifest, ManifestKind, Proposal, ProposalKind, ValidationOutcome,
 };
 
 use super::{DependencyEcosystem, EcosystemContext, EcosystemName};
@@ -282,6 +282,7 @@ pub fn propose_from_cargo_dry_run(
             initial_classification: Classification::Exact,
             manifest_paths: manifest_paths.to_vec(),
             notes: Vec::new(),
+            bump_tier: BumpTier::LockfileOnly,
         });
     }
     Ok(proposals)
@@ -454,6 +455,7 @@ pub fn propose_from_cargo_stdout(
             initial_classification: Classification::Exact,
             manifest_paths: manifest_paths.to_vec(),
             notes: Vec::new(),
+            bump_tier: BumpTier::LockfileOnly,
         });
     }
     Ok(proposals)
@@ -885,6 +887,7 @@ mod tests {
             initial_classification: crate::model::Classification::Exact,
             manifest_paths: vec![],
             notes: vec![],
+            bump_tier: BumpTier::LockfileOnly,
         }
     }
 
@@ -907,6 +910,7 @@ mod tests {
             initial_classification: Classification::Exact,
             manifest_paths: vec![],
             notes: vec![],
+            bump_tier: BumpTier::LockfileOnly,
         };
         let mut workflows = eco.gate_workflows(&stub_proposal, tmp.path()).unwrap();
         workflows.sort();
@@ -959,6 +963,7 @@ mod tests {
             initial_classification: Classification::Exact,
             manifest_paths: vec![],
             notes: vec![],
+            bump_tier: BumpTier::LockfileOnly,
         }
     }
 

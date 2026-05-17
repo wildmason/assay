@@ -123,6 +123,7 @@ mod tests {
             initial_classification: Classification::Exact,
             manifest_paths: vec![],
             notes: vec![],
+            bump_tier: crate::model::BumpTier::LockfileOnly,
         }
     }
 
