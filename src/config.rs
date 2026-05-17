@@ -70,6 +70,14 @@ pub struct EcosystemEntry {
     /// Only meaningful for the GitHub Actions ecosystem; ignored otherwise.
     #[serde(default)]
     pub allow_major: bool,
+    /// Cap on concurrent WorkUnits processed for this ecosystem. Defaults
+    /// to `1` for Cargo (defends against `.cargo/registry/.package-cache`
+    /// MutateExclusive contention) and `0` (= unlimited, bounded only by
+    /// `--threads`) for GitHub Actions and any future ecosystem without
+    /// a known shared mutable resource. Set to `0` to opt into unlimited
+    /// parallelism; any other value caps the per-ecosystem worker count.
+    #[serde(default)]
+    pub max_parallel: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +205,11 @@ fn default_cargo_ecosystem() -> EcosystemEntry {
         )]),
         grouping: Grouping::AllInOne,
         allow_major: false,
+        // Cargo's `.cargo/registry/.package-cache` is held in
+        // `MutateExclusive` mode during `cargo update`; concurrent
+        // updates serialize anyway and risk lockfile contention. Cap-of-1
+        // is conservative but predictable.
+        max_parallel: 1,
     }
 }
 
@@ -206,6 +219,9 @@ fn default_github_actions_ecosystem() -> EcosystemEntry {
         validate_workflows: WorkflowSelection::default(),
         grouping: Grouping::AllInOne,
         allow_major: false,
+        // GHA bump-application is pure file rewriting — no shared mutable
+        // resource. Bounded only by `--threads`.
+        max_parallel: 0,
     }
 }
 

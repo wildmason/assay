@@ -19,9 +19,11 @@ use crate::publisher::{
 use crate::receipt::write_run_receipt;
 use crate::sanitize::sanitize_commit_subject;
 use crate::validator::{CustomBackend, Validator, ValidatorExecutor};
+use crate::worker_pool::{Semaphore, WorkerContext, WorkerPool};
 use crate::workflow_filter::WorkflowFilter;
 
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Parser)]
 #[command(name = "assay")]
@@ -132,6 +134,18 @@ pub struct AnalyzeArgs {
     /// Overrides `--repo` and any `--ecosystem` value.
     #[arg(long, value_name = "PATH")]
     pub project: Option<PathBuf>,
+
+    /// Worker threads for the per-proposal apply+validate pipeline.
+    /// Defaults to `min(4, available_parallelism())`. Cargo proposals
+    /// stay capped at 1 concurrent worker by default (configurable via
+    /// `.assay.toml [ecosystems.cargo] max_parallel`).
+    #[arg(long, value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Stop dispatching new proposals after the first non-success outcome.
+    /// In-flight proposals run to completion. Default is run-all-and-report.
+    #[arg(long)]
+    pub fail_fast: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -315,97 +329,91 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         let validator =
             build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
 
-        for (eco_idx, proposal) in &all_proposals {
-            let ecosystem = registry[*eco_idx].as_ref();
-            let apply_tree = match prepare_apply_local_tree(&args.repo, &run_id, &proposal.id) {
-                Ok(path) => path,
-                Err(err) => {
-                    provenance.records.push(ProvenanceRecord {
-                        tool: "assay".into(),
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        stage: format!("applier.{}", ecosystem.name()),
-                        subject: proposal.id.clone(),
-                        status: Classification::Unsupported,
-                        summary: format!("apply tree preparation failed: {err}"),
-                        artifact_path: None,
-                        details: None,
-                    });
+        let units: Vec<WorkUnit> = all_proposals
+            .iter()
+            .map(|(eco_idx, proposal)| WorkUnit {
+                eco_idx: *eco_idx,
+                ecosystem_name: registry[*eco_idx].name(),
+                proposal: proposal.clone(),
+            })
+            .collect();
+
+        let pool = WorkerPool {
+            threads: args.threads.unwrap_or_else(WorkerPool::default_threads),
+            fail_fast: args.fail_fast,
+        };
+        // Build semaphores from the v1 defaults (cargo cap=1, others
+        // unbounded). Reading the EcosystemEntry's max_parallel from
+        // .assay.toml is the natural next step but isn't wired yet.
+        let semaphores = vec![("cargo", Arc::new(Semaphore::new(1)))];
+        let git_mutex = Mutex::new(());
+        let ctx = WorkerContext {
+            semaphores,
+            git_mutex: &git_mutex,
+        };
+
+        let validator_ref = &validator;
+        let registry_ref = &registry;
+        let repo_ref = args.repo.as_path();
+        let run_id_ref = run_id.as_str();
+        let outcomes = pool.run(
+            units,
+            ctx,
+            |unit, ctx| {
+                process_proposal_unit(unit, validator_ref, registry_ref, repo_ref, run_id_ref, ctx)
+            },
+            |outcome| {
+                matches!(outcome, WorkerOutcome::PreValidationFailure { .. })
+                    || matches!(outcome, WorkerOutcome::ValidatorErrored { .. })
+                    || matches!(
+                        outcome,
+                        WorkerOutcome::Completed { outcome, .. } if outcome.conclusion != "success"
+                    )
+            },
+            |unit| unit.ecosystem_name,
+        );
+
+        // Drain outcomes back into the existing aggregation shape.
+        for outcome in outcomes {
+            match outcome {
+                WorkerOutcome::PreValidationFailure {
+                    eco_idx: _,
+                    proposal: _,
+                    provenance: pr_records,
+                } => {
+                    provenance.records.extend(pr_records);
                     proposals_failed += 1;
                     pre_validation_failures += 1;
-                    continue;
                 }
-            };
-            if let Err(err) = ecosystem.apply_proposal(proposal, &apply_tree) {
-                provenance.records.push(ProvenanceRecord {
-                    tool: "assay".into(),
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    stage: format!("applier.{}", ecosystem.name()),
-                    subject: proposal.id.clone(),
-                    status: Classification::Unsupported,
-                    summary: format!("apply failed: {err}"),
-                    artifact_path: None,
-                    details: None,
-                });
-                proposals_failed += 1;
-                pre_validation_failures += 1;
-                continue;
-            }
-            provenance.records.push(ProvenanceRecord {
-                tool: "assay".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                stage: format!("applier.{}", ecosystem.name()),
-                subject: proposal.id.clone(),
-                status: Classification::Exact,
-                summary: "applied to sandbox worktree".into(),
-                artifact_path: None,
-                details: Some(serde_json::json!({ "sandbox": apply_tree })),
-            });
-
-            let workflow_paths = ecosystem
-                .gate_workflows(proposal, &apply_tree)
-                .unwrap_or_default();
-            let outcome = match validator.validate(proposal, &apply_tree, &workflow_paths) {
-                Ok(outcome) => outcome,
-                Err(err) => {
+                WorkerOutcome::ValidatorErrored {
+                    eco_idx: _,
+                    proposal: _,
+                    provenance: pr_records,
+                } => {
+                    provenance.records.extend(pr_records);
                     proposals_unvalidated += 1;
-                    provenance.records.push(ProvenanceRecord {
-                        tool: "assay".into(),
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        stage: format!("validator.{}", ecosystem.name()),
-                        subject: proposal.id.clone(),
-                        status: Classification::Stubbed,
-                        summary: format!("validator could not run: {err}"),
-                        artifact_path: None,
-                        details: None,
-                    });
-                    continue;
                 }
-            };
-            match outcome.conclusion.as_str() {
-                "success" => proposals_passed += 1,
-                "unvalidated" => proposals_unvalidated += 1,
-                _ => proposals_failed += 1,
+                WorkerOutcome::Completed {
+                    eco_idx,
+                    proposal,
+                    sandbox,
+                    outcome,
+                    provenance: pr_records,
+                } => {
+                    provenance.records.extend(pr_records);
+                    match outcome.conclusion.as_str() {
+                        "success" => proposals_passed += 1,
+                        "unvalidated" => proposals_unvalidated += 1,
+                        _ => proposals_failed += 1,
+                    }
+                    completed_runs.push(ProposalRun {
+                        eco_idx,
+                        proposal,
+                        sandbox,
+                        outcome,
+                    });
+                }
             }
-            provenance.records.push(ProvenanceRecord {
-                tool: "assay".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                stage: format!("validator.{}", ecosystem.name()),
-                subject: proposal.id.clone(),
-                status: outcome.classification,
-                summary: format!(
-                    "validation {} ({} run(s))",
-                    outcome.conclusion,
-                    outcome.ci_forge_run_ids.len()
-                ),
-                artifact_path: None,
-                details: Some(serde_json::to_value(&outcome).map_err(Error::Json)?),
-            });
-            completed_runs.push(ProposalRun {
-                eco_idx: *eco_idx,
-                proposal: proposal.clone(),
-                sandbox: apply_tree,
-                outcome,
-            });
         }
     } else {
         proposals_unvalidated = all_proposals.len();
@@ -544,6 +552,164 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         println!("assay: receipt written to {}", run_json_path.display());
     }
     Ok(())
+}
+
+/// One unit dispatched to the worker pool — a single (ecosystem, proposal)
+/// pair. Workers pull these and run apply + validate sequentially.
+struct WorkUnit {
+    eco_idx: usize,
+    /// Cached for the worker pool's per-ecosystem semaphore lookup.
+    ecosystem_name: &'static str,
+    proposal: Proposal,
+}
+
+/// What a worker thread produces for one [`WorkUnit`].
+///
+/// `eco_idx` and `proposal` are carried on the failure variants for
+/// future error-reporting that wants to address the failed proposal by
+/// id. The current aggregator only reads them via the structural match
+/// in `analyze_command`, so allow the dead-code lint here.
+#[allow(dead_code)]
+enum WorkerOutcome {
+    /// Apply tree preparation or `apply_proposal` failed before validation
+    /// could run.
+    PreValidationFailure {
+        eco_idx: usize,
+        proposal: Proposal,
+        provenance: Vec<ProvenanceRecord>,
+    },
+    /// Validator couldn't run at all (e.g. forge not on PATH AND no
+    /// recognized manifest).
+    ValidatorErrored {
+        eco_idx: usize,
+        proposal: Proposal,
+        provenance: Vec<ProvenanceRecord>,
+    },
+    /// Pipeline completed with a real validation outcome.
+    Completed {
+        eco_idx: usize,
+        proposal: Proposal,
+        sandbox: PathBuf,
+        outcome: crate::model::ValidationOutcome,
+        provenance: Vec<ProvenanceRecord>,
+    },
+}
+
+/// Worker body: prepare sandbox → apply proposal → gate workflows → validate.
+///
+/// All provenance records produced during this unit live on the
+/// returned `WorkerOutcome` so the main thread can drain them into the
+/// shared `Provenance` without contention.
+fn process_proposal_unit(
+    unit: WorkUnit,
+    validator: &Validator,
+    registry: &[Box<dyn DependencyEcosystem>],
+    repo: &Path,
+    run_id: &str,
+    ctx: &WorkerContext<'_>,
+) -> WorkerOutcome {
+    let mut records: Vec<ProvenanceRecord> = Vec::new();
+    let ecosystem = registry[unit.eco_idx].as_ref();
+
+    // Conc-2: `git worktree add` is serialized across workers to avoid
+    // .git/index.lock races.
+    let apply_tree = {
+        let _git_guard = ctx.git_mutex.lock().unwrap();
+        prepare_apply_local_tree(repo, run_id, &unit.proposal.id)
+    };
+    let apply_tree = match apply_tree {
+        Ok(path) => path,
+        Err(err) => {
+            records.push(ProvenanceRecord {
+                tool: "assay".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                stage: format!("applier.{}", ecosystem.name()),
+                subject: unit.proposal.id.clone(),
+                status: Classification::Unsupported,
+                summary: format!("apply tree preparation failed: {err}"),
+                artifact_path: None,
+                details: None,
+            });
+            return WorkerOutcome::PreValidationFailure {
+                eco_idx: unit.eco_idx,
+                proposal: unit.proposal,
+                provenance: records,
+            };
+        }
+    };
+
+    if let Err(err) = ecosystem.apply_proposal(&unit.proposal, &apply_tree) {
+        records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: format!("applier.{}", ecosystem.name()),
+            subject: unit.proposal.id.clone(),
+            status: Classification::Unsupported,
+            summary: format!("apply failed: {err}"),
+            artifact_path: None,
+            details: None,
+        });
+        return WorkerOutcome::PreValidationFailure {
+            eco_idx: unit.eco_idx,
+            proposal: unit.proposal,
+            provenance: records,
+        };
+    }
+    records.push(ProvenanceRecord {
+        tool: "assay".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        stage: format!("applier.{}", ecosystem.name()),
+        subject: unit.proposal.id.clone(),
+        status: Classification::Exact,
+        summary: "applied to sandbox worktree".into(),
+        artifact_path: None,
+        details: Some(serde_json::json!({ "sandbox": apply_tree })),
+    });
+
+    let workflow_paths = ecosystem
+        .gate_workflows(&unit.proposal, &apply_tree)
+        .unwrap_or_default();
+    let outcome = match validator.validate(&unit.proposal, &apply_tree, &workflow_paths) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            records.push(ProvenanceRecord {
+                tool: "assay".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                stage: format!("validator.{}", ecosystem.name()),
+                subject: unit.proposal.id.clone(),
+                status: Classification::Stubbed,
+                summary: format!("validator could not run: {err}"),
+                artifact_path: None,
+                details: None,
+            });
+            return WorkerOutcome::ValidatorErrored {
+                eco_idx: unit.eco_idx,
+                proposal: unit.proposal,
+                provenance: records,
+            };
+        }
+    };
+    records.push(ProvenanceRecord {
+        tool: "assay".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        stage: format!("validator.{}", ecosystem.name()),
+        subject: unit.proposal.id.clone(),
+        status: outcome.classification,
+        summary: format!(
+            "validation {} ({} run(s))",
+            outcome.conclusion,
+            outcome.ci_forge_run_ids.len()
+        ),
+        artifact_path: None,
+        details: serde_json::to_value(&outcome).ok(),
+    });
+    WorkerOutcome::Completed {
+        eco_idx: unit.eco_idx,
+        proposal: unit.proposal,
+        sandbox: apply_tree,
+        outcome,
+        provenance: records,
+    }
 }
 
 /// One proposal's full lifecycle through the apply-local pipeline:
@@ -1394,6 +1560,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -1462,6 +1630,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -1472,6 +1642,37 @@ mod tests {
     // -------------------------------------------------------------------------
     // --project flag + ProjectScope::resolve
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_cli_accepts_threads_flag() {
+        let cli = parse_cli(["assay", "analyze", "--threads", "8"]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(args.threads, Some(8));
+    }
+
+    #[test]
+    fn parse_cli_defaults_threads_to_none() {
+        let cli = parse_cli(["assay", "analyze"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(
+            args.threads.is_none(),
+            "default --threads should be None so the pool picks the sensible default"
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_fail_fast_flag() {
+        let cli = parse_cli(["assay", "analyze", "--fail-fast"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(args.fail_fast);
+    }
+
+    #[test]
+    fn parse_cli_defaults_fail_fast_off() {
+        let cli = parse_cli(["assay", "analyze"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(!args.fail_fast);
+    }
 
     #[test]
     fn parse_cli_accepts_project_flag() {
@@ -1603,6 +1804,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         }
     }
 
@@ -1694,6 +1897,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
         // The Validator field isn't pub, but `validate` against an empty
@@ -1742,6 +1947,8 @@ mod tests {
             gate_file: Some(script),
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         // Just needs to not error during construction.
         build_validator(&args).expect("gate-file should always build");
@@ -1769,6 +1976,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -1810,6 +2019,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -2362,6 +2573,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -2387,6 +2600,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -2410,6 +2625,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -2435,6 +2652,8 @@ mod tests {
             gate_file: None,
             remote: "origin".into(),
             project: None,
+            threads: None,
+            fail_fast: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
