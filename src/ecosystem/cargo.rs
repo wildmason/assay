@@ -552,12 +552,19 @@ fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposa
         .map(|m| m.path.clone())
         .collect();
 
-    // LockfileOnly tier first (existing path), then the Compatible /
-    // Breaking proposals parsed from the same stdout. Cargo's `Updating`
-    // and `Unchanged` lines are disjoint per run, so no dedup needed.
-    let mut proposals = propose_from_cargo_stdout(&dry_run_output.stdout, &manifest_paths)?;
+    // Cargo emits all human-readable progress (Updating / Unchanged /
+    // Locking lines) to STDERR, with stdout reserved for the JSON
+    // resolver output that `--message-format=json` would produce. We
+    // run without `--message-format=json`, so the text we want is on
+    // stderr. Earlier code paths read stdout alone and quietly returned
+    // zero proposals on real repos; the synthetic test fixtures fed
+    // stdout directly and so never caught the mismatch. Concatenating
+    // both streams here is robust regardless of which cargo version is
+    // installed.
+    let combined = format!("{}\n{}", dry_run_output.stdout, dry_run_output.stderr);
+    let mut proposals = propose_from_cargo_stdout(&combined, &manifest_paths)?;
     proposals.extend(propose_unchanged_from_cargo_stdout(
-        &dry_run_output.stdout,
+        &combined,
         &manifest_paths,
     ));
     Ok(proposals)
