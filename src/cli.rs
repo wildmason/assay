@@ -14,6 +14,7 @@ use crate::model::{
 };
 use crate::receipt::write_run_receipt;
 use crate::validator::{Validator, ValidatorExecutor};
+use crate::workflow_filter::WorkflowFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "assay")]
@@ -76,6 +77,23 @@ pub struct AnalyzeArgs {
     /// Output format for terminal summaries.
     #[arg(long, value_enum, default_value = "text")]
     pub format: OutputFormat,
+
+    /// Workflow path glob to always include, regardless of trigger.
+    /// Repeatable. Match runs against the workflow's basename and its
+    /// repo-relative path (forward-slash normalized).
+    #[arg(long = "include-workflow", value_name = "GLOB")]
+    pub include_workflows: Vec<String>,
+
+    /// Workflow path glob to always exclude. Repeatable. Takes precedence
+    /// over `--include-workflow`.
+    #[arg(long = "exclude-workflow", value_name = "GLOB")]
+    pub exclude_workflows: Vec<String>,
+
+    /// Disable the default pull_request-trigger filter; run every
+    /// workflow returned by the ecosystem. Use for projects whose CI
+    /// suite isn't expressed via pull_request triggers.
+    #[arg(long)]
+    pub no_workflow_filter: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -241,7 +259,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             ExecutorChoice::Host => ValidatorExecutor::Host,
             ExecutorChoice::Docker => ValidatorExecutor::Docker,
         };
-        let validator = Validator::auto(&args.repo, validator_executor)?;
+        let validator = Validator::auto(&args.repo, validator_executor)?
+            .with_workflow_filter(workflow_filter_from_args(&args));
 
         for (eco_idx, proposal) in &all_proposals {
             let ecosystem = registry[*eco_idx].as_ref();
@@ -537,6 +556,24 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
+/// Build the [`WorkflowFilter`] from the parsed CLI args.
+///
+/// Defaults to [`WorkflowFilter::pull_request_default`]; flipped to
+/// [`WorkflowFilter::accept_all`] when `--no-workflow-filter` is set.
+/// Include/exclude globs are layered on top of either base.
+fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
+    let base = if args.no_workflow_filter {
+        WorkflowFilter::accept_all()
+    } else {
+        WorkflowFilter::pull_request_default()
+    };
+    WorkflowFilter {
+        include_globs: args.include_workflows.clone(),
+        exclude_globs: args.exclude_workflows.clone(),
+        ..base
+    }
+}
+
 fn ecosystem_enabled(args: &AnalyzeArgs, ecosystem: &dyn DependencyEcosystem) -> bool {
     let Some(selector) = args.ecosystem else {
         return true;
@@ -622,6 +659,9 @@ mod tests {
             force: true,
             executor: ExecutorChoice::Host,
             format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -683,11 +723,110 @@ mod tests {
             force: false,
             executor: ExecutorChoice::Docker,
             format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
         assert!(ecosystem_enabled(&args, &cargo));
         assert!(ecosystem_enabled(&args, &gha));
+    }
+
+    #[test]
+    fn parse_cli_accepts_repeated_include_workflow_flags() {
+        let cli = parse_cli([
+            "assay",
+            "analyze",
+            "--include-workflow",
+            "deploy.yml",
+            "--include-workflow",
+            "release.yml",
+        ]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(args.include_workflows, vec!["deploy.yml", "release.yml"]);
+    }
+
+    #[test]
+    fn parse_cli_accepts_repeated_exclude_workflow_flags() {
+        let cli = parse_cli([
+            "assay",
+            "analyze",
+            "--exclude-workflow",
+            "smoke-*.yml",
+            "--exclude-workflow",
+            "lint.yml",
+        ]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(args.exclude_workflows, vec!["smoke-*.yml", "lint.yml"]);
+    }
+
+    #[test]
+    fn parse_cli_accepts_no_workflow_filter_flag() {
+        let cli = parse_cli(["assay", "analyze", "--no-workflow-filter"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(args.no_workflow_filter);
+    }
+
+    #[test]
+    fn workflow_filter_from_args_defaults_to_pull_request_only() {
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
+        };
+        let filter = workflow_filter_from_args(&args);
+        assert!(filter.require_pull_request_trigger);
+        assert!(filter.include_globs.is_empty());
+        assert!(filter.exclude_globs.is_empty());
+    }
+
+    #[test]
+    fn workflow_filter_from_args_disables_trigger_check_when_no_workflow_filter_set() {
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: true,
+        };
+        let filter = workflow_filter_from_args(&args);
+        assert!(!filter.require_pull_request_trigger);
+    }
+
+    #[test]
+    fn workflow_filter_from_args_passes_through_include_exclude_globs() {
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: vec!["always.yml".into()],
+            exclude_workflows: vec!["never-*.yml".into()],
+            no_workflow_filter: false,
+        };
+        let filter = workflow_filter_from_args(&args);
+        assert_eq!(filter.include_globs, vec!["always.yml"]);
+        assert_eq!(filter.exclude_globs, vec!["never-*.yml"]);
+        assert!(filter.require_pull_request_trigger);
     }
 
     #[test]
@@ -701,6 +840,9 @@ mod tests {
             force: false,
             executor: ExecutorChoice::Docker,
             format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;

@@ -14,6 +14,7 @@ pub mod receipt;
 pub mod redact;
 pub mod sanitize;
 pub mod validator;
+pub mod workflow_filter;
 
 pub use cli::{AnalyzeArgs, Cli, Command, parse_cli};
 pub use ecosystem::{

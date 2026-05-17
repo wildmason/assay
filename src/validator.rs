@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::model::{Classification, Proposal, ValidationOutcome};
+use crate::workflow_filter::WorkflowFilter;
 
 // =============================================================================
 // Executor and outcome types
@@ -712,6 +713,7 @@ pub const DEFAULT_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub struct Validator {
     backend: Box<dyn ValidatorBackend>,
     workflow_timeout: Duration,
+    workflow_filter: WorkflowFilter,
 }
 
 impl Validator {
@@ -731,6 +733,7 @@ impl Validator {
         Self {
             backend,
             workflow_timeout: DEFAULT_WORKFLOW_TIMEOUT,
+            workflow_filter: WorkflowFilter::pull_request_default(),
         }
     }
 
@@ -738,6 +741,14 @@ impl Validator {
     /// [`DEFAULT_WORKFLOW_TIMEOUT`] = 30 minutes).
     pub fn with_workflow_timeout(mut self, timeout: Duration) -> Self {
         self.workflow_timeout = timeout;
+        self
+    }
+
+    /// Override the workflow filter (default
+    /// [`WorkflowFilter::pull_request_default`] — keeps only workflows
+    /// whose `on:` block declares `pull_request`).
+    pub fn with_workflow_filter(mut self, filter: WorkflowFilter) -> Self {
+        self.workflow_filter = filter;
         self
     }
 
@@ -786,6 +797,10 @@ impl Validator {
     /// Validate a proposal by running every workflow in `workflow_paths`
     /// against the working tree at `workspace`. Returns a single
     /// `ValidationOutcome` summarizing the union (any failure → failure).
+    ///
+    /// The configured [`WorkflowFilter`] runs first; any workflow that
+    /// doesn't satisfy it is dropped and surfaced in the outcome's
+    /// `notes` so the operator can see what was skipped.
     pub fn validate(
         &self,
         proposal: &Proposal,
@@ -806,6 +821,41 @@ impl Validator {
             });
         }
 
+        let filtered = self.workflow_filter.apply(workflow_paths, workspace);
+        if filtered.is_empty() {
+            let dropped: Vec<String> = workflow_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            return Ok(ValidationOutcome {
+                proposal_id: proposal.id.clone(),
+                conclusion: "unvalidated".to_string(),
+                ci_forge_run_ids: Vec::new(),
+                validated_workflows: Vec::new(),
+                classification: Classification::Stubbed,
+                notes: vec![format!(
+                    "every candidate workflow was excluded by the workflow filter \
+                     (default: pull_request triggers only). Excluded: [{}]. \
+                     Pass --include-workflow <glob> or --no-workflow-filter to override.",
+                    dropped.join(", ")
+                )],
+            });
+        }
+        let mut filter_notes = Vec::new();
+        if filtered.len() != workflow_paths.len() {
+            let dropped: Vec<String> = workflow_paths
+                .iter()
+                .filter(|p| !filtered.contains(p))
+                .map(|p| p.display().to_string())
+                .collect();
+            filter_notes.push(format!(
+                "workflow filter excluded {} candidate(s): [{}]",
+                dropped.len(),
+                dropped.join(", ")
+            ));
+        }
+        let workflow_paths = &filtered;
+
         // Per-validator log directory. The receipt-path-aware caller in
         // the new pipeline will instead pass an explicit log directory
         // rooted at `.assay/runs/<id>/logs/<proposal-id>/`; for v1
@@ -820,7 +870,7 @@ impl Validator {
 
         let mut run_ids = Vec::new();
         let mut any_failure = false;
-        let mut notes = Vec::new();
+        let mut notes = filter_notes;
         let mut validated = Vec::new();
 
         for workflow in workflow_paths {
@@ -1527,6 +1577,103 @@ mod tests {
     // -------------------------------------------------------------------------
     // Validator::auto backend selection (plan §C.4.c)
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Validator + WorkflowFilter integration
+    // -------------------------------------------------------------------------
+
+    fn write_workflow(tree: &Path, name: &str, yaml: &str) -> PathBuf {
+        let dir = tree.join(".github").join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), yaml).unwrap();
+        PathBuf::from(".github/workflows").join(name)
+    }
+
+    #[test]
+    fn validate_returns_unvalidated_when_filter_excludes_every_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let push_only = write_workflow(
+            tmp.path(),
+            "deploy.yml",
+            "name: deploy\non: push\njobs: {}\n",
+        );
+        let validator = Validator::with_backend(Box::new(MockBackend {
+            result: WorkflowResult::Pass,
+        }));
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &[push_only])
+            .unwrap();
+        assert_eq!(outcome.conclusion, "unvalidated");
+        assert!(matches!(outcome.classification, Classification::Stubbed));
+        assert!(
+            outcome.validated_workflows.is_empty(),
+            "no workflow should have been run"
+        );
+        assert!(
+            outcome.notes.iter().any(|n| n.contains("excluded by")),
+            "outcome should explain why nothing ran: {:?}",
+            outcome.notes
+        );
+    }
+
+    #[test]
+    fn validate_runs_only_workflows_that_survive_the_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pr_workflow = write_workflow(
+            tmp.path(),
+            "ci.yml",
+            "name: CI\non: pull_request\njobs: {}\n",
+        );
+        let deploy_workflow = write_workflow(
+            tmp.path(),
+            "deploy.yml",
+            "name: deploy\non: push\njobs: {}\n",
+        );
+        let validator = Validator::with_backend(Box::new(MockBackend {
+            result: WorkflowResult::Pass,
+        }));
+        let outcome = validator
+            .validate(
+                &sample_proposal(),
+                tmp.path(),
+                &[pr_workflow.clone(), deploy_workflow],
+            )
+            .unwrap();
+        assert_eq!(outcome.conclusion, "success");
+        assert_eq!(
+            outcome.validated_workflows,
+            vec![pr_workflow],
+            "only the pull_request workflow should have been run"
+        );
+        assert!(
+            outcome.notes.iter().any(|n| n.contains("filter excluded")),
+            "outcome should record what the filter dropped: {:?}",
+            outcome.notes
+        );
+    }
+
+    #[test]
+    fn validate_disables_filter_when_accept_all_supplied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let push_only = write_workflow(
+            tmp.path(),
+            "deploy.yml",
+            "name: deploy\non: push\njobs: {}\n",
+        );
+        let validator = Validator::with_backend(Box::new(MockBackend {
+            result: WorkflowResult::Pass,
+        }))
+        .with_workflow_filter(WorkflowFilter::accept_all());
+        let outcome = validator
+            .validate(
+                &sample_proposal(),
+                tmp.path(),
+                std::slice::from_ref(&push_only),
+            )
+            .unwrap();
+        assert_eq!(outcome.conclusion, "success");
+        assert_eq!(outcome.validated_workflows, vec![push_only]);
+    }
 
     #[test]
     fn auto_with_errors_when_nothing_applicable() {
