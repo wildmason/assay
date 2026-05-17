@@ -1,0 +1,31 @@
+[package]
+name = "assay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wildmason/assay"
+homepage = "https://github.com/wildmason/assay"
+description = "Dependency upgrade impact analyzer — test upgrades against your projects' real CI before you adopt them"
+
+[[bin]]
+name = "assay"
+path = "src/main.rs"
+
+[lib]
+name = "assay"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.20"
