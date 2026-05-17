@@ -60,3 +60,9 @@ impl Error {
         Error::Other(msg.into())
     }
 }
+
+impl From<crate::publisher::BackendError> for Error {
+    fn from(err: crate::publisher::BackendError) -> Self {
+        Error::Other(err.to_string())
+    }
+}

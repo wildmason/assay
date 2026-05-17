@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 pub mod branch_name;
+pub mod gh_cli;
 pub mod git_push;
 pub mod guards;
 pub mod pr_body;

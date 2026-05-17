@@ -12,10 +12,16 @@ use crate::model::{
     AssayRunReceipt, Classification, Manifest, Proposal, Provenance, ProvenanceRecord,
     RepositoryRef, RunSummary,
 };
+use crate::publisher::gh_cli::{GhCliBackend, parse_owner_repo_from_origin};
+use crate::publisher::{
+    PullRequestBackend, PullRequestParams, build_pull_request_request, guards::guard_push_target,
+};
 use crate::receipt::write_run_receipt;
 use crate::sanitize::sanitize_commit_subject;
 use crate::validator::{CustomBackend, Validator, ValidatorExecutor};
 use crate::workflow_filter::WorkflowFilter;
+
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
 #[command(name = "assay")]
@@ -114,6 +120,10 @@ pub struct AnalyzeArgs {
     /// with `--gate-cmd`. When set, `--executor` is silently ignored.
     #[arg(long = "gate-file", value_name = "PATH")]
     pub gate_file: Option<PathBuf>,
+
+    /// Git remote to push to when `--apply-pr` is set. Defaults to `origin`.
+    #[arg(long, default_value = "origin")]
+    pub remote: String,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -198,22 +208,27 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         ));
     }
 
-    // --apply-pr is fully gated until the gh-CLI publisher lands. Surface
-    // the actionable next step before any dirty-tree check so the operator
-    // gets the most useful message.
-    if matches!(mode, ApplyMode::ApplyPr) {
-        return Err(Error::other(
-            "--apply-pr is not yet wired in v1: see docs/assay-plan.md §C.6.b for the planned gh-CLI-backed implementation.",
-        ));
-    }
     // Safety: apply modes refuse on a dirty tree unless --force.
-    if matches!(mode, ApplyMode::ApplyLocal) && !args.force {
+    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr) && !args.force {
         if let Some(dirty_path) = working_tree_dirty_path(&args.repo)? {
+            let mode_label = if matches!(mode, ApplyMode::ApplyLocal) {
+                "--apply-local"
+            } else {
+                "--apply-pr"
+            };
             return Err(Error::other(format!(
-                "refusing to --apply-local against a dirty working tree (uncommitted changes at {dirty_path}). \
+                "refusing to {mode_label} against a dirty working tree (uncommitted changes at {dirty_path}). \
                  Commit or stash, or pass --force to override."
             )));
         }
+    }
+    // Apply-pr preflight: $CI must not be set (we don't open PRs inside CI runs
+    // unless the operator explicitly overrides via --force).
+    if matches!(mode, ApplyMode::ApplyPr) && !args.force && std::env::var("CI").is_ok() {
+        return Err(Error::other(
+            "refusing to --apply-pr while $CI is set; CI runs should consume assay's report, not open PRs. \
+             Pass --force to override.",
+        ));
     }
 
     let registry = default_registry();
@@ -281,7 +296,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut completed_runs: Vec<ProposalRun> = Vec::new();
     let mut pre_validation_failures = 0usize;
 
-    if matches!(mode, ApplyMode::ApplyLocal) && !all_proposals.is_empty() {
+    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr) && !all_proposals.is_empty() {
         let validator =
             build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
 
@@ -382,6 +397,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     }
 
     let mut commit_summary: Option<CommitSummary> = None;
+    let mut pr_summary: Option<ApplyPrSummary> = None;
     if matches!(mode, ApplyMode::ApplyLocal) && !all_proposals.is_empty() {
         commit_summary = Some(perform_apply_local_commit(
             &args.repo,
@@ -389,6 +405,19 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             &mut completed_runs,
             pre_validation_failures,
             &mut provenance,
+        )?);
+    }
+    if matches!(mode, ApplyMode::ApplyPr) && !all_proposals.is_empty() {
+        let backend = GhCliBackend::default();
+        pr_summary = Some(perform_apply_pr(
+            &args.repo,
+            &registry,
+            &mut completed_runs,
+            pre_validation_failures,
+            &mut provenance,
+            &backend,
+            &args.remote,
+            &run_id,
         )?);
     }
 
@@ -468,6 +497,33 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         .join("work")
                         .display()
                 );
+            }
+        }
+        if matches!(mode, ApplyMode::ApplyPr) {
+            println!(
+                "assay: validated {} green / {} red / {} unvalidated",
+                proposals_passed, proposals_failed, proposals_unvalidated,
+            );
+            match &pr_summary {
+                Some(ApplyPrSummary::Published {
+                    url,
+                    branch,
+                    bump_count,
+                }) => {
+                    println!(
+                        "assay: opened PR for {bump_count} bump(s) on branch `{branch}`: {url}"
+                    );
+                }
+                Some(ApplyPrSummary::SkippedDueToFailures { red_count, total }) => {
+                    println!(
+                        "assay: refused to open PR (--apply-pr requires all-green); {} of {} proposal(s) failed validation",
+                        red_count, total,
+                    );
+                }
+                Some(ApplyPrSummary::NothingToPublish) => {
+                    println!("assay: nothing to publish (no green proposals)");
+                }
+                None => {}
             }
         }
         println!("assay: receipt written to {}", run_json_path.display());
@@ -629,6 +685,285 @@ fn perform_apply_local_commit(
         paths: modified_paths,
         subject,
     })
+}
+
+/// Outcome of `--apply-pr` orchestration.
+#[derive(Debug)]
+enum ApplyPrSummary {
+    Published {
+        url: String,
+        branch: String,
+        bump_count: usize,
+    },
+    SkippedDueToFailures {
+        red_count: usize,
+        total: usize,
+    },
+    NothingToPublish,
+}
+
+/// Compute a deterministic branch name covering every green proposal.
+///
+/// Single-bump → `branch_name_for_bump(eco, subject, from, to)`.
+/// Multi-bump → `assay/multi/<N>-<short-hash-of-all-ids>` so the name
+/// remains injective on the set of proposals AND stable across re-runs.
+fn compute_branch_name_for_runs(runs: &[ProposalRun]) -> String {
+    if runs.len() == 1 {
+        let p = &runs[0].proposal;
+        return crate::publisher::branch_name::branch_name_for_bump(
+            &p.ecosystem,
+            &p.subject,
+            &p.from,
+            &p.to,
+        );
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"assay:multi:v1:");
+    for run in runs {
+        hasher.update(run.proposal.id.as_bytes());
+        hasher.update(b"|");
+    }
+    let digest = hasher.finalize();
+    let hex_short: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("assay/multi/{}-{hex_short}", runs.len())
+}
+
+/// Run the post-validation `--apply-pr` flow:
+/// branch → worktree → copy_back → commit → push → open PR.
+#[allow(clippy::too_many_arguments)]
+fn perform_apply_pr(
+    repo: &Path,
+    registry: &[Box<dyn DependencyEcosystem>],
+    completed_runs: &mut [ProposalRun],
+    pre_validation_failures: usize,
+    provenance: &mut Provenance,
+    backend: &dyn PullRequestBackend,
+    remote: &str,
+    run_id: &str,
+) -> Result<ApplyPrSummary> {
+    let red_count = pre_validation_failures
+        + completed_runs
+            .iter()
+            .filter(|r| r.outcome.conclusion != "success")
+            .count();
+    let total = completed_runs.len() + pre_validation_failures;
+    if total == 0 {
+        return Ok(ApplyPrSummary::NothingToPublish);
+    }
+    if red_count > 0 {
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "publisher.apply_pr".into(),
+            subject: "<aggregate>".into(),
+            status: Classification::Unsupported,
+            summary: format!(
+                "refused to open PR: {} of {} proposal(s) didn't validate green",
+                red_count, total
+            ),
+            artifact_path: None,
+            details: None,
+        });
+        return Ok(ApplyPrSummary::SkippedDueToFailures { red_count, total });
+    }
+
+    completed_runs.sort_by(|a, b| a.proposal.id.cmp(&b.proposal.id));
+
+    let (owner, repo_name) = parse_owner_repo_from_origin(repo, remote)
+        .map_err(|err| Error::other(format!("couldn't determine owner/repo: {err}")))?;
+    let branch = compute_branch_name_for_runs(completed_runs);
+    crate::publisher::git_push::validate_branch_name(&branch).map_err(|err| {
+        Error::other(format!(
+            "internal: generated branch name `{branch}` fails validation: {err}"
+        ))
+    })?;
+    crate::publisher::git_push::validate_remote_name(remote).map_err(|err| {
+        Error::other(format!(
+            "--remote `{remote}` fails charset validation: {err}"
+        ))
+    })?;
+
+    // Create a fresh worktree on a new branch from HEAD. The worktree
+    // is where copy-back + commit happen; the host main checkout is
+    // never mutated by --apply-pr.
+    let worktree = repo
+        .join(".assay")
+        .join("runs")
+        .join(run_id)
+        .join("pr-tree");
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "-b"])
+        .arg(&branch)
+        .arg(&worktree)
+        .arg("HEAD")
+        .current_dir(repo)
+        .output()
+        .map_err(|source| Error::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::other(format!(
+            "git worktree add (branch `{branch}`) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    // Copy back into the worktree.
+    let mut modified_paths: Vec<PathBuf> = Vec::new();
+    let mut body_lines: Vec<String> = Vec::new();
+    for run in completed_runs.iter() {
+        let ecosystem = registry[run.eco_idx].as_ref();
+        let modified = ecosystem
+            .copy_back(&run.proposal, &run.sandbox, &worktree)
+            .map_err(|err| {
+                Error::other(format!(
+                    "copy-back failed for proposal `{}`: {err}",
+                    run.proposal.id
+                ))
+            })?;
+        for path in &modified {
+            if !modified_paths.contains(path) {
+                modified_paths.push(path.clone());
+            }
+        }
+        body_lines.push(format!(
+            "- {} {} -> {} ({})",
+            run.proposal.subject,
+            run.proposal.from,
+            run.proposal.to,
+            run.outcome.classification.as_str()
+        ));
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "publisher.apply_pr".into(),
+            subject: run.proposal.id.clone(),
+            status: Classification::Exact,
+            summary: format!("copied back {} path(s)", modified.len()),
+            artifact_path: None,
+            details: None,
+        });
+    }
+
+    if modified_paths.is_empty() {
+        return Ok(ApplyPrSummary::NothingToPublish);
+    }
+
+    let raw_subject = if completed_runs.len() == 1 {
+        let p = &completed_runs[0].proposal;
+        format!(
+            "chore(deps): bump {} from {} to {}",
+            p.subject, p.from, p.to
+        )
+    } else {
+        format!("chore(deps): bump {} dependencies", completed_runs.len())
+    };
+    let subject = sanitize_commit_subject(&raw_subject)
+        .map_err(|err| {
+            Error::other(format!(
+                "internal: generated commit subject failed sanitization: {err}"
+            ))
+        })?
+        .to_string();
+    let body = body_lines.join("\n");
+    git_add_paths(&worktree, &modified_paths)?;
+    git_commit(&worktree, &subject, &body)?;
+
+    // Push the branch.
+    crate::publisher::git_push::push_branch(&worktree, remote, &branch)
+        .map_err(|err| Error::other(format!("git push failed: {err}")))?;
+
+    // After push, fetch branch metadata and run the three-guard check.
+    // Defense in depth: branch namespace is validated upstream, but the
+    // default/protected-branch check needs server-side state.
+    let metadata = backend.fetch_branch_metadata(&owner, &repo_name, &branch)?;
+    guard_push_target(&branch, &metadata).map_err(|err| {
+        Error::other(format!(
+            "post-push guard rejected branch `{branch}`: {err} \
+             (the branch was pushed but the PR was NOT opened; you may want to delete the remote branch)"
+        ))
+    })?;
+
+    // Open the PR. Title overrides build_pull_request_request's default
+    // "Bump <subject>" shape so the multi-bump case reads cleanly.
+    let title = if completed_runs.len() == 1 {
+        format!(
+            "Bump {} from {} to {}",
+            completed_runs[0].proposal.subject,
+            completed_runs[0].proposal.from,
+            completed_runs[0].proposal.to,
+        )
+    } else {
+        format!("Bump {} dependencies via assay", completed_runs.len())
+    };
+    let base = detect_default_branch(repo, remote).unwrap_or_else(|| "main".into());
+    let mut request = build_pull_request_request(PullRequestParams {
+        owner: &owner,
+        repo: &repo_name,
+        branch: &branch,
+        base: &base,
+        subject: &title,
+        body: body.clone(),
+        labels: vec!["assay".into()],
+        reviewers: vec![],
+        draft: false,
+    });
+    request.title = title;
+    let response = backend.open_pull_request(&request).map_err(|err| {
+        Error::other(format!(
+            "the branch was pushed but `gh pr create` failed: {err}. \
+             You can open the PR manually from {}.",
+            request.branch,
+        ))
+    })?;
+
+    provenance.records.push(ProvenanceRecord {
+        tool: "assay".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        stage: "publisher.apply_pr".into(),
+        subject: "<pr>".into(),
+        status: Classification::Exact,
+        summary: response.url.clone(),
+        artifact_path: None,
+        details: Some(serde_json::json!({
+            "branch": branch,
+            "url": response.url,
+            "number": response.number,
+        })),
+    });
+
+    Ok(ApplyPrSummary::Published {
+        url: response.url,
+        branch,
+        bump_count: completed_runs.len(),
+    })
+}
+
+/// Detect the repository's default branch using `git remote show <remote>`.
+/// Falls back to None if anything goes wrong; callers default to "main".
+fn detect_default_branch(repo: &Path, remote: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "show", remote])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix("HEAD branch: ") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
 }
 
 /// Stage exactly the listed paths via `git add`. Refuses paths that
@@ -961,6 +1296,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -1027,6 +1363,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -1120,6 +1457,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: Some("make test".into()),
             gate_file: None,
+            remote: "origin".into(),
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
         // The Validator field isn't pub, but `validate` against an empty
@@ -1166,6 +1504,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: Some(script),
+            remote: "origin".into(),
         };
         // Just needs to not error during construction.
         build_validator(&args).expect("gate-file should always build");
@@ -1191,6 +1530,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -1230,6 +1570,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: Some("true".into()),
             gate_file: None,
+            remote: "origin".into(),
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -1408,6 +1749,275 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // perform_apply_pr — gh-CLI-backed publisher (against mock backend)
+    // -------------------------------------------------------------------------
+
+    struct MockPrBackend {
+        // Records calls so tests can assert on them.
+        opened: std::sync::Mutex<Vec<crate::publisher::PullRequestRequest>>,
+        metadata: crate::publisher::BranchMetadata,
+    }
+
+    impl crate::publisher::PullRequestBackend for MockPrBackend {
+        fn fetch_branch_metadata(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> std::result::Result<crate::publisher::BranchMetadata, crate::publisher::BackendError>
+        {
+            Ok(self.metadata.clone())
+        }
+
+        fn open_pull_request(
+            &self,
+            request: &crate::publisher::PullRequestRequest,
+        ) -> std::result::Result<
+            crate::publisher::PullRequestResponse,
+            crate::publisher::BackendError,
+        > {
+            self.opened.lock().unwrap().push(request.clone());
+            Ok(crate::publisher::PullRequestResponse {
+                url: "https://github.com/assay/test/pull/99".into(),
+                number: 99,
+            })
+        }
+    }
+
+    /// Build a `file:///...` URL that git can push to on Windows + Unix.
+    fn file_url(path: &std::path::Path) -> String {
+        let canon = std::fs::canonicalize(path).unwrap();
+        let s = canon.to_str().unwrap().to_string();
+        if cfg!(windows) {
+            // Strip the verbatim/UNC prefix `\\?\` that canonicalize adds.
+            let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+            let normalized = stripped.replace('\\', "/");
+            format!("file:///{normalized}")
+        } else {
+            format!("file://{s}")
+        }
+    }
+
+    /// Create a bare repo and a working repo with origin pointing at it.
+    /// Returns (working tempdir, bare tempdir, working path, bare path).
+    fn make_local_remote_pair() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let bare = tempfile::tempdir().unwrap();
+        let bare_path = bare.path().to_path_buf();
+        git(&bare_path, ["init", "--bare", "-q", "-b", "main"]);
+
+        let work = tempfile::tempdir().unwrap();
+        let work_path = work.path().to_path_buf();
+        init_git_repo(&work_path);
+        std::fs::write(work_path.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(work_path.join("Cargo.lock"), "version = 3\n").unwrap();
+        git(&work_path, ["add", "Cargo.toml", "Cargo.lock"]);
+        git(&work_path, ["commit", "-m", "init"]);
+        // Rename branch to main for consistency.
+        git(&work_path, ["branch", "-M", "main"]);
+        // Wire origin via a file:// URL so git on Windows doesn't read
+        // the drive letter as an SSH hostname.
+        let url = file_url(&bare_path);
+        git(&work_path, ["remote", "add", "origin", url.as_str()]);
+        (work, bare, work_path, bare_path)
+    }
+
+    #[test]
+    fn perform_apply_pr_pushes_branch_and_opens_pr_when_all_green() {
+        let (_work_tmp, _bare_tmp, repo, _bare) = make_local_remote_pair();
+        // Override remote URL with one parse_owner_repo_from_url can read.
+        // `git remote set-url origin <new>` updates it.
+        git(
+            &repo,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/wildmason/assay-test",
+            ],
+        );
+        // But to actually push, we also need a real fetch URL — set the
+        // pushurl back to the bare repo while keeping the fetch URL as the
+        // GitHub-shape URL.
+        let bare_url = file_url(&_bare);
+        git(
+            &repo,
+            ["remote", "set-url", "--push", "origin", bare_url.as_str()],
+        );
+
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("Cargo.lock"),
+            "version = 3\n[[package]]\nname = \"serde\"\nversion = \"1.0.215\"\n",
+        )
+        .unwrap();
+
+        let registry = crate::ecosystem::default_registry();
+        let mut completed_runs = vec![ProposalRun {
+            eco_idx: 0,
+            proposal: sample_cargo_proposal_for_apply(),
+            sandbox: sandbox.path().to_path_buf(),
+            outcome: sample_outcome("success"),
+        }];
+        let mut provenance = crate::model::Provenance::default();
+        let backend = MockPrBackend {
+            opened: std::sync::Mutex::new(Vec::new()),
+            metadata: crate::publisher::BranchMetadata {
+                name: "assay/cargo/serde-1-0-215-placeholder".into(),
+                is_default: false,
+                is_protected: false,
+            },
+        };
+
+        let summary = perform_apply_pr(
+            &repo,
+            &registry,
+            &mut completed_runs,
+            0,
+            &mut provenance,
+            &backend,
+            "origin",
+            "assay-test-run-pushed",
+        )
+        .expect("apply-pr should succeed");
+
+        match summary {
+            ApplyPrSummary::Published {
+                url,
+                branch,
+                bump_count,
+            } => {
+                assert_eq!(bump_count, 1);
+                assert!(branch.starts_with("assay/cargo/serde-"));
+                assert!(url.contains("/pull/"));
+            }
+            other => panic!("expected Published, got {other:?}"),
+        }
+        let opened = backend.opened.lock().unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].owner, "wildmason");
+        assert_eq!(opened[0].repo, "assay-test");
+        assert!(opened[0].title.contains("serde"));
+    }
+
+    #[test]
+    fn perform_apply_pr_refuses_when_any_proposal_failed() {
+        let (_w, _b, repo, _bp) = make_local_remote_pair();
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(sandbox.path().join("Cargo.lock"), "version = 3\n").unwrap();
+
+        let registry = crate::ecosystem::default_registry();
+        let mut completed_runs = vec![ProposalRun {
+            eco_idx: 0,
+            proposal: sample_cargo_proposal_for_apply(),
+            sandbox: sandbox.path().to_path_buf(),
+            outcome: sample_outcome("failure"),
+        }];
+        let mut provenance = crate::model::Provenance::default();
+        let backend = MockPrBackend {
+            opened: std::sync::Mutex::new(Vec::new()),
+            metadata: crate::publisher::BranchMetadata {
+                name: "x".into(),
+                is_default: false,
+                is_protected: false,
+            },
+        };
+
+        let summary = perform_apply_pr(
+            &repo,
+            &registry,
+            &mut completed_runs,
+            0,
+            &mut provenance,
+            &backend,
+            "origin",
+            "assay-test-run-refused",
+        )
+        .expect("refusal is not an error result");
+
+        match summary {
+            ApplyPrSummary::SkippedDueToFailures { red_count, total } => {
+                assert_eq!(red_count, 1);
+                assert_eq!(total, 1);
+            }
+            other => panic!("expected SkippedDueToFailures, got {other:?}"),
+        }
+        assert!(
+            backend.opened.lock().unwrap().is_empty(),
+            "no PR should have been opened"
+        );
+    }
+
+    #[test]
+    fn perform_apply_pr_refuses_when_metadata_marks_branch_protected() {
+        let (_w, _b, repo, _bp) = make_local_remote_pair();
+        git(
+            &repo,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/wildmason/assay-test",
+            ],
+        );
+        let bare_url = file_url(&_bp);
+        git(
+            &repo,
+            ["remote", "set-url", "--push", "origin", bare_url.as_str()],
+        );
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("Cargo.lock"),
+            "version = 3\n[[package]]\nname = \"serde\"\nversion = \"1.0.215\"\n",
+        )
+        .unwrap();
+
+        let registry = crate::ecosystem::default_registry();
+        let mut completed_runs = vec![ProposalRun {
+            eco_idx: 0,
+            proposal: sample_cargo_proposal_for_apply(),
+            sandbox: sandbox.path().to_path_buf(),
+            outcome: sample_outcome("success"),
+        }];
+        let mut provenance = crate::model::Provenance::default();
+        let backend = MockPrBackend {
+            opened: std::sync::Mutex::new(Vec::new()),
+            // Server-side metadata claims the branch is protected — the
+            // guard must refuse PR creation even though everything else
+            // is green.
+            metadata: crate::publisher::BranchMetadata {
+                name: "<placeholder>".into(),
+                is_default: false,
+                is_protected: true,
+            },
+        };
+
+        let err = perform_apply_pr(
+            &repo,
+            &registry,
+            &mut completed_runs,
+            0,
+            &mut provenance,
+            &backend,
+            "origin",
+            "assay-test-run-protected",
+        )
+        .expect_err("protected branch metadata must reject");
+        assert!(
+            err.to_string().contains("protected"),
+            "error should explain protection: {err}"
+        );
+        assert!(
+            backend.opened.lock().unwrap().is_empty(),
+            "no PR should have been opened after guard refusal"
+        );
+    }
+
     #[test]
     fn perform_apply_local_commit_is_deterministic_across_runs() {
         let setup = || -> (tempfile::TempDir, tempfile::TempDir) {
@@ -1511,6 +2121,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -1534,6 +2145,7 @@ mod tests {
             no_workflow_filter: true,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -1555,6 +2167,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -1578,6 +2191,7 @@ mod tests {
             no_workflow_filter: false,
             gate_cmd: None,
             gate_file: None,
+            remote: "origin".into(),
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
