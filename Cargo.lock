@@ -75,6 +75,7 @@ dependencies = [
  "clap",
  "libc",
  "regex",
+ "semver",
  "serde",
  "serde_json",
  "serde_yml",

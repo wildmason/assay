@@ -148,6 +148,27 @@ pub struct CargoUpdateLine {
     pub to: String,
 }
 
+/// Parser for `cargo update --dry-run --verbose` stdout's `Unchanged X vOLD
+/// (available: vNEW[, requires Rust X.Y.Z])` lines.
+///
+/// These lines surface the gap between *what cargo bumped* (in-range,
+/// lockfile-only) and *what's actually published* (constraint or MSRV
+/// blocked). They are the input to the `Compatible` / `Breaking` proposal
+/// tiers — assay reports them but doesn't auto-apply since bumping
+/// requires editing the manifest's constraint, not just the lockfile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoUnchangedLine {
+    pub crate_name: String,
+    /// Version currently resolved in the lockfile.
+    pub from: String,
+    /// Highest version cargo could see in the registry.
+    pub to: String,
+    /// `Some("X.Y.Z")` when cargo flagged the target as MSRV-blocked.
+    /// Not a hard veto — assay still proposes the bump but attaches the
+    /// note so the operator knows an MSRV change is part of the cost.
+    pub requires_rust: Option<String>,
+}
+
 /// Parses cargo update stdout. Recognized line shapes (cargo 1.85+):
 ///
 /// ```text
@@ -196,6 +217,105 @@ pub fn parse_cargo_update_output(stdout: &str) -> Vec<CargoUpdateLine> {
         });
     }
     out
+}
+
+/// Parses `Unchanged X vOLD (available: vNEW[, requires Rust X.Y.Z])`
+/// lines emitted by `cargo update --dry-run --verbose`. Lines without
+/// the `(available: vNEW...)` clause (e.g. `Unchanged X vOLD (requires
+/// Rust X.Y.Z)`) are silently skipped — they mean cargo *would* bump
+/// but the published version itself is MSRV-blocked, not actionable as
+/// a bump proposal.
+pub fn parse_cargo_unchanged_output(stdout: &str) -> Vec<CargoUnchangedLine> {
+    let mut out = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim_start();
+        let rest = match line.strip_prefix("Unchanged ") {
+            Some(rest) => rest,
+            None => continue,
+        };
+        // "<crate> v<from> (<parens>)" — the version prefix is what
+        // separates crate name from the rest.
+        let Some((crate_part, version_part)) = rest.split_once(" v") else {
+            continue;
+        };
+        let crate_name = crate_part.trim().to_string();
+        if crate_name.is_empty() {
+            continue;
+        }
+        // From-version followed by " (...)". When the parenthetical is
+        // missing the line carries no actionable bump.
+        let Some((from_part, paren_part)) = version_part.split_once(" (") else {
+            continue;
+        };
+        let from = from_part.trim().to_string();
+        if from.is_empty() {
+            continue;
+        }
+        let Some(inner) = paren_part.strip_suffix(')') else {
+            continue;
+        };
+        let Some(after_avail) = inner.strip_prefix("available: v") else {
+            // Parenthetical is something else ("requires Rust X.Y.Z" alone,
+            // or some future variant). No actionable target version.
+            continue;
+        };
+        // Optional "<vNEW>, requires Rust X.Y.Z" suffix split.
+        let (to_str, requires_rust) = match after_avail.split_once(", requires Rust ") {
+            Some((to, rust)) => (to.trim(), Some(rust.trim().to_string())),
+            None => (after_avail.trim(), None),
+        };
+        let to = to_str.to_string();
+        if to.is_empty() {
+            continue;
+        }
+        out.push(CargoUnchangedLine {
+            crate_name,
+            from,
+            to,
+            requires_rust,
+        });
+    }
+    out
+}
+
+/// Classify an `Unchanged X vFROM (available: vTO)` bump by impact tier,
+/// using Cargo's compatibility groups (which are subtler than plain semver).
+///
+/// Compatibility groups per the [Cargo reference][1]:
+/// - `major >= 1`: compatible within the same major (`^1.x.y`).
+/// - `0.y.z` (minor >= 1): compatible within the same minor (`^0.y.z`).
+/// - `0.0.z`: every patch is its own group — *no* `to` other than the same
+///   `from` is compatible.
+///
+/// Returns [`BumpTier::Compatible`] when `from` and `to` live in the same
+/// group (i.e. only a manifest-constraint pin keeps cargo from bumping
+/// — non-breaking by Cargo's contract), [`BumpTier::Breaking`] otherwise.
+/// Defensively returns `Breaking` for unparseable versions so the operator
+/// gets a chance to look rather than silently skipping the upgrade.
+///
+/// [1]: https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#caret-requirements
+pub fn classify_unchanged_bump(from: &str, to: &str) -> BumpTier {
+    let Ok(from_v) = semver::Version::parse(from) else {
+        return BumpTier::Breaking;
+    };
+    let Ok(to_v) = semver::Version::parse(to) else {
+        return BumpTier::Breaking;
+    };
+    if compat_group(&from_v) == compat_group(&to_v) {
+        BumpTier::Compatible
+    } else {
+        BumpTier::Breaking
+    }
+}
+
+/// Cargo's caret-compatibility group key. Two versions are caret-compatible
+/// iff their group keys are equal. See [`classify_unchanged_bump`].
+fn compat_group(v: &semver::Version) -> (u64, u64, u64) {
+    match (v.major, v.minor) {
+        (0, 0) => (0, 0, v.patch),
+        (0, _) => (0, v.minor, 0),
+        _ => (v.major, 0, 0),
+    }
 }
 
 /// Diff two `Cargo.lock` contents (TOML) into a list of version changes.
@@ -653,6 +773,175 @@ mod tests {
         assert_eq!(parsed[1].crate_name, "tokio");
         assert_eq!(parsed[1].from, "1.40.0");
         assert_eq!(parsed[1].to, "1.42.1");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_cargo_unchanged_output — the constraint-pinned tier feed.
+    //
+    // Real output captured from `cargo update --dry-run --workspace --verbose`
+    // against this repo on 2026-05-17 — covers the three actionable shapes
+    // (plain available, available + MSRV note, no available clause) plus
+    // build-metadata-suffixed versions (toml's `1.1.2+spec-1.1.0`).
+    // -------------------------------------------------------------------------
+
+    const SAMPLE_UNCHANGED_STDOUT: &str = "\
+     Locking 0 packages to latest Rust 1.85 compatible versions
+   Unchanged cargo_metadata v0.18.1 (available: v0.20.0)
+   Unchanged sha2 v0.10.9 (available: v0.11.0)
+   Unchanged toml v0.8.23 (available: v1.1.2+spec-1.1.0)
+   Unchanged wasip2 v1.0.1+wasi-0.2.4 (available: v1.0.3+wasi-0.2.9, requires Rust 1.87.0)
+   Unchanged wasip3 v0.4.0+wasi-0.3.0-rc-2026-01-06 (requires Rust 1.87.0)
+warning: not updating lockfile due to dry run
+";
+
+    #[test]
+    fn parse_unchanged_picks_lines_with_available_clause() {
+        let parsed = parse_cargo_unchanged_output(SAMPLE_UNCHANGED_STDOUT);
+        // wasip3 has no "available: v..." → skipped. 4 actionable lines.
+        assert_eq!(parsed.len(), 4, "got: {parsed:?}");
+        assert_eq!(parsed[0].crate_name, "cargo_metadata");
+        assert_eq!(parsed[0].from, "0.18.1");
+        assert_eq!(parsed[0].to, "0.20.0");
+        assert!(parsed[0].requires_rust.is_none());
+    }
+
+    #[test]
+    fn parse_unchanged_preserves_build_metadata_in_target() {
+        let parsed = parse_cargo_unchanged_output(SAMPLE_UNCHANGED_STDOUT);
+        let toml = parsed.iter().find(|l| l.crate_name == "toml").unwrap();
+        assert_eq!(toml.from, "0.8.23");
+        // Build metadata (after `+`) round-trips into the proposal target.
+        assert_eq!(toml.to, "1.1.2+spec-1.1.0");
+    }
+
+    #[test]
+    fn parse_unchanged_splits_msrv_suffix_from_target() {
+        let parsed = parse_cargo_unchanged_output(SAMPLE_UNCHANGED_STDOUT);
+        let wasip2 = parsed.iter().find(|l| l.crate_name == "wasip2").unwrap();
+        assert_eq!(wasip2.from, "1.0.1+wasi-0.2.4");
+        // MSRV note must NOT leak into the version string.
+        assert_eq!(wasip2.to, "1.0.3+wasi-0.2.9");
+        assert_eq!(wasip2.requires_rust.as_deref(), Some("1.87.0"));
+    }
+
+    #[test]
+    fn parse_unchanged_skips_lines_without_available_clause() {
+        // "Unchanged X vOLD (requires Rust X.Y.Z)" — published version is
+        // MSRV-blocked but cargo offers no different target. Nothing to
+        // propose. The full sample contains a wasip3 line of this shape.
+        let parsed = parse_cargo_unchanged_output(SAMPLE_UNCHANGED_STDOUT);
+        assert!(!parsed.iter().any(|l| l.crate_name == "wasip3"));
+    }
+
+    #[test]
+    fn parse_unchanged_ignores_updating_and_other_lines() {
+        // A run with both `Updating` and `Unchanged` lines — each parser
+        // must yield only its own shape. Verifies they don't poach.
+        let stdout = "\
+   Updating serde v1.0.200 -> v1.0.215
+   Unchanged tokio v1.40.0 (available: v1.42.1)
+warning: not updating lockfile due to dry run
+";
+        let unchanged = parse_cargo_unchanged_output(stdout);
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0].crate_name, "tokio");
+        let updates = parse_cargo_update_output(stdout);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].crate_name, "serde");
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_unchanged_bump — Cargo caret-compat groups.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn classify_within_major_one_or_higher_is_compatible() {
+        // 1.x.y / 1.x.y' — same major, any minor/patch difference is in-range.
+        assert_eq!(
+            classify_unchanged_bump("1.0.0", "1.5.0"),
+            BumpTier::Compatible
+        );
+        assert_eq!(
+            classify_unchanged_bump("1.40.0", "1.45.2"),
+            BumpTier::Compatible
+        );
+        assert_eq!(
+            classify_unchanged_bump("2.0.0", "2.0.1"),
+            BumpTier::Compatible
+        );
+    }
+
+    #[test]
+    fn classify_cross_major_is_breaking() {
+        assert_eq!(
+            classify_unchanged_bump("1.0.0", "2.0.0"),
+            BumpTier::Breaking
+        );
+        assert_eq!(
+            classify_unchanged_bump("0.8.23", "1.1.2"),
+            BumpTier::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_zero_dot_x_groups_by_minor() {
+        // 0.18.x and 0.18.y are caret-compatible; 0.18.x and 0.20.y are not.
+        assert_eq!(
+            classify_unchanged_bump("0.18.1", "0.18.7"),
+            BumpTier::Compatible
+        );
+        assert_eq!(
+            classify_unchanged_bump("0.18.1", "0.20.0"),
+            BumpTier::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_zero_zero_x_treats_every_patch_as_breaking() {
+        // Per Cargo's caret rules, every 0.0.x is its own compat group.
+        assert_eq!(
+            classify_unchanged_bump("0.0.5", "0.0.10"),
+            BumpTier::Breaking
+        );
+        assert_eq!(
+            classify_unchanged_bump("0.0.1", "0.0.2"),
+            BumpTier::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_handles_build_metadata_suffix() {
+        // Build metadata (after `+`) is informational per semver and must
+        // not affect the compat-group determination.
+        assert_eq!(
+            classify_unchanged_bump("1.0.1+wasi-0.2.4", "1.0.3+wasi-0.2.9"),
+            BumpTier::Compatible
+        );
+    }
+
+    #[test]
+    fn classify_unparseable_input_defaults_to_breaking() {
+        // Defensive — when cargo emits something we can't parse, surface
+        // it to the operator (loud) rather than silently treating as
+        // compatible. The operator can decide whether to act.
+        assert_eq!(
+            classify_unchanged_bump("not-a-version", "1.0.0"),
+            BumpTier::Breaking
+        );
+        assert_eq!(
+            classify_unchanged_bump("1.0.0", "also-bogus"),
+            BumpTier::Breaking
+        );
+    }
+
+    #[test]
+    fn parse_unchanged_returns_empty_for_no_verbose_output() {
+        // The non-verbose `cargo update --dry-run` output contains a
+        // `note:` line about hidden deps but no `Unchanged` lines. Must
+        // parse cleanly to an empty list, not crash on the suggestion.
+        let stdout = "     Locking 0 packages to latest Rust 1.93.1 compatible versions\nnote: pass `--verbose` to see 110 unchanged dependencies behind latest\n";
+        let parsed = parse_cargo_unchanged_output(stdout);
+        assert!(parsed.is_empty());
     }
 
     #[test]
