@@ -43,6 +43,10 @@ pub enum ManifestKind {
     CargoLock,
     WorkflowYaml,
     CompositeActionYaml,
+    /// `package.json` — npm / pnpm / yarn root or workspace member.
+    PackageJson,
+    /// Any of `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`.
+    NpmLockfile,
 }
 
 /// A dependency manifest discovered by the Scanner. Each ecosystem returns

@@ -12,6 +12,7 @@ use crate::model::{ConsumerId, Manifest, Proposal, ValidationOutcome};
 pub mod cargo;
 pub mod cargo_manifest_editor;
 pub mod github_actions;
+pub mod npm;
 
 /// Identifies an ecosystem by short name. Matches the string stored on
 /// `Proposal.ecosystem` so the receipt index can group by it.
@@ -19,6 +20,7 @@ pub mod github_actions;
 pub enum EcosystemName {
     Cargo,
     GitHubActions,
+    Npm,
 }
 
 impl EcosystemName {
@@ -26,6 +28,7 @@ impl EcosystemName {
         match self {
             EcosystemName::Cargo => "cargo",
             EcosystemName::GitHubActions => "github-actions",
+            EcosystemName::Npm => "npm",
         }
     }
 }
@@ -123,5 +126,6 @@ pub fn default_registry() -> Vec<Box<dyn DependencyEcosystem>> {
     vec![
         Box::new(cargo::CargoEcosystem),
         Box::new(github_actions::GitHubActionsEcosystem),
+        Box::new(npm::NpmEcosystem),
     ]
 }

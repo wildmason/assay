@@ -152,6 +152,7 @@ pub struct AnalyzeArgs {
 pub enum EcosystemSelector {
     Cargo,
     GithubActions,
+    Npm,
     All,
 }
 
@@ -1486,6 +1487,10 @@ fn infer_project_scope_from_manifest(path: &Path) -> Option<(EcosystemSelector, 
         let parent = path.parent()?.to_path_buf();
         return Some((EcosystemSelector::Cargo, parent));
     }
+    if filename.eq_ignore_ascii_case("package.json") {
+        let parent = path.parent()?.to_path_buf();
+        return Some((EcosystemSelector::Npm, parent));
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -1563,6 +1568,7 @@ fn ecosystem_enabled(args: &AnalyzeArgs, ecosystem: &dyn DependencyEcosystem) ->
         (EcosystemSelector::All, _)
             | (EcosystemSelector::Cargo, "cargo")
             | (EcosystemSelector::GithubActions, "github-actions")
+            | (EcosystemSelector::Npm, "npm")
     )
 }
 

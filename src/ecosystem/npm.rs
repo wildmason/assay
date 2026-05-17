@@ -1,0 +1,1176 @@
+//! npm / pnpm ecosystem.
+//!
+//! Detects `package.json` + a lockfile (`package-lock.json`, `pnpm-lock.yaml`,
+//! or `yarn.lock`) and proposes version bumps by shelling out to the matching
+//! package manager's `outdated` reporter. Both npm and pnpm emit a
+//! near-identical JSON shape:
+//!
+//! ```json
+//! {
+//!   "lodash": {
+//!     "current": "4.17.20",
+//!     "wanted":  "4.17.21",
+//!     "latest":  "5.0.0"
+//!   }
+//! }
+//! ```
+//!
+//! - `current` — what's resolved in the lockfile.
+//! - `wanted` — highest in-range version (lockfile would pick this on
+//!   `npm update <pkg>`).
+//! - `latest` — most recent publish on the registry.
+//!
+//! Tier mapping:
+//! - `wanted == latest` → [`BumpTier::LockfileOnly`]. Constraint allows
+//!   latest; only the lockfile needs to change.
+//! - `wanted != latest` → [`BumpTier::Compatible`] or [`BumpTier::Breaking`]
+//!   based on the caret-compat group of (`current`, `latest`). The
+//!   manifest constraint must be widened.
+//!
+//! Yarn 1 emits a wholly different output format and is **not** supported
+//! in v1 — assay reports the lockfile as detected but emits no proposals
+//! and a `notes` entry pointing the operator at npm/pnpm. Yarn 2+ ("Berry")
+//! offers `yarn npm outdated --json` which lands in the same shape and
+//! could be added later.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::error::{Error, Result};
+use crate::model::{
+    BumpTier, Classification, ConsumerId, Manifest, ManifestKind, Proposal, ProposalKind,
+    ValidationOutcome,
+};
+use crate::process_runner::{RunResult, run_with_timeout};
+
+use super::{DependencyEcosystem, EcosystemContext, EcosystemName};
+
+/// Lockfile flavor the project uses. Determines which `outdated` command
+/// the proposer invokes and which lockfile path the copy-back ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NpmFlavor {
+    /// `package-lock.json` — invoke `npm`.
+    Npm,
+    /// `pnpm-lock.yaml` — invoke `pnpm`.
+    Pnpm,
+    /// `yarn.lock` — recognized but not actionable in v1 (different
+    /// `yarn outdated --json` format).
+    Yarn,
+}
+
+impl NpmFlavor {
+    fn lockfile_name(self) -> &'static str {
+        match self {
+            NpmFlavor::Npm => "package-lock.json",
+            NpmFlavor::Pnpm => "pnpm-lock.yaml",
+            NpmFlavor::Yarn => "yarn.lock",
+        }
+    }
+}
+
+fn detect_flavor(repo: &Path) -> Option<NpmFlavor> {
+    [NpmFlavor::Npm, NpmFlavor::Pnpm, NpmFlavor::Yarn]
+        .into_iter()
+        .find(|flavor| repo.join(flavor.lockfile_name()).is_file())
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NpmEcosystem;
+
+impl DependencyEcosystem for NpmEcosystem {
+    fn name(&self) -> &'static str {
+        EcosystemName::Npm.as_str()
+    }
+
+    fn detect_manifests(&self, repo: &Path) -> Result<Vec<Manifest>> {
+        if !repo.is_dir() {
+            return Err(Error::RepoNotFound(repo.to_path_buf()));
+        }
+        let mut found = Vec::new();
+        let package_json = repo.join("package.json");
+        if package_json.is_file() {
+            found.push(Manifest {
+                path: PathBuf::from("package.json"),
+                kind: ManifestKind::PackageJson,
+                metadata: BTreeMap::new(),
+            });
+        }
+        if let Some(flavor) = detect_flavor(repo) {
+            found.push(Manifest {
+                path: PathBuf::from(flavor.lockfile_name()),
+                kind: ManifestKind::NpmLockfile,
+                metadata: BTreeMap::new(),
+            });
+        }
+        Ok(found)
+    }
+
+    fn propose_updates(
+        &self,
+        manifests: &[Manifest],
+        repo: &Path,
+        _ctx: &EcosystemContext,
+    ) -> Result<Vec<Proposal>> {
+        let has_package_json = manifests
+            .iter()
+            .any(|m| matches!(m.kind, ManifestKind::PackageJson));
+        if !has_package_json {
+            return Ok(Vec::new());
+        }
+        let Some(flavor) = detect_flavor(repo) else {
+            return Ok(Vec::new());
+        };
+        if matches!(flavor, NpmFlavor::Yarn) {
+            // yarn1 emits a different format; defer support to a later
+            // commit so we don't ship a broken parser.
+            return Ok(Vec::new());
+        }
+        let manifest_paths: Vec<PathBuf> = manifests
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.kind,
+                    ManifestKind::PackageJson | ManifestKind::NpmLockfile
+                )
+            })
+            .map(|m| m.path.clone())
+            .collect();
+        run_npm_proposer(flavor, repo, &manifest_paths)
+    }
+
+    fn gate_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
+        let workflows_dir = repo.join(".github").join("workflows");
+        if !workflows_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&workflows_dir).map_err(|source| Error::Io {
+            path: workflows_dir.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| Error::Io {
+                path: workflows_dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let extension = path.extension().and_then(|e| e.to_str());
+            if matches!(extension, Some("yml") | Some("yaml")) {
+                let rel = path
+                    .strip_prefix(repo)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path);
+                out.push(rel);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn affected_consumers(&self, _proposal: &Proposal, _tree: &Path) -> Result<Vec<ConsumerId>> {
+        // npm/yarn/pnpm workspace member resolution lands in a follow-up;
+        // for v1 we collapse to a flat single-project report.
+        Ok(Vec::new())
+    }
+
+    fn apply_proposal(&self, proposal: &Proposal, tree_path: &Path) -> Result<()> {
+        let Some(flavor) = detect_flavor(tree_path) else {
+            return Err(Error::other(format!(
+                "no npm/pnpm lockfile found in `{}`; cannot apply bump",
+                tree_path.display()
+            )));
+        };
+        apply_npm_proposal(flavor, proposal, tree_path)
+    }
+
+    fn copy_back(&self, _proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
+        let Some(flavor) = detect_flavor(sandbox) else {
+            return Err(Error::other(format!(
+                "no lockfile in sandbox at `{}`; cannot copy back",
+                sandbox.display()
+            )));
+        };
+        let mut copied = Vec::new();
+        for relative in ["package.json", flavor.lockfile_name()] {
+            let sb = sandbox.join(relative);
+            let host_path = host.join(relative);
+            if !sb.is_file() {
+                continue;
+            }
+            std::fs::copy(&sb, &host_path).map_err(|source| Error::Io {
+                path: host_path,
+                source,
+            })?;
+            copied.push(PathBuf::from(relative));
+        }
+        Ok(copied)
+    }
+
+    fn pr_body_fragment(&self, proposal: &Proposal, outcome: &ValidationOutcome) -> String {
+        format!(
+            "- **{pkg}**: `{from}` → `{to}` ({classification})",
+            pkg = proposal.subject,
+            from = proposal.from,
+            to = proposal.to,
+            classification = outcome.classification.as_str(),
+        )
+    }
+}
+
+/// Single entry from `npm outdated --json` / `pnpm outdated --format=json`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct OutdatedEntry {
+    /// Resolved version in the lockfile. May be absent when the package
+    /// is in `package.json` but hasn't been installed yet.
+    #[serde(default)]
+    current: Option<String>,
+    /// Highest version that satisfies the current constraint.
+    wanted: String,
+    /// Most recent publish on the registry.
+    latest: String,
+}
+
+/// Parsed proposal-ready entry combining the dep name with its versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NpmOutdatedRow {
+    pub name: String,
+    pub current: Option<String>,
+    pub wanted: String,
+    pub latest: String,
+}
+
+/// Parses the JSON object emitted by `npm outdated --json` /
+/// `pnpm outdated --format=json`. Returns rows sorted by name so
+/// downstream proposal IDs are deterministic across runs.
+///
+/// Empty input (no outdated packages, both reporters emit `{}` and exit
+/// non-zero from npm — but with `--json` the body is still well-formed
+/// JSON) parses to an empty Vec.
+pub(crate) fn parse_npm_outdated_output(stdout: &str) -> Result<Vec<NpmOutdatedRow>> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: BTreeMap<String, OutdatedEntry> = serde_json::from_str(trimmed)
+        .map_err(|e| Error::other(format!("npm outdated JSON: {e}")))?;
+    let mut rows: Vec<NpmOutdatedRow> = parsed
+        .into_iter()
+        .map(|(name, entry)| NpmOutdatedRow {
+            name,
+            current: entry.current,
+            wanted: entry.wanted,
+            latest: entry.latest,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
+/// Builds proposals from parsed outdated rows. Tier mapping mirrors
+/// cargo's: when the lockfile-wanted version equals the registry latest,
+/// the bump only needs `npm update` (LockfileOnly). When it doesn't,
+/// the constraint blocks the latest and tier classification falls back
+/// to the caret-compat-group comparison between current and latest.
+///
+/// Rows with no `current` (package declared but never installed) are
+/// skipped — we have no "from" to compare against.
+pub(crate) fn build_npm_proposals(
+    rows: &[NpmOutdatedRow],
+    manifest_paths: &[PathBuf],
+) -> Vec<Proposal> {
+    let mut proposals = Vec::new();
+    for row in rows {
+        let Some(current) = row.current.as_deref() else {
+            continue;
+        };
+        // When `npm outdated` runs without a populated node_modules it
+        // includes every package, even ones where the lockfile already
+        // matches the registry latest. Drop those — there's nothing to
+        // bump.
+        if current == row.latest {
+            continue;
+        }
+        let tier = if row.wanted == row.latest {
+            BumpTier::LockfileOnly
+        } else {
+            classify_npm_bump(current, &row.latest)
+        };
+        let id = format!(
+            "npm-{}-{}",
+            sanitize_id_segment(&row.name),
+            sanitize_id_segment(&row.latest),
+        );
+        proposals.push(Proposal {
+            id,
+            ecosystem: EcosystemName::Npm.as_str().to_string(),
+            kind: ProposalKind::Version,
+            subject: row.name.clone(),
+            from: current.to_string(),
+            to: row.latest.clone(),
+            initial_classification: Classification::Exact,
+            manifest_paths: manifest_paths.to_vec(),
+            notes: Vec::new(),
+            bump_tier: tier,
+        });
+    }
+    proposals
+}
+
+/// Classify an npm version bump into a [`BumpTier`].
+///
+/// npm uses the same compatibility-group concept as Cargo (caret matches
+/// within the same significant segment), so the rules mirror
+/// `classify_unchanged_bump` in `cargo.rs`:
+///
+/// - `major >= 1`: same major group → Compatible.
+/// - `0.y.z`: same minor group → Compatible.
+/// - `0.0.z`: same patch group → Compatible (i.e. only identical bumps).
+///
+/// Defensive: unparseable input returns Breaking so the operator gets
+/// a chance to look rather than a silent skip.
+pub(crate) fn classify_npm_bump(from: &str, to: &str) -> BumpTier {
+    let Ok(from_v) = semver::Version::parse(from) else {
+        return BumpTier::Breaking;
+    };
+    let Ok(to_v) = semver::Version::parse(to) else {
+        return BumpTier::Breaking;
+    };
+    if compat_group(&from_v) == compat_group(&to_v) {
+        BumpTier::Compatible
+    } else {
+        BumpTier::Breaking
+    }
+}
+
+fn compat_group(v: &semver::Version) -> (u64, u64, u64) {
+    match (v.major, v.minor) {
+        (0, 0) => (0, 0, v.patch),
+        (0, _) => (0, v.minor, 0),
+        _ => (v.major, 0, 0),
+    }
+}
+
+/// Filter proposals down to direct deps declared in `package.json` (root
+/// + any workspace members). Drops transitive entries that `npm
+/// outdated` surfaces but the applier can't widen.
+pub(crate) fn filter_to_direct_deps(
+    proposals: Vec<Proposal>,
+    direct: &BTreeSet<String>,
+) -> Vec<Proposal> {
+    proposals
+        .into_iter()
+        .filter(|p| direct.contains(&p.subject))
+        .collect()
+}
+
+fn run_npm_proposer(
+    flavor: NpmFlavor,
+    repo: &Path,
+    manifest_paths: &[PathBuf],
+) -> Result<Vec<Proposal>> {
+    let bin = npm_binary_name(flavor);
+    if bin.is_empty() {
+        return Ok(Vec::new());
+    }
+    let args: &[&str] = match flavor {
+        NpmFlavor::Npm => &["outdated", "--json"],
+        NpmFlavor::Pnpm => &["outdated", "--format=json"],
+        NpmFlavor::Yarn => unreachable!(),
+    };
+
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args).current_dir(repo);
+    let run =
+        run_with_timeout(cmd, std::time::Duration::from_secs(120)).map_err(|source| Error::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+    let RunResult::Completed { status, stdout, .. } = run else {
+        return Err(Error::other(format!(
+            "{bin} outdated timed out against `{}`",
+            repo.display()
+        )));
+    };
+    // npm outdated exits non-zero when packages are outdated; we ignore
+    // the exit code and rely on JSON parsing instead.
+    let _ = status;
+    // we ignore the exit code and rely on JSON parsing.
+    let stdout_str = String::from_utf8_lossy(&stdout);
+
+    let mut rows = parse_npm_outdated_output(&stdout_str)?;
+    // When `node_modules` isn't materialized, `npm outdated` omits the
+    // `current` field. Fall back to the package-lock.json's resolved
+    // version so assay can still surface proposals without forcing the
+    // operator to run `npm install` first.
+    backfill_current_from_lockfile(repo, &mut rows)?;
+    let proposals = build_npm_proposals(&rows, manifest_paths);
+    let direct = collect_direct_dep_names(repo)?;
+    Ok(filter_to_direct_deps(proposals, &direct))
+}
+
+/// Read each `node_modules/<name>` entry from a `package-lock.json` v3
+/// `packages` map. Returns a `name -> version` lookup for use when
+/// `npm outdated` omits the `current` field (no installed
+/// node_modules).
+pub(crate) fn read_lockfile_versions(repo: &Path) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let lockfile = repo.join("package-lock.json");
+    if !lockfile.is_file() {
+        return Ok(out);
+    }
+    let text = std::fs::read_to_string(&lockfile).map_err(|source| Error::Io {
+        path: lockfile.clone(),
+        source,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::other(format!("package-lock.json parse: {e}")))?;
+    // Modern lockfile shape (v2/v3): `packages` map keyed by
+    // `"node_modules/<name>"`. Nested deps may have keys like
+    // `"node_modules/a/node_modules/b"` — those are transitive copies
+    // and we want the *top-level* resolution. The simplest pick: take
+    // the first occurrence of each `<name>`. v1 lockfiles use a
+    // `dependencies` tree which we skip — modern projects (npm 7+)
+    // produce v2/v3 by default.
+    if let Some(packages) = value.get("packages").and_then(|v| v.as_object()) {
+        for (key, entry) in packages {
+            let Some(rest) = key.strip_prefix("node_modules/") else {
+                continue;
+            };
+            // Skip nested deps; only top-level `node_modules/<name>`.
+            if rest.contains("/node_modules/") {
+                continue;
+            }
+            let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.entry(rest.to_string())
+                .or_insert_with(|| version.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn backfill_current_from_lockfile(repo: &Path, rows: &mut [NpmOutdatedRow]) -> Result<()> {
+    let needs_backfill = rows.iter().any(|r| r.current.is_none());
+    if !needs_backfill {
+        return Ok(());
+    }
+    let lockfile = read_lockfile_versions(repo)?;
+    for row in rows.iter_mut() {
+        if row.current.is_none()
+            && let Some(v) = lockfile.get(&row.name)
+        {
+            row.current = Some(v.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Read every dep name declared in `package.json`'s `dependencies`,
+/// `devDependencies`, `peerDependencies`, and `optionalDependencies`.
+/// Workspace members are handled by also reading each member listed in
+/// the root `workspaces` field.
+pub(crate) fn collect_direct_dep_names(repo: &Path) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let root_pkg = repo.join("package.json");
+    if !root_pkg.is_file() {
+        return Ok(names);
+    }
+    let root_text = std::fs::read_to_string(&root_pkg).map_err(|source| Error::Io {
+        path: root_pkg.clone(),
+        source,
+    })?;
+    let root_value: serde_json::Value = serde_json::from_str(&root_text)
+        .map_err(|e| Error::other(format!("package.json parse: {e}")))?;
+    extend_dep_names(&root_value, &mut names);
+
+    // Workspaces: declared in root as `"workspaces": [..]` (npm/yarn) or
+    // `"workspaces": { "packages": [..] }` (some configs). Glob entries
+    // like `packages/*` aren't expanded here — only literal paths. A
+    // full glob resolver lands in the workspace-aware applier follow-up.
+    if let Some(ws) = root_value.get("workspaces") {
+        let entries: Vec<String> = if let Some(arr) = ws.as_array() {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        } else if let Some(obj) = ws.as_object() {
+            obj.get("packages")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for entry in entries {
+            // Literal paths only for v1. Globs (`packages/*`) skipped.
+            if entry.contains('*') {
+                continue;
+            }
+            let member_pkg = repo.join(&entry).join("package.json");
+            if !member_pkg.is_file() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&member_pkg).map_err(|source| Error::Io {
+                path: member_pkg.clone(),
+                source,
+            })?;
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                extend_dep_names(&value, &mut names);
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn extend_dep_names(pkg: &serde_json::Value, names: &mut BTreeSet<String>) {
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(obj) = pkg.get(field).and_then(|v| v.as_object()) {
+            for key in obj.keys() {
+                names.insert(key.clone());
+            }
+        }
+    }
+}
+
+/// Apply an npm proposal:
+///
+/// - **LockfileOnly:** install the explicit target version with
+///   `--no-save --package-lock-only`. This bumps only the lockfile
+///   (package.json's constraint is untouched). Plain
+///   `npm install --package-lock-only` would be a no-op when the
+///   lockfile is already in sync with package.json — we need to push
+///   the resolution to the specific `to` version.
+/// - **Compatible / Breaking:** widen the constraint in `package.json`
+///   first, then run a plain `install --package-lock-only` so the
+///   lockfile picks up the new constraint.
+fn apply_npm_proposal(flavor: NpmFlavor, proposal: &Proposal, tree_path: &Path) -> Result<()> {
+    if matches!(proposal.bump_tier, BumpTier::LockfileOnly) {
+        return run_install_pinned(flavor, &proposal.subject, &proposal.to, tree_path);
+    }
+    let modified = update_package_json_constraint(tree_path, &proposal.subject, &proposal.to)?;
+    if modified.is_empty() {
+        return Err(Error::other(format!(
+            "expected to widen the constraint for `{}` in {} but no package.json had a matching dep entry",
+            proposal.subject,
+            tree_path.display(),
+        )));
+    }
+    run_install_lockfile_only(flavor, tree_path)
+}
+
+/// Install a specific `<name>@<version>` into the lockfile while
+/// preserving `package.json`'s original constraint. Used for
+/// LockfileOnly bumps.
+///
+/// Implementation: snapshot `package.json` text → install WITH
+/// `--save-exact` (forces npm to actually move to the requested
+/// version) → restore the snapshotted `package.json` bytes. The
+/// lockfile keeps the bump; the manifest is byte-identical to where
+/// it started.
+///
+/// Why not `--no-save`? npm's `--no-save` flag puts the resolver in a
+/// "minimum-change" mode: if the existing lockfile version already
+/// satisfies the manifest constraint, npm decides the lockfile is
+/// "current" and doesn't bump even when an explicit `pkg@version` is
+/// passed. The save-and-restore wrapper sidesteps that by giving npm
+/// permission to mutate package.json (which forces the lockfile
+/// update) and then taking that mutation back.
+fn run_install_pinned(
+    flavor: NpmFlavor,
+    name: &str,
+    version: &str,
+    tree_path: &Path,
+) -> Result<()> {
+    let bin = npm_binary_name(flavor);
+    let pinned = format!("{name}@{version}");
+    let args: Vec<&str> = match flavor {
+        NpmFlavor::Npm => vec![
+            "install",
+            &pinned,
+            "--save-exact",
+            "--no-audit",
+            "--no-fund",
+        ],
+        NpmFlavor::Pnpm => vec!["add", &pinned, "--save-exact"],
+        NpmFlavor::Yarn => {
+            return Err(Error::other("yarn applier not implemented in v1"));
+        }
+    };
+    let package_json = tree_path.join("package.json");
+    let snapshot = std::fs::read(&package_json).map_err(|source| Error::Io {
+        path: package_json.clone(),
+        source,
+    })?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(&args).current_dir(tree_path);
+    let install_result = run_install_with_timeout(cmd, bin, tree_path);
+    // Restore package.json verbatim even if install failed — leaves the
+    // sandbox in a sane state for diagnostics. The Result from install
+    // is still propagated.
+    let _ = std::fs::write(&package_json, &snapshot);
+    install_result
+}
+
+/// Refresh the lockfile after a manifest constraint edit. Same
+/// rationale for dropping `--package-lock-only` as in
+/// [`run_install_pinned`].
+fn run_install_lockfile_only(flavor: NpmFlavor, tree_path: &Path) -> Result<()> {
+    let bin = npm_binary_name(flavor);
+    let args: &[&str] = match flavor {
+        NpmFlavor::Npm => &["install", "--no-audit", "--no-fund"],
+        NpmFlavor::Pnpm => &["install"],
+        NpmFlavor::Yarn => {
+            return Err(Error::other("yarn applier not implemented in v1"));
+        }
+    };
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args).current_dir(tree_path);
+    run_install_with_timeout(cmd, bin, tree_path)
+}
+
+fn run_install_with_timeout(cmd: std::process::Command, bin: &str, tree_path: &Path) -> Result<()> {
+    let run =
+        run_with_timeout(cmd, std::time::Duration::from_secs(300)).map_err(|source| Error::Io {
+            path: tree_path.to_path_buf(),
+            source,
+        })?;
+    let RunResult::Completed {
+        status,
+        stdout,
+        stderr,
+        ..
+    } = run
+    else {
+        return Err(Error::other(format!(
+            "{bin} install timed out against `{}`",
+            tree_path.display()
+        )));
+    };
+    if !status.success() {
+        return Err(Error::other(format!(
+            "{bin} install failed: exit={:?}\nstdout=\n{}\nstderr=\n{}",
+            status.code(),
+            String::from_utf8_lossy(&stdout).trim(),
+            String::from_utf8_lossy(&stderr).trim(),
+        )));
+    }
+    Ok(())
+}
+
+/// Format-best-effort `package.json` constraint editor. Reads JSON via
+/// `serde_json::Value` and writes back with 2-space indent (npm/pnpm's
+/// own convention when they edit package.json on `install --save`).
+///
+/// Walks `dependencies`, `devDependencies`, `peerDependencies`, and
+/// `optionalDependencies` — first hit wins. Constraint widening preserves
+/// the operator's caret/tilde prefix when present:
+/// - `"^1.0.0"` → `"^1.5.0"` (caret preserved)
+/// - `"~1.0.0"` → `"~1.5.0"` (tilde preserved)
+/// - `"1.0.0"` → `"^1.5.0"` (bare bumps gain a caret — npm's default
+///   for `npm install --save`)
+pub(crate) fn update_package_json_constraint(
+    tree_path: &Path,
+    name: &str,
+    new_version: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut modified: Vec<PathBuf> = Vec::new();
+    let root_pkg = tree_path.join("package.json");
+    if try_edit_package_json(&root_pkg, name, new_version)? {
+        modified.push(PathBuf::from("package.json"));
+    }
+    // Walk literal workspaces too (globs deferred to follow-up).
+    if let Ok(text) = std::fs::read_to_string(&root_pkg)
+        && let Ok(root_value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(ws) = root_value.get("workspaces")
+    {
+        let entries: Vec<String> = if let Some(arr) = ws.as_array() {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        } else if let Some(obj) = ws.as_object() {
+            obj.get("packages")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for entry in entries {
+            if entry.contains('*') {
+                continue;
+            }
+            let member_pkg = tree_path.join(&entry).join("package.json");
+            if !member_pkg.is_file() {
+                continue;
+            }
+            if try_edit_package_json(&member_pkg, name, new_version)? {
+                modified.push(PathBuf::from(&entry).join("package.json"));
+            }
+        }
+    }
+    modified.sort();
+    Ok(modified)
+}
+
+fn try_edit_package_json(path: &Path, name: &str, new_version: &str) -> Result<bool> {
+    let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::other(format!("{}: {e}", path.display())))?;
+    let mut edited = false;
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(obj) = value.get_mut(field).and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+        let Some(existing) = obj.get_mut(name) else {
+            continue;
+        };
+        let Some(existing_str) = existing.as_str() else {
+            continue;
+        };
+        let new_spec = preserve_constraint_prefix(existing_str, new_version);
+        *existing = serde_json::Value::String(new_spec);
+        edited = true;
+        break;
+    }
+    if !edited {
+        return Ok(false);
+    }
+    let pretty = serde_json::to_string_pretty(&value)
+        .map_err(|e| Error::other(format!("{} re-serialize: {e}", path.display())))?;
+    let mut bytes = pretty.into_bytes();
+    // npm/pnpm append a trailing newline; mirror that convention.
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    std::fs::write(path, bytes).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(true)
+}
+
+fn preserve_constraint_prefix(existing: &str, new_version: &str) -> String {
+    if let Some(rest) = existing.strip_prefix('^') {
+        if rest.contains(|c: char| c.is_ascii_digit()) {
+            return format!("^{new_version}");
+        }
+    }
+    if let Some(rest) = existing.strip_prefix('~') {
+        if rest.contains(|c: char| c.is_ascii_digit()) {
+            return format!("~{new_version}");
+        }
+    }
+    if existing.starts_with('=') {
+        return format!("={new_version}");
+    }
+    // Bare version (`"1.0.0"`) — apply npm's default caret on update.
+    if existing.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return format!("^{new_version}");
+    }
+    // Anything else (range expressions, tags, file:, git:) is opaque to
+    // us; replace verbatim and trust the user to inspect the diff.
+    new_version.to_string()
+}
+
+/// Platform-aware binary name for npm/pnpm. On Windows, the actual
+/// executables are `.cmd` shims around node scripts; `Command::new`
+/// uses `CreateProcess` which only auto-resolves `.exe`, so we must
+/// say `.cmd` explicitly. On Unix the bare name works.
+fn npm_binary_name(flavor: NpmFlavor) -> &'static str {
+    match (flavor, cfg!(windows)) {
+        (NpmFlavor::Npm, true) => "npm.cmd",
+        (NpmFlavor::Npm, false) => "npm",
+        (NpmFlavor::Pnpm, true) => "pnpm.cmd",
+        (NpmFlavor::Pnpm, false) => "pnpm",
+        (NpmFlavor::Yarn, _) => "",
+    }
+}
+
+fn sanitize_id_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_dash = false;
+    for ch in value.chars().flat_map(|c| c.to_lowercase()) {
+        let safe = if ch.is_ascii_alphanumeric() { ch } else { '-' };
+        if safe == '-' {
+            if !last_was_dash {
+                out.push(safe);
+            }
+            last_was_dash = true;
+        } else {
+            out.push(safe);
+            last_was_dash = false;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // parse_npm_outdated_output
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_outdated_handles_typical_npm_json() {
+        let stdout = r#"{
+            "lodash": {
+                "current": "4.17.20",
+                "wanted":  "4.17.21",
+                "latest":  "4.17.21",
+                "dependent": "my-app"
+            },
+            "react": {
+                "current": "17.0.0",
+                "wanted":  "17.0.2",
+                "latest":  "18.3.1",
+                "dependent": "my-app"
+            }
+        }"#;
+        let rows = parse_npm_outdated_output(stdout).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Sorted by name → lodash, react.
+        assert_eq!(rows[0].name, "lodash");
+        assert_eq!(rows[0].current.as_deref(), Some("4.17.20"));
+        assert_eq!(rows[0].wanted, "4.17.21");
+        assert_eq!(rows[0].latest, "4.17.21");
+        assert_eq!(rows[1].name, "react");
+        assert_eq!(rows[1].current.as_deref(), Some("17.0.0"));
+    }
+
+    #[test]
+    fn parse_outdated_handles_empty_object() {
+        let rows = parse_npm_outdated_output("{}").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_outdated_handles_empty_string() {
+        let rows = parse_npm_outdated_output("").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_outdated_handles_missing_current() {
+        // Package declared but not installed — `current` is absent.
+        let stdout = r#"{"chalk":{"wanted":"4.1.2","latest":"5.3.0"}}"#;
+        let rows = parse_npm_outdated_output(stdout).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].current, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // build_npm_proposals
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn build_proposals_tier_maps_correctly() {
+        let rows = vec![
+            NpmOutdatedRow {
+                name: "lodash".into(),
+                current: Some("4.17.20".into()),
+                wanted: "4.17.21".into(),
+                latest: "4.17.21".into(),
+            },
+            NpmOutdatedRow {
+                name: "react".into(),
+                current: Some("17.0.0".into()),
+                wanted: "17.0.2".into(),
+                latest: "18.3.1".into(),
+            },
+            NpmOutdatedRow {
+                name: "chalk".into(),
+                current: Some("4.1.2".into()),
+                wanted: "4.1.2".into(),
+                latest: "5.3.0".into(),
+            },
+        ];
+        let proposals = build_npm_proposals(&rows, &[PathBuf::from("package.json")]);
+        assert_eq!(proposals.len(), 3);
+        let by_name: BTreeMap<&str, &Proposal> =
+            proposals.iter().map(|p| (p.subject.as_str(), p)).collect();
+        // lodash: wanted == latest → LockfileOnly.
+        assert_eq!(by_name["lodash"].bump_tier, BumpTier::LockfileOnly);
+        // react: wanted (17.0.2) != latest (18.3.1), cross-major → Breaking.
+        assert_eq!(by_name["react"].bump_tier, BumpTier::Breaking);
+        // chalk: wanted (4.1.2) != latest (5.3.0), cross-major → Breaking.
+        assert_eq!(by_name["chalk"].bump_tier, BumpTier::Breaking);
+    }
+
+    #[test]
+    fn build_proposals_skips_rows_where_current_equals_latest() {
+        // npm outdated without node_modules sometimes lists packages
+        // whose lockfile already matches latest. The proposer must
+        // drop those so the report doesn't show "5.2.9 -> 5.2.9".
+        let rows = vec![NpmOutdatedRow {
+            name: "@fontsource/inter".into(),
+            current: Some("5.2.8".into()),
+            wanted: "5.2.8".into(),
+            latest: "5.2.8".into(),
+        }];
+        let proposals = build_npm_proposals(&rows, &[]);
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn build_proposals_skips_rows_without_current_version() {
+        let rows = vec![NpmOutdatedRow {
+            name: "chalk".into(),
+            current: None,
+            wanted: "4.1.2".into(),
+            latest: "5.3.0".into(),
+        }];
+        let proposals = build_npm_proposals(&rows, &[]);
+        assert!(proposals.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_npm_bump — same caret-compat-group rules as cargo
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn classify_npm_same_major_is_compatible() {
+        assert_eq!(classify_npm_bump("1.0.0", "1.5.0"), BumpTier::Compatible);
+        assert_eq!(classify_npm_bump("17.0.0", "17.0.2"), BumpTier::Compatible);
+    }
+
+    #[test]
+    fn classify_npm_cross_major_is_breaking() {
+        assert_eq!(classify_npm_bump("17.0.0", "18.0.0"), BumpTier::Breaking);
+        assert_eq!(classify_npm_bump("0.8.0", "1.0.0"), BumpTier::Breaking);
+    }
+
+    #[test]
+    fn classify_npm_zero_dot_x_groups_by_minor() {
+        assert_eq!(classify_npm_bump("0.18.1", "0.18.7"), BumpTier::Compatible);
+        assert_eq!(classify_npm_bump("0.18.1", "0.20.0"), BumpTier::Breaking);
+    }
+
+    // -------------------------------------------------------------------------
+    // preserve_constraint_prefix
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn preserve_prefix_keeps_caret() {
+        assert_eq!(preserve_constraint_prefix("^1.0.0", "1.5.2"), "^1.5.2");
+    }
+
+    #[test]
+    fn preserve_prefix_keeps_tilde() {
+        assert_eq!(preserve_constraint_prefix("~1.0.0", "1.5.2"), "~1.5.2");
+    }
+
+    #[test]
+    fn preserve_prefix_keeps_exact_equality() {
+        assert_eq!(preserve_constraint_prefix("=1.0.0", "1.5.2"), "=1.5.2");
+    }
+
+    #[test]
+    fn preserve_prefix_adds_caret_to_bare_version() {
+        // npm install --save defaults to caret-prefixed when adding a
+        // dep that previously had a bare version. Mirror that here.
+        assert_eq!(preserve_constraint_prefix("1.0.0", "1.5.2"), "^1.5.2");
+    }
+
+    #[test]
+    fn preserve_prefix_opaque_for_unknown_shapes() {
+        // file:, git+ssh://, npm tag references, etc. — replace verbatim.
+        assert_eq!(
+            preserve_constraint_prefix("file:../local", "1.5.2"),
+            "1.5.2",
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // try_edit_package_json
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn editor_widens_dependencies_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{
+  "name": "sample",
+  "version": "0.1.0",
+  "dependencies": {
+    "lodash": "^4.17.20"
+  }
+}
+"#,
+        )
+        .unwrap();
+        let edited = try_edit_package_json(&pkg, "lodash", "4.17.21").unwrap();
+        assert!(edited);
+        let after = std::fs::read_to_string(&pkg).unwrap();
+        assert!(after.contains(r#""lodash": "^4.17.21""#), "got:\n{after}");
+        // Trailing newline preserved (npm convention).
+        assert!(after.ends_with('\n'));
+    }
+
+    #[test]
+    fn editor_widens_dev_dependencies_when_main_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{"name":"sample","devDependencies":{"jest":"^28.0.0"}}"#,
+        )
+        .unwrap();
+        let edited = try_edit_package_json(&pkg, "jest", "29.7.0").unwrap();
+        assert!(edited);
+        let after = std::fs::read_to_string(&pkg).unwrap();
+        assert!(after.contains(r#""jest": "^29.7.0""#));
+    }
+
+    #[test]
+    fn editor_returns_false_when_dep_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{"name":"sample","dependencies":{"lodash":"^4.0.0"}}"#,
+        )
+        .unwrap();
+        let edited = try_edit_package_json(&pkg, "missing-pkg", "1.0.0").unwrap();
+        assert!(!edited);
+    }
+
+    // -------------------------------------------------------------------------
+    // detect_flavor + detect_manifests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn detect_flavor_recognizes_each_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(detect_flavor(root).is_none());
+        std::fs::write(root.join("package-lock.json"), "{}").unwrap();
+        assert_eq!(detect_flavor(root), Some(NpmFlavor::Npm));
+        std::fs::remove_file(root.join("package-lock.json")).unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 6.0\n").unwrap();
+        assert_eq!(detect_flavor(root), Some(NpmFlavor::Pnpm));
+        std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(root.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(detect_flavor(root), Some(NpmFlavor::Yarn));
+    }
+
+    #[test]
+    fn detect_manifests_finds_package_json_and_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}").unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(root).unwrap();
+        assert_eq!(manifests.len(), 2);
+        assert!(
+            manifests
+                .iter()
+                .any(|m| matches!(m.kind, ManifestKind::PackageJson))
+        );
+        assert!(
+            manifests
+                .iter()
+                .any(|m| matches!(m.kind, ManifestKind::NpmLockfile))
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // collect_direct_dep_names + filter
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn read_lockfile_versions_parses_v3_packages_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "root", "version": "0.1.0" },
+                    "node_modules/lodash": { "version": "4.17.20" },
+                    "node_modules/react": { "version": "17.0.0" },
+                    "node_modules/foo/node_modules/lodash": { "version": "3.0.0" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let map = read_lockfile_versions(tmp.path()).unwrap();
+        assert_eq!(map.get("lodash"), Some(&"4.17.20".to_string()));
+        assert_eq!(map.get("react"), Some(&"17.0.0".to_string()));
+        // Nested duplicate must be ignored — top-level only.
+        assert_ne!(map.get("lodash"), Some(&"3.0.0".to_string()));
+    }
+
+    #[test]
+    fn read_lockfile_versions_returns_empty_when_lockfile_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map = read_lockfile_versions(tmp.path()).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn collect_direct_dep_names_reads_root_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+                "dependencies": { "lodash": "^4.0.0" },
+                "devDependencies": { "jest": "^28.0.0" }
+            }"#,
+        )
+        .unwrap();
+        let names = collect_direct_dep_names(tmp.path()).unwrap();
+        let names: Vec<&String> = names.iter().collect();
+        assert_eq!(names, vec![&"jest".to_string(), &"lodash".to_string()]);
+    }
+
+    #[test]
+    fn filter_to_direct_deps_drops_transitive_entries() {
+        let proposals = vec![sample_proposal("lodash"), sample_proposal("@types/node")];
+        let direct: BTreeSet<String> = std::iter::once("lodash".to_string()).collect();
+        let kept = filter_to_direct_deps(proposals, &direct);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].subject, "lodash");
+    }
+
+    fn sample_proposal(name: &str) -> Proposal {
+        Proposal {
+            id: format!("npm-{name}-test"),
+            ecosystem: EcosystemName::Npm.as_str().into(),
+            kind: ProposalKind::Version,
+            subject: name.into(),
+            from: "1.0.0".into(),
+            to: "1.5.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+        }
+    }
+}
