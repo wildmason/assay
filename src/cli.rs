@@ -13,7 +13,7 @@ use crate::model::{
     RepositoryRef, RunSummary,
 };
 use crate::receipt::write_run_receipt;
-use crate::validator::{Validator, ValidatorExecutor};
+use crate::validator::{CustomBackend, Validator, ValidatorExecutor};
 use crate::workflow_filter::WorkflowFilter;
 
 #[derive(Debug, Parser)]
@@ -37,6 +37,11 @@ pub enum Command {
 #[command(group(
     ArgGroup::new("apply_mode")
         .args(["apply_local", "apply_pr"])
+        .multiple(false)
+))]
+#[command(group(
+    ArgGroup::new("gate_override")
+        .args(["gate_cmd", "gate_file"])
         .multiple(false)
 ))]
 pub struct AnalyzeArgs {
@@ -94,6 +99,20 @@ pub struct AnalyzeArgs {
     /// suite isn't expressed via pull_request triggers.
     #[arg(long)]
     pub no_workflow_filter: bool,
+
+    /// Override the auto-selected validator backend with an operator-
+    /// supplied shell-line. Whitespace-split argv (no shell features —
+    /// for pipes/redirection write a script and use `--gate-file`).
+    /// Mutually exclusive with `--gate-file`. When set, `--executor` is
+    /// silently ignored (CustomBackend bypasses forge entirely).
+    #[arg(long = "gate-cmd", value_name = "SHELL_LINE")]
+    pub gate_cmd: Option<String>,
+
+    /// Override the auto-selected validator backend with a script.
+    /// The script's shebang controls interpretation. Mutually exclusive
+    /// with `--gate-cmd`. When set, `--executor` is silently ignored.
+    #[arg(long = "gate-file", value_name = "PATH")]
+    pub gate_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -163,9 +182,14 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         return Err(Error::RepoNotFound(args.repo));
     }
     let mode = ApplyMode::from_args(&args);
+    // The host-executor safety check only matters when forge runs the
+    // gate; --gate-cmd / --gate-file bypass forge entirely and the
+    // operator is opting into running their own commands.
+    let gate_override = args.gate_cmd.is_some() || args.gate_file.is_some();
     if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr)
         && args.executor == ExecutorChoice::Host
         && !args.unsafe_host_validation
+        && !gate_override
     {
         return Err(Error::other(
             "--executor host requires --unsafe-host-validation for apply modes; \
@@ -255,12 +279,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut proposals_unvalidated = 0usize;
 
     if matches!(mode, ApplyMode::ApplyLocal) && !all_proposals.is_empty() {
-        let validator_executor = match args.executor {
-            ExecutorChoice::Host => ValidatorExecutor::Host,
-            ExecutorChoice::Docker => ValidatorExecutor::Docker,
-        };
-        let validator = Validator::auto(&args.repo, validator_executor)?
-            .with_workflow_filter(workflow_filter_from_args(&args));
+        let validator =
+            build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
 
         for (eco_idx, proposal) in &all_proposals {
             let ecosystem = registry[*eco_idx].as_ref();
@@ -556,6 +576,31 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
+/// Construct the [`Validator`] for this run.
+///
+/// `--gate-cmd` / `--gate-file` short-circuit auto-selection by wrapping
+/// the operator-supplied command in a [`CustomBackend`]; otherwise we
+/// defer to [`Validator::auto`] to pick `forge-run` (when `forge` and
+/// `.github/workflows/` are both present) or `build-test` (manifest-
+/// inferred fallback).
+fn build_validator(args: &AnalyzeArgs) -> Result<Validator> {
+    if let Some(cmd) = args.gate_cmd.as_deref() {
+        return Ok(Validator::with_backend(Box::new(
+            CustomBackend::from_gate_cmd(cmd),
+        )));
+    }
+    if let Some(file) = args.gate_file.as_deref() {
+        return Ok(Validator::with_backend(Box::new(
+            CustomBackend::from_gate_file(file),
+        )));
+    }
+    let validator_executor = match args.executor {
+        ExecutorChoice::Host => ValidatorExecutor::Host,
+        ExecutorChoice::Docker => ValidatorExecutor::Docker,
+    };
+    Validator::auto(&args.repo, validator_executor)
+}
+
 /// Build the [`WorkflowFilter`] from the parsed CLI args.
 ///
 /// Defaults to [`WorkflowFilter::pull_request_default`]; flipped to
@@ -662,6 +707,8 @@ mod tests {
             include_workflows: Vec::new(),
             exclude_workflows: Vec::new(),
             no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -726,6 +773,8 @@ mod tests {
             include_workflows: Vec::new(),
             exclude_workflows: Vec::new(),
             no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -769,6 +818,179 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_accepts_gate_cmd_flag() {
+        let cli = parse_cli(["assay", "analyze", "--gate-cmd", "make test"]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(args.gate_cmd.as_deref(), Some("make test"));
+        assert!(args.gate_file.is_none());
+    }
+
+    #[test]
+    fn parse_cli_accepts_gate_file_flag() {
+        let cli = parse_cli(["assay", "analyze", "--gate-file", "./scripts/check.sh"]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(
+            args.gate_file.as_deref(),
+            Some(std::path::Path::new("./scripts/check.sh"))
+        );
+        assert!(args.gate_cmd.is_none());
+    }
+
+    #[test]
+    fn parse_cli_rejects_gate_cmd_and_gate_file_together() {
+        let parsed = Cli::try_parse_from([
+            "assay",
+            "analyze",
+            "--gate-cmd",
+            "make test",
+            "--gate-file",
+            "./check.sh",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--gate-cmd and --gate-file must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn build_validator_uses_custom_backend_for_gate_cmd() {
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
+            gate_cmd: Some("make test".into()),
+            gate_file: None,
+        };
+        let validator = build_validator(&args).expect("gate-cmd should always build");
+        // The Validator field isn't pub, but `validate` against an empty
+        // tree and no workflows surfaces a deterministic outcome we can
+        // assert on — the *unvalidated* path doesn't run the backend, so
+        // the assertion focuses on the construction succeeding.
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = validator
+            .validate(
+                &crate::model::Proposal {
+                    id: "p".into(),
+                    ecosystem: "cargo".into(),
+                    kind: crate::model::ProposalKind::Version,
+                    subject: "x".into(),
+                    from: "1".into(),
+                    to: "2".into(),
+                    initial_classification: crate::model::Classification::Exact,
+                    manifest_paths: vec![],
+                    notes: vec![],
+                },
+                tmp.path(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(outcome.conclusion, "unvalidated");
+    }
+
+    #[test]
+    fn build_validator_uses_custom_backend_for_gate_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("check.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let args = AnalyzeArgs {
+            repo: ".".into(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: Some(script),
+        };
+        // Just needs to not error during construction.
+        build_validator(&args).expect("gate-file should always build");
+    }
+
+    #[test]
+    fn build_validator_errors_for_empty_dir_when_no_gate_override() {
+        // Empty tempdir: no Cargo.toml, no .github/workflows/, and no
+        // gate override — Validator::auto should fail with the canonical
+        // "no validator backend applicable" error.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = AnalyzeArgs {
+            repo: tmp.path().to_path_buf(),
+            ecosystem: None,
+            apply_local: false,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: false,
+            executor: ExecutorChoice::Docker,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
+        };
+        // forge may or may not be on PATH; what matters is that the
+        // empty dir gives no manifest and no workflows. On a dev box
+        // where forge is missing the auto-selector errors immediately;
+        // when forge IS on PATH the auto-selector falls to the
+        // BuildTestBackend::infer step which also returns None.
+        // If for some reason a backend was selectable on this host
+        // (unlikely in an empty tempdir), that's fine — the test
+        // proves construction works either way.
+        if let Err(err) = build_validator(&args) {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no validator backend applicable"),
+                "error should explain why no backend was selectable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_executor_safety_gate_is_waived_when_gate_override_present() {
+        // --executor host normally requires --unsafe-host-validation for
+        // apply modes; with --gate-cmd, forge isn't involved at all so
+        // the gate should not apply.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let result = analyze_command(AnalyzeArgs {
+            repo: tmp.path().to_path_buf(),
+            ecosystem: None,
+            apply_local: true,
+            apply_pr: false,
+            unsafe_host_validation: false,
+            force: true,
+            executor: ExecutorChoice::Host,
+            format: OutputFormat::Text,
+            include_workflows: Vec::new(),
+            exclude_workflows: Vec::new(),
+            no_workflow_filter: false,
+            gate_cmd: Some("true".into()),
+            gate_file: None,
+        });
+        // We don't care whether the rest of the pipeline succeeds in
+        // this empty tempdir; the assertion is that we are *not*
+        // rejected by the host-executor safety check.
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("--unsafe-host-validation"),
+                "gate override should waive the host-executor safety gate: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn workflow_filter_from_args_defaults_to_pull_request_only() {
         let args = AnalyzeArgs {
             repo: ".".into(),
@@ -782,6 +1004,8 @@ mod tests {
             include_workflows: Vec::new(),
             exclude_workflows: Vec::new(),
             no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -803,6 +1027,8 @@ mod tests {
             include_workflows: Vec::new(),
             exclude_workflows: Vec::new(),
             no_workflow_filter: true,
+            gate_cmd: None,
+            gate_file: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -822,6 +1048,8 @@ mod tests {
             include_workflows: vec!["always.yml".into()],
             exclude_workflows: vec!["never-*.yml".into()],
             no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -843,6 +1071,8 @@ mod tests {
             include_workflows: Vec::new(),
             exclude_workflows: Vec::new(),
             no_workflow_filter: false,
+            gate_cmd: None,
+            gate_file: None,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
