@@ -9,6 +9,7 @@ pub mod config;
 pub mod ecosystem;
 pub mod error;
 pub mod model;
+pub mod process_runner;
 pub mod publisher;
 pub mod receipt;
 pub mod redact;

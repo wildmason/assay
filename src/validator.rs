@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::model::{Classification, Proposal, ValidationOutcome};
+use crate::process_runner::{RunResult, run_with_timeout};
 use crate::workflow_filter::WorkflowFilter;
 
 // =============================================================================
@@ -205,10 +206,9 @@ impl ValidatorBackend for ForgeRunBackend {
         &self,
         workflow: &Path,
         tree: &Path,
-        _timeout: Duration,
+        timeout: Duration,
         log_path: &Path,
     ) -> Result<WorkflowOutcome> {
-        let started = Instant::now();
         let argv = ValidatorCommandBuilder::new(&self.forge_bin)
             .workflow(workflow)
             .workspace(tree)
@@ -219,23 +219,38 @@ impl ValidatorBackend for ForgeRunBackend {
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]);
         command.current_dir(tree);
-        let output = command.output().map_err(|source| Error::Io {
+        let run = run_with_timeout(command, timeout).map_err(|source| Error::Io {
             path: tree.to_path_buf(),
             source,
         })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(run.stdout()).into_owned();
+        let stderr = String::from_utf8_lossy(run.stderr()).into_owned();
 
-        // Best-effort: persist the captured output to log_path. Errors here
-        // are non-fatal — the classification doesn't depend on the file
-        // landing, but the operator benefits from having logs to grep.
         let log_content = format!("=== STDOUT ===\n{stdout}\n=== STDERR ===\n{stderr}");
         let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
         let _ = std::fs::write(log_path, log_content);
 
-        let duration_ms = started.elapsed().as_millis();
-        let exit_code = output.status.code();
-        Ok(self.classify(workflow, exit_code, &stdout, &stderr, duration_ms, log_path))
+        match run {
+            RunResult::Completed {
+                status, duration, ..
+            } => Ok(self.classify(
+                workflow,
+                status.code(),
+                &stdout,
+                &stderr,
+                duration.as_millis(),
+                log_path,
+            )),
+            RunResult::TimedOut { duration, .. } => Ok(WorkflowOutcome {
+                workflow: workflow.to_path_buf(),
+                backend: self.name(),
+                result: WorkflowResult::Fail(FailureFlavor::Timeout),
+                forge_run_id: None,
+                duration_ms: duration.as_millis(),
+                stderr_tail: stderr_tail(&stderr, 4096),
+                log_path: log_path.to_path_buf(),
+            }),
+        }
     }
 }
 
@@ -426,22 +441,21 @@ impl BuildTestBackend {
     fn classify(
         &self,
         workflow: &Path,
-        results: &[(Vec<String>, std::io::Result<std::process::Output>)],
+        results: &[(Vec<String>, BuildTestStepOutcome)],
         duration_ms: u128,
         log_path: &Path,
     ) -> WorkflowOutcome {
         let mut combined_stderr = String::new();
-        for (cmd, result) in results {
-            match result {
-                Ok(output) => {
+        for (cmd, step) in results {
+            match step {
+                BuildTestStepOutcome::Ran { status, stderr, .. } => {
                     combined_stderr.push_str(&format!(
                         "=== {} ===\n{}\n",
                         cmd.join(" "),
-                        String::from_utf8_lossy(&output.stderr),
+                        String::from_utf8_lossy(stderr),
                     ));
-                    if !output.status.success() {
-                        let exit_label = output
-                            .status
+                    if !status.success() {
+                        let exit_label = status
                             .code()
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "signal".into());
@@ -459,12 +473,24 @@ impl BuildTestBackend {
                         };
                     }
                 }
-                Err(err) => {
+                BuildTestStepOutcome::TimedOut { stderr, .. } => {
+                    let stderr_str = String::from_utf8_lossy(stderr).into_owned();
+                    return WorkflowOutcome {
+                        workflow: workflow.to_path_buf(),
+                        backend: self.label,
+                        result: WorkflowResult::Fail(FailureFlavor::Timeout),
+                        forge_run_id: None,
+                        duration_ms,
+                        stderr_tail: stderr_tail(&stderr_str, 4096),
+                        log_path: log_path.to_path_buf(),
+                    };
+                }
+                BuildTestStepOutcome::SpawnFailed { error } => {
                     let bin = cmd.first().map(String::as_str).unwrap_or("(empty)");
-                    let reason = if err.kind() == std::io::ErrorKind::NotFound {
+                    let reason = if error.kind() == std::io::ErrorKind::NotFound {
                         format!("binary `{bin}` not found on PATH")
                     } else {
-                        format!("couldn't spawn `{bin}`: {err}")
+                        format!("couldn't spawn `{bin}`: {error}")
                     };
                     return WorkflowOutcome {
                         workflow: workflow.to_path_buf(),
@@ -499,46 +525,149 @@ impl ValidatorBackend for BuildTestBackend {
         &self,
         workflow: &Path,
         tree: &Path,
-        _timeout: Duration,
+        timeout: Duration,
         log_path: &Path,
     ) -> Result<WorkflowOutcome> {
         let started = Instant::now();
-        let mut results = Vec::new();
+        let mut results: Vec<(Vec<String>, BuildTestStepOutcome)> = Vec::new();
+        // Total timeout is shared across all commands; track remaining
+        // budget and surface a Timeout outcome if it runs out before
+        // every command finishes.
+        let mut remaining = timeout;
         for cmd in &self.commands {
             if cmd.is_empty() {
                 continue;
             }
-            let result = Command::new(&cmd[0])
+            let mut command = Command::new(&cmd[0]);
+            command
                 .args(&cmd[1..])
                 .current_dir(tree)
-                .env("CARGO_TERM_COLOR", "never")
-                .output();
-            results.push((cmd.clone(), result));
-        }
-
-        // Best-effort log write — non-fatal on error.
-        let mut log_content = String::new();
-        for (cmd, result) in &results {
-            log_content.push_str(&format!("=== {} ===\n", cmd.join(" ")));
-            match result {
-                Ok(o) => log_content.push_str(&format!(
-                    "exit: {}\nstdout:\n{}\nstderr:\n{}\n\n",
-                    o.status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into()),
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr),
-                )),
-                Err(e) => log_content.push_str(&format!("spawn error: {e}\n\n")),
+                .env("CARGO_TERM_COLOR", "never");
+            let result = run_with_timeout(command, remaining);
+            let step = match result {
+                Ok(RunResult::Completed {
+                    status,
+                    stdout,
+                    stderr,
+                    duration,
+                }) => {
+                    remaining = remaining.checked_sub(duration).unwrap_or(Duration::ZERO);
+                    BuildTestStepOutcome::Ran {
+                        status,
+                        stdout,
+                        stderr,
+                    }
+                }
+                Ok(RunResult::TimedOut {
+                    stdout,
+                    stderr,
+                    duration: _,
+                }) => {
+                    remaining = Duration::ZERO;
+                    BuildTestStepOutcome::TimedOut { stdout, stderr }
+                }
+                Err(err) => BuildTestStepOutcome::SpawnFailed { error: err },
+            };
+            let timed_out = matches!(step, BuildTestStepOutcome::TimedOut { .. });
+            let bad = matches!(
+                step,
+                BuildTestStepOutcome::TimedOut { .. } | BuildTestStepOutcome::SpawnFailed { .. }
+            ) || matches!(&step, BuildTestStepOutcome::Ran { status, .. } if !status.success());
+            results.push((cmd.clone(), step));
+            // Short-circuit on first failure or timeout.
+            if bad {
+                if timed_out {
+                    // Persist log + return Timeout immediately so we
+                    // don't keep spinning through later commands with
+                    // remaining == 0.
+                    let log_content = render_build_test_log(&results);
+                    let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
+                    let _ = std::fs::write(log_path, log_content);
+                    let stderr_combined = combined_stderr(&results);
+                    return Ok(WorkflowOutcome {
+                        workflow: workflow.to_path_buf(),
+                        backend: self.label,
+                        result: WorkflowResult::Fail(FailureFlavor::Timeout),
+                        forge_run_id: None,
+                        duration_ms: started.elapsed().as_millis(),
+                        stderr_tail: stderr_tail(&stderr_combined, 4096),
+                        log_path: log_path.to_path_buf(),
+                    });
+                }
+                break;
             }
         }
+
+        let log_content = render_build_test_log(&results);
         let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
         let _ = std::fs::write(log_path, log_content);
 
-        let duration_ms = started.elapsed().as_millis();
-        Ok(self.classify(workflow, &results, duration_ms, log_path))
+        Ok(self.classify(workflow, &results, started.elapsed().as_millis(), log_path))
     }
+}
+
+/// One step outcome inside [`BuildTestBackend::validate_workflow`].
+#[derive(Debug)]
+pub(crate) enum BuildTestStepOutcome {
+    Ran {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    TimedOut {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    SpawnFailed {
+        error: std::io::Error,
+    },
+}
+
+fn render_build_test_log(results: &[(Vec<String>, BuildTestStepOutcome)]) -> String {
+    let mut out = String::new();
+    for (cmd, step) in results {
+        out.push_str(&format!("=== {} ===\n", cmd.join(" ")));
+        match step {
+            BuildTestStepOutcome::Ran {
+                status,
+                stdout,
+                stderr,
+            } => out.push_str(&format!(
+                "exit: {}\nstdout:\n{}\nstderr:\n{}\n\n",
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into()),
+                String::from_utf8_lossy(stdout),
+                String::from_utf8_lossy(stderr),
+            )),
+            BuildTestStepOutcome::TimedOut { stdout, stderr } => out.push_str(&format!(
+                "TIMED OUT\nstdout:\n{}\nstderr:\n{}\n\n",
+                String::from_utf8_lossy(stdout),
+                String::from_utf8_lossy(stderr),
+            )),
+            BuildTestStepOutcome::SpawnFailed { error } => {
+                out.push_str(&format!("spawn error: {error}\n\n"))
+            }
+        }
+    }
+    out
+}
+
+fn combined_stderr(results: &[(Vec<String>, BuildTestStepOutcome)]) -> String {
+    let mut out = String::new();
+    for (cmd, step) in results {
+        if let BuildTestStepOutcome::TimedOut { stderr, .. }
+        | BuildTestStepOutcome::Ran { stderr, .. } = step
+        {
+            out.push_str(&format!(
+                "=== {} ===\n{}\n",
+                cmd.join(" "),
+                String::from_utf8_lossy(stderr)
+            ));
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -592,28 +721,31 @@ impl CustomBackend {
     fn classify(
         &self,
         workflow: &Path,
-        result: std::io::Result<std::process::Output>,
+        run: std::io::Result<RunResult>,
         duration_ms: u128,
         log_path: &Path,
     ) -> WorkflowOutcome {
-        match result {
-            Ok(output) if output.status.success() => WorkflowOutcome {
-                workflow: workflow.to_path_buf(),
-                backend: self.label,
-                result: WorkflowResult::Pass,
-                forge_run_id: None,
-                duration_ms,
-                stderr_tail: String::new(),
-                log_path: log_path.to_path_buf(),
-            },
-            Ok(output) => {
-                let exit_label = output
-                    .status
+        match run {
+            Ok(RunResult::Completed { status, stderr, .. }) if status.success() => {
+                // Stderr might still hold useful content on a passing
+                // gate — preserve a tail for the report.
+                let stderr_str = String::from_utf8_lossy(&stderr);
+                WorkflowOutcome {
+                    workflow: workflow.to_path_buf(),
+                    backend: self.label,
+                    result: WorkflowResult::Pass,
+                    forge_run_id: None,
+                    duration_ms,
+                    stderr_tail: stderr_tail(&stderr_str, 4096),
+                    log_path: log_path.to_path_buf(),
+                }
+            }
+            Ok(RunResult::Completed { status, stderr, .. }) => {
+                let exit_label = status
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".into());
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stderr_tail_str = stderr_tail(&stderr, 4096);
+                let stderr_str = String::from_utf8_lossy(&stderr);
                 WorkflowOutcome {
                     workflow: workflow.to_path_buf(),
                     backend: self.label,
@@ -622,7 +754,19 @@ impl CustomBackend {
                     }),
                     forge_run_id: None,
                     duration_ms,
-                    stderr_tail: stderr_tail_str,
+                    stderr_tail: stderr_tail(&stderr_str, 4096),
+                    log_path: log_path.to_path_buf(),
+                }
+            }
+            Ok(RunResult::TimedOut { stderr, .. }) => {
+                let stderr_str = String::from_utf8_lossy(&stderr);
+                WorkflowOutcome {
+                    workflow: workflow.to_path_buf(),
+                    backend: self.label,
+                    result: WorkflowResult::Fail(FailureFlavor::Timeout),
+                    forge_run_id: None,
+                    duration_ms,
+                    stderr_tail: stderr_tail(&stderr_str, 4096),
                     log_path: log_path.to_path_buf(),
                 }
             }
@@ -656,7 +800,7 @@ impl ValidatorBackend for CustomBackend {
         &self,
         workflow: &Path,
         tree: &Path,
-        _timeout: Duration,
+        timeout: Duration,
         log_path: &Path,
     ) -> Result<WorkflowOutcome> {
         if self.argv.is_empty() {
@@ -673,25 +817,29 @@ impl ValidatorBackend for CustomBackend {
             });
         }
         let started = Instant::now();
-        let result = Command::new(&self.argv[0])
-            .args(&self.argv[1..])
-            .current_dir(tree)
-            .output();
+        let mut cmd = Command::new(&self.argv[0]);
+        cmd.args(&self.argv[1..]).current_dir(tree);
+        let result = run_with_timeout(cmd, timeout);
 
         // Best-effort log write — non-fatal.
-        if let Ok(ref output) = result {
+        if let Ok(ref run) = result {
             let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
+            let header = match run {
+                RunResult::Completed { status, .. } => format!(
+                    "exit: {}",
+                    status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into())
+                ),
+                RunResult::TimedOut { .. } => "TIMED OUT".to_string(),
+            };
             let _ = std::fs::write(
                 log_path,
                 format!(
-                    "exit: {}\nstdout:\n{}\nstderr:\n{}",
-                    output
-                        .status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into()),
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
+                    "{header}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(run.stdout()),
+                    String::from_utf8_lossy(run.stderr()),
                 ),
             );
         }
@@ -1549,6 +1697,66 @@ mod tests {
             }
             other => panic!("expected SetupFailure, got {other:?}"),
         }
+    }
+
+    fn slow_sleep_argv() -> Vec<String> {
+        // Platform-portable "block for ~10s" command — same trick as
+        // process_runner::tests::slow_sleep_argv. Invoke directly so the
+        // kill path on Windows hits ping itself (cmd /C would fork a
+        // child that outlives the parent due to the Windows process-tree
+        // kill limitation documented in process_runner).
+        if cfg!(windows) {
+            vec!["ping".into(), "-n".into(), "11".into(), "127.0.0.1".into()]
+        } else {
+            vec!["sh".into(), "-c".into(), "sleep 10".into()]
+        }
+    }
+
+    #[test]
+    fn custom_backend_reports_timeout_flavor_when_command_overruns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = CustomBackend::new(slow_sleep_argv());
+        let outcome = backend
+            .validate_workflow(
+                Path::new("gate.yml"),
+                tmp.path(),
+                Duration::from_millis(500),
+                &tmp.path().join("log.txt"),
+            )
+            .unwrap();
+        match outcome.result {
+            WorkflowResult::Fail(FailureFlavor::Timeout) => {}
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // Should not have waited the full 10 seconds.
+        assert!(
+            outcome.duration_ms < 5000,
+            "timeout should fire promptly: duration_ms={}",
+            outcome.duration_ms
+        );
+    }
+
+    #[test]
+    fn build_test_backend_reports_timeout_flavor_when_command_overruns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BuildTestBackend::with_commands(vec![slow_sleep_argv()], "test-timeout");
+        let outcome = backend
+            .validate_workflow(
+                Path::new("gate.yml"),
+                tmp.path(),
+                Duration::from_millis(500),
+                &tmp.path().join("log.txt"),
+            )
+            .unwrap();
+        match outcome.result {
+            WorkflowResult::Fail(FailureFlavor::Timeout) => {}
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            outcome.duration_ms < 5000,
+            "timeout should fire promptly: duration_ms={}",
+            outcome.duration_ms
+        );
     }
 
     #[test]
