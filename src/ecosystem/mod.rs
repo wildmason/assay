@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::model::{Manifest, Proposal, ValidationOutcome};
+use crate::model::{ConsumerId, Manifest, Proposal, ValidationOutcome};
 
 pub mod cargo;
 pub mod github_actions;
@@ -65,9 +65,30 @@ pub trait DependencyEcosystem: Send + Sync {
         ctx: &EcosystemContext,
     ) -> Result<Vec<Proposal>>;
 
-    /// Identify the workflow files that should validate this proposal.
-    /// Returned paths are workspace-relative.
-    fn affected_workflows(&self, proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>>;
+    /// Identify the workflow files this proposal should be validated
+    /// against (the "gate" — what counts as 'this passes'). Returned paths
+    /// are workspace-relative.
+    ///
+    /// Renamed from `affected_workflows` per Arch-11 in the deep-plan's
+    /// Review Pass 1: "affected" suggested these workflows were touched
+    /// BY the proposal, but they're actually the proposal's gate.
+    fn gate_workflows(&self, proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>>;
+
+    /// Identify which workspace members consume the proposal's subject
+    /// (i.e. depend on the bumped crate, package, etc).
+    ///
+    /// The Reporter filters per-consumer rows to only members in this
+    /// list, so a Cargo workspace where 3 of 50 members use `serde`
+    /// produces a 3-row report for a `serde` bump.
+    ///
+    /// Returns an empty `Vec` for ecosystems without a workspace-member
+    /// axis (and for non-workspace Cargo projects) — the Reporter
+    /// collapses to a flat single-project report when no consumer axis
+    /// is meaningful.
+    ///
+    /// Cargo's impl walks `cargo metadata` (lands in Commit F); GHA
+    /// returns empty in v1.
+    fn affected_consumers(&self, proposal: &Proposal, tree: &Path) -> Result<Vec<ConsumerId>>;
 
     /// Apply the proposal to a working tree (typically a tempdir clone).
     /// The implementation owns whatever ecosystem-specific writes that

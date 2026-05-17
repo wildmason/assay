@@ -111,9 +111,19 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
         Ok(Vec::new())
     }
 
-    fn affected_workflows(&self, _proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
+    fn gate_workflows(&self, _proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
         // A `uses:` bump only affects the workflows that reference it; the
         // Validator narrows the set after consulting `Proposal.manifest_paths`.
+        Ok(Vec::new())
+    }
+
+    fn affected_consumers(
+        &self,
+        _proposal: &Proposal,
+        _tree: &Path,
+    ) -> Result<Vec<crate::model::ConsumerId>> {
+        // GHA has no workspace-member axis — workflows live at the repo
+        // root. The Reporter collapses to a flat single-project format.
         Ok(Vec::new())
     }
 

@@ -59,6 +59,15 @@ pub struct Manifest {
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
+/// Identifies one workspace-member (consumer) in a workspace-rooted
+/// analysis.
+///
+/// For Cargo: the member's package name (e.g. `"web-app"`, `"shared-lib"`).
+/// For ecosystems without a workspace-member axis (GHA, single-project
+/// Cargo): unused — the Resolver returns an empty `Vec`, and the
+/// Reporter collapses to a flat single-project report.
+pub type ConsumerId = String;
+
 /// Kind of proposed change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -67,7 +67,7 @@ impl DependencyEcosystem for CargoEcosystem {
         run_cargo_proposer(repo, manifests)
     }
 
-    fn affected_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
+    fn gate_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
         // Default: every CI-named workflow in the repo. The Validator
         // narrows this further via config (`validate_workflows`).
         let workflows_dir = repo.join(".github").join("workflows");
@@ -95,6 +95,18 @@ impl DependencyEcosystem for CargoEcosystem {
         }
         out.sort();
         Ok(out)
+    }
+
+    fn affected_consumers(
+        &self,
+        _proposal: &Proposal,
+        _tree: &Path,
+    ) -> Result<Vec<crate::model::ConsumerId>> {
+        // Stub for Commit F. The real implementation walks `cargo metadata`
+        // to enumerate workspace members consuming the bumped crate and
+        // returns only those member names. Empty `Vec` here means the
+        // Reporter renders a flat (non-workspace) report.
+        Ok(Vec::new())
     }
 
     fn apply_proposal(&self, _proposal: &Proposal, tree_path: &Path) -> Result<()> {
@@ -727,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn affected_workflows_lists_yml_files_only() {
+    fn gate_workflows_lists_yml_files_only() {
         let tmp = tempfile::tempdir().unwrap();
         let workflows = tmp.path().join(".github").join("workflows");
         std::fs::create_dir_all(&workflows).unwrap();
@@ -746,7 +758,7 @@ mod tests {
             manifest_paths: vec![],
             notes: vec![],
         };
-        let mut workflows = eco.affected_workflows(&stub_proposal, tmp.path()).unwrap();
+        let mut workflows = eco.gate_workflows(&stub_proposal, tmp.path()).unwrap();
         workflows.sort();
         assert_eq!(workflows.len(), 2);
         assert!(workflows.iter().any(|p| p.ends_with("ci.yml")));

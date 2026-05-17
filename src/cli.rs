@@ -289,7 +289,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
 
             // Validate the bump via ci-forge.
             let workflow_paths = ecosystem
-                .affected_workflows(proposal, &apply_tree)
+                .gate_workflows(proposal, &apply_tree)
                 .unwrap_or_default();
             let outcome = match validator.validate(proposal, &apply_tree, &workflow_paths) {
                 Ok(outcome) => outcome,
