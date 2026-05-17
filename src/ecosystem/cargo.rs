@@ -371,91 +371,92 @@ pub fn apply_cargo_update_to_tree(tree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Invoke `cargo update --dry-run --workspace` against a tempdir clone of
-/// `repo` and parse the result into proposals.
+/// Invoke `cargo update --dry-run --workspace` against the host repo's
+/// own manifest and parse the result into proposals.
 ///
-/// Implementation detail: we clone with `git clone --local --no-hardlinks`
-/// to get a writable working copy that does NOT share git objects via the
-/// `alternates` mechanism (which would leak the alternates pointer back
-/// into anything that archived the tempdir). When the source repo isn't a
-/// git checkout, we fall back to copying just the manifest files.
+/// **Why direct, not cloned to a tempdir.** An earlier design cloned the
+/// repo into `tempfile::TempDir` and ran cargo there for write isolation.
+/// That breaks on any project with **out-of-tree path deps** — e.g.
+/// `wildmason-license = { path = "../../licensing/crate" }` in a Tauri
+/// project's `src-tauri/Cargo.toml`. Once cloned, the relative path
+/// resolves into a non-existent location and cargo refuses to even
+/// enumerate the dep graph.
+///
+/// `--dry-run` is non-mutating to the lockfile by design, so running on
+/// the host is safe. Cargo's user-level registry cache
+/// (`~/.cargo/registry`) gets refreshed as a side effect, which is
+/// behavior the operator already expects from any cargo invocation.
+///
+/// **Lockfile cross-check trade-off.** The earlier design ran a second
+/// `cargo update` (non-dry-run) in the tempdir to produce a real
+/// lockfile diff, then cross-checked it against the parsed stdout —
+/// catching parser drift if cargo's stdout format ever changed. Without
+/// a tempdir, we can't run the mutating side without touching the host.
+/// We accept the parser-only path for v1; [`propose_from_cargo_dry_run`]
+/// keeps the cross-check available for callers that *do* have an
+/// after-lockfile to compare.
 fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposal>> {
-    let tmp = tempfile::Builder::new()
-        .prefix("assay-cargo-")
-        .tempdir()
-        .map_err(|source| Error::Io {
-            path: repo.to_path_buf(),
-            source,
-        })?;
-    let clone_root = tmp.path();
-    materialize_cargo_workspace(repo, clone_root)?;
-
-    let manifest_path = clone_root.join("Cargo.toml");
-    let lock_path = clone_root.join("Cargo.lock");
-    let lock_before = std::fs::read_to_string(&lock_path).map_err(|source| Error::Io {
-        path: lock_path.clone(),
-        source,
-    })?;
-
+    let manifest_path = repo.join("Cargo.toml");
+    let manifest_str = manifest_path
+        .to_str()
+        .ok_or_else(|| Error::other("Cargo.toml path is not valid UTF-8"))?;
     let dry_run_output = run_cargo_command(
-        clone_root,
+        repo,
         &[
             "update",
             "--dry-run",
             "--workspace",
             "--manifest-path",
-            manifest_path
-                .to_str()
-                .ok_or_else(|| Error::other("Cargo.toml path is not valid UTF-8"))?,
+            manifest_str,
         ],
     )?;
-    let stdout = dry_run_output.stdout.clone();
-
-    // Cargo emits its diagnostics on stderr; if it failed, surface that.
     if !dry_run_output.success {
         return Err(Error::CargoUpdate {
             message: format!(
                 "cargo update --dry-run exited non-zero: stderr=\n{}\nstdout=\n{}",
                 dry_run_output.stderr.trim(),
-                stdout.trim()
+                dry_run_output.stdout.trim()
             ),
         });
     }
 
-    // For the cross-check we need an *actual* lockfile diff. Re-run cargo
-    // update without --dry-run inside the same tempdir clone. The host
-    // tree is never mutated because we operate on a copy.
-    let apply_output = run_cargo_command(
-        clone_root,
-        &[
-            "update",
-            "--workspace",
-            "--manifest-path",
-            manifest_path.to_str().expect("validated above"),
-        ],
-    )?;
-    if !apply_output.success {
-        return Err(Error::CargoUpdate {
-            message: format!(
-                "cargo update (non-dry-run, in tempdir) exited non-zero: stderr=\n{}",
-                apply_output.stderr.trim()
-            ),
-        });
-    }
-    let lock_after = std::fs::read_to_string(&lock_path).map_err(|source| Error::Io {
-        path: lock_path.clone(),
-        source,
-    })?;
-
-    // Manifest paths to record on each proposal — workspace-relative paths
-    // taken from the detected manifest list.
     let manifest_paths: Vec<PathBuf> = manifests
         .iter()
         .filter(|m| matches!(m.kind, ManifestKind::CargoLock | ManifestKind::CargoToml))
         .map(|m| m.path.clone())
         .collect();
 
-    propose_from_cargo_dry_run(&stdout, &lock_before, &lock_after, &manifest_paths)
+    propose_from_cargo_stdout(&dry_run_output.stdout, &manifest_paths)
+}
+
+/// Build proposals from `cargo update --dry-run` stdout without the
+/// lockfile-diff cross-check. Used by [`run_cargo_proposer`] which can't
+/// generate an after-lockfile without a mutating cargo invocation.
+pub fn propose_from_cargo_stdout(
+    stdout: &str,
+    manifest_paths: &[PathBuf],
+) -> Result<Vec<Proposal>> {
+    let parsed = parse_cargo_update_output(stdout);
+    let mut proposals = Vec::new();
+    for line in &parsed {
+        let id = format!(
+            "cargo-{}-{}",
+            sanitize_id_segment(&line.crate_name),
+            sanitize_id_segment(&line.to),
+        );
+        proposals.push(Proposal {
+            id,
+            ecosystem: EcosystemName::Cargo.as_str().to_string(),
+            kind: ProposalKind::Version,
+            subject: line.crate_name.clone(),
+            from: line.from.clone(),
+            to: line.to.clone(),
+            initial_classification: Classification::Exact,
+            manifest_paths: manifest_paths.to_vec(),
+            notes: Vec::new(),
+        });
+    }
+    Ok(proposals)
 }
 
 #[derive(Debug)]
@@ -482,74 +483,6 @@ fn run_cargo_command(cwd: &Path, args: &[&str]) -> Result<CargoCommandOutput> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
-}
-
-/// Materialize the relevant subset of `repo` into `dest` so cargo can
-/// resolve the workspace. Prefers `git clone --local --no-hardlinks` for
-/// fidelity; falls back to a manifest-only copy when the repo isn't a git
-/// checkout.
-fn materialize_cargo_workspace(repo: &Path, dest: &Path) -> Result<()> {
-    let is_git = repo.join(".git").exists();
-    if is_git {
-        let output = std::process::Command::new("git")
-            .arg("clone")
-            .arg("--local")
-            .arg("--no-hardlinks")
-            .arg("--quiet")
-            .arg(repo)
-            .arg(dest)
-            .output()
-            .map_err(|source| Error::Io {
-                path: repo.to_path_buf(),
-                source,
-            })?;
-        if !output.status.success() {
-            return Err(Error::other(format!(
-                "git clone --local failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(())
-    } else {
-        copy_manifest_tree(repo, dest)
-    }
-}
-
-fn copy_manifest_tree(src: &Path, dest: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(src).map_err(|source| Error::Io {
-        path: src.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| Error::Io {
-            path: src.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let target = dest.join(&file_name);
-        if path.is_dir() {
-            // Skip target/, .git/, node_modules/, .assay/, and other
-            // build outputs. Cargo only needs source manifests + src/.
-            let name = file_name.to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                "target" | ".git" | "node_modules" | ".assay" | "target-codex" | "research"
-            ) {
-                continue;
-            }
-            std::fs::create_dir_all(&target).map_err(|source| Error::Io {
-                path: target.clone(),
-                source,
-            })?;
-            copy_manifest_tree(&path, &target)?;
-        } else {
-            std::fs::copy(&path, &target).map_err(|source| Error::Io {
-                path: target.clone(),
-                source,
-            })?;
-        }
-    }
-    Ok(())
 }
 
 /// Replace any character outside `[a-z0-9-]` with `-`. Used to build
@@ -732,6 +665,32 @@ mod tests {
         let stdout = "Updating crates.io index\n";
         let parsed = parse_cargo_update_output(stdout);
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn propose_from_cargo_stdout_builds_proposal_per_updating_line() {
+        let stdout = "Updating crates.io index\n   Updating serde v1.0.200 -> v1.0.215\n   Updating tokio v1.40.0 -> v1.42.0\n";
+        let proposals = propose_from_cargo_stdout(stdout, &[PathBuf::from("Cargo.lock")]).unwrap();
+        assert_eq!(proposals.len(), 2);
+        let serde = proposals.iter().find(|p| p.subject == "serde").unwrap();
+        assert_eq!(serde.from, "1.0.200");
+        assert_eq!(serde.to, "1.0.215");
+        assert_eq!(serde.id, "cargo-serde-1-0-215");
+        assert_eq!(serde.manifest_paths, vec![PathBuf::from("Cargo.lock")]);
+        assert!(
+            proposals.iter().any(|p| p.subject == "tokio"),
+            "tokio proposal must be present"
+        );
+    }
+
+    #[test]
+    fn propose_from_cargo_stdout_returns_empty_when_nothing_to_update() {
+        // Cargo's "Locking 0 packages..." line + a verbose note. No
+        // "Updating X v1 -> v2" lines means no proposals — assay should
+        // report nothing-to-do cleanly, not crash.
+        let stdout = "     Locking 0 packages to latest Rust 1.93.1 compatible versions\nnote: pass `--verbose` to see 110 unchanged dependencies behind latest\nwarning: not updating lockfile due to dry run\n";
+        let proposals = propose_from_cargo_stdout(stdout, &[PathBuf::from("Cargo.lock")]).unwrap();
+        assert!(proposals.is_empty());
     }
 
     fn lockfile_with(packages: &[(&str, &str)]) -> String {
