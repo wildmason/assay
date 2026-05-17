@@ -521,12 +521,17 @@ fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposa
     let manifest_str = manifest_path
         .to_str()
         .ok_or_else(|| Error::other("Cargo.toml path is not valid UTF-8"))?;
+    // `--verbose` is what surfaces the `Unchanged X v$OLD (available: v$NEW)`
+    // lines we need for the Compatible / Breaking tiers. Without it, cargo
+    // prints only a `note: pass --verbose to see N unchanged…` hint and the
+    // 100+ constraint-pinned upgrade opportunities stay invisible.
     let dry_run_output = run_cargo_command(
         repo,
         &[
             "update",
             "--dry-run",
             "--workspace",
+            "--verbose",
             "--manifest-path",
             manifest_str,
         ],
@@ -547,7 +552,58 @@ fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposa
         .map(|m| m.path.clone())
         .collect();
 
-    propose_from_cargo_stdout(&dry_run_output.stdout, &manifest_paths)
+    // LockfileOnly tier first (existing path), then the Compatible /
+    // Breaking proposals parsed from the same stdout. Cargo's `Updating`
+    // and `Unchanged` lines are disjoint per run, so no dedup needed.
+    let mut proposals = propose_from_cargo_stdout(&dry_run_output.stdout, &manifest_paths)?;
+    proposals.extend(propose_unchanged_from_cargo_stdout(
+        &dry_run_output.stdout,
+        &manifest_paths,
+    ));
+    Ok(proposals)
+}
+
+/// Build [`BumpTier::Compatible`] and [`BumpTier::Breaking`] proposals from
+/// the `Unchanged X vFROM (available: vTO[, requires Rust X.Y.Z])` lines
+/// emitted by `cargo update --dry-run --verbose`. Each line becomes a
+/// report-only proposal — assay surfaces it but does NOT auto-apply,
+/// because closing the gap requires editing Cargo.toml constraints,
+/// not just regenerating the lockfile. (The constraint-edit applier
+/// lands in a follow-up commit.)
+///
+/// `requires_rust` notes from cargo ride along in `notes` so the
+/// operator sees the MSRV ask before deciding to merge.
+pub fn propose_unchanged_from_cargo_stdout(
+    stdout: &str,
+    manifest_paths: &[PathBuf],
+) -> Vec<Proposal> {
+    let parsed = parse_cargo_unchanged_output(stdout);
+    let mut proposals = Vec::with_capacity(parsed.len());
+    for line in &parsed {
+        let tier = classify_unchanged_bump(&line.from, &line.to);
+        let id = format!(
+            "cargo-{}-{}",
+            sanitize_id_segment(&line.crate_name),
+            sanitize_id_segment(&line.to),
+        );
+        let mut notes = Vec::new();
+        if let Some(rust) = &line.requires_rust {
+            notes.push(format!("requires Rust {rust}"));
+        }
+        proposals.push(Proposal {
+            id,
+            ecosystem: EcosystemName::Cargo.as_str().to_string(),
+            kind: ProposalKind::Version,
+            subject: line.crate_name.clone(),
+            from: line.from.clone(),
+            to: line.to.clone(),
+            initial_classification: Classification::Exact,
+            manifest_paths: manifest_paths.to_vec(),
+            notes,
+            bump_tier: tier,
+        });
+    }
+    proposals
 }
 
 /// Build proposals from `cargo update --dry-run` stdout without the
@@ -972,6 +1028,59 @@ warning: not updating lockfile due to dry run
             proposals.iter().any(|p| p.subject == "tokio"),
             "tokio proposal must be present"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // propose_unchanged_from_cargo_stdout — Compatible/Breaking proposals.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn propose_unchanged_emits_tier_aware_proposals() {
+        let stdout = "\
+   Unchanged cargo_metadata v0.18.1 (available: v0.20.0)
+   Unchanged tokio v1.40.0 (available: v1.45.2)
+   Unchanged serde v1.0.200 (available: v2.0.0)
+";
+        let proposals = propose_unchanged_from_cargo_stdout(stdout, &[PathBuf::from("Cargo.toml")]);
+        assert_eq!(proposals.len(), 3);
+
+        let by_subject: BTreeMap<&str, &Proposal> =
+            proposals.iter().map(|p| (p.subject.as_str(), p)).collect();
+
+        // 0.18.1 -> 0.20.0 crosses Cargo's 0.x compat group → Breaking.
+        let meta = by_subject["cargo_metadata"];
+        assert_eq!(meta.bump_tier, crate::model::BumpTier::Breaking);
+        assert_eq!(meta.from, "0.18.1");
+        assert_eq!(meta.to, "0.20.0");
+
+        // 1.40 -> 1.45 stays within major 1 → Compatible.
+        let tokio = by_subject["tokio"];
+        assert_eq!(tokio.bump_tier, crate::model::BumpTier::Compatible);
+
+        // 1.0 -> 2.0 crosses major → Breaking.
+        let serde = by_subject["serde"];
+        assert_eq!(serde.bump_tier, crate::model::BumpTier::Breaking);
+    }
+
+    #[test]
+    fn propose_unchanged_attaches_msrv_note_when_present() {
+        let stdout = "   Unchanged wasip2 v1.0.1+wasi-0.2.4 (available: v1.0.3+wasi-0.2.9, requires Rust 1.87.0)\n";
+        let proposals = propose_unchanged_from_cargo_stdout(stdout, &[]);
+        assert_eq!(proposals.len(), 1);
+        let p = &proposals[0];
+        assert_eq!(p.bump_tier, crate::model::BumpTier::Compatible);
+        assert!(
+            p.notes.iter().any(|n| n.contains("Rust 1.87.0")),
+            "MSRV note must ride along: {:?}",
+            p.notes,
+        );
+    }
+
+    #[test]
+    fn propose_unchanged_returns_empty_when_no_unchanged_lines() {
+        let stdout = "   Updating serde v1.0.200 -> v1.0.215\n";
+        let proposals = propose_unchanged_from_cargo_stdout(stdout, &[]);
+        assert!(proposals.is_empty());
     }
 
     #[test]

@@ -92,6 +92,7 @@ mod tests {
                 proposals_passed: 1,
                 proposals_failed: 0,
                 proposals_unvalidated: 0,
+                proposals_discovered: 0,
                 prs_opened: 0,
             },
             provenance: Provenance {

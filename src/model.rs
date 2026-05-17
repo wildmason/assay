@@ -199,6 +199,11 @@ pub struct RunSummary {
     pub proposals_passed: usize,
     pub proposals_failed: usize,
     pub proposals_unvalidated: usize,
+    /// Proposals whose [`BumpTier`] short-circuited apply/validate
+    /// (Compatible or Breaking). Surfaces the helm-style 110-deps-
+    /// behind-latest gap. `#[serde(default)]` for receipt back-compat.
+    #[serde(default)]
+    pub proposals_discovered: usize,
     pub prs_opened: usize,
 }
 

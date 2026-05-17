@@ -322,6 +322,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut proposals_passed = 0usize;
     let mut proposals_failed = 0usize;
     let mut proposals_unvalidated = 0usize;
+    let mut proposals_discovered = 0usize;
     let mut completed_runs: Vec<ProposalRun> = Vec::new();
     let mut pre_validation_failures = 0usize;
 
@@ -363,6 +364,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 process_proposal_unit(unit, validator_ref, registry_ref, repo_ref, run_id_ref, ctx)
             },
             |outcome| {
+                // `Discovered` is intentionally NOT red — it's a successful
+                // surfacing of a non-applyable bump, not a failure.
                 matches!(outcome, WorkerOutcome::PreValidationFailure { .. })
                     || matches!(outcome, WorkerOutcome::ValidatorErrored { .. })
                     || matches!(
@@ -413,6 +416,14 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         outcome,
                     });
                 }
+                WorkerOutcome::Discovered {
+                    eco_idx: _,
+                    proposal: _,
+                    provenance: pr_records,
+                } => {
+                    provenance.records.extend(pr_records);
+                    proposals_discovered += 1;
+                }
             }
         }
     } else {
@@ -450,6 +461,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         proposals_passed,
         proposals_failed,
         proposals_unvalidated,
+        proposals_discovered,
         prs_opened: 0,
     };
     let finished_at = iso8601_now();
@@ -469,6 +481,11 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let run_json_path = write_run_receipt(&args.repo, &receipt)?;
 
     if matches!(args.format, OutputFormat::Text) {
+        // Per-tier breakdown surfaces the helm-style "110 deps behind
+        // latest but constraint-pinned" gap that plain `cargo update`
+        // hides. Walks all_proposals directly — the source of truth.
+        let (lockfile_only, compatible, breaking) =
+            tier_counts(all_proposals.iter().map(|(_, p)| p));
         println!(
             "assay: scanned {} manifest(s) across {} ecosystem(s); {} proposal(s) (mode={:?})",
             total_manifests,
@@ -476,10 +493,17 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             all_proposals.len(),
             mode,
         );
+        println!(
+            "assay: tier breakdown: {} lockfile-only / {} compatible / {} breaking",
+            lockfile_only, compatible, breaking,
+        );
+        if (compatible + breaking) > 0 {
+            print_discovered_section(all_proposals.iter().map(|(_, p)| p));
+        }
         if matches!(mode, ApplyMode::ApplyLocal) {
             println!(
-                "assay: validated {} green / {} red / {} unvalidated",
-                proposals_passed, proposals_failed, proposals_unvalidated,
+                "assay: validated {} green / {} red / {} unvalidated / {} discovered (skipped apply)",
+                proposals_passed, proposals_failed, proposals_unvalidated, proposals_discovered,
             );
             match &commit_summary {
                 Some(CommitSummary::Committed {
@@ -524,8 +548,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         }
         if matches!(mode, ApplyMode::ApplyPr) {
             println!(
-                "assay: validated {} green / {} red / {} unvalidated",
-                proposals_passed, proposals_failed, proposals_unvalidated,
+                "assay: validated {} green / {} red / {} unvalidated / {} discovered (skipped apply)",
+                proposals_passed, proposals_failed, proposals_unvalidated, proposals_discovered,
             );
             match &pr_summary {
                 Some(ApplyPrSummary::Published {
@@ -570,6 +594,7 @@ struct WorkUnit {
 /// id. The current aggregator only reads them via the structural match
 /// in `analyze_command`, so allow the dead-code lint here.
 #[allow(dead_code)]
+#[derive(Debug)]
 enum WorkerOutcome {
     /// Apply tree preparation or `apply_proposal` failed before validation
     /// could run.
@@ -593,6 +618,123 @@ enum WorkerOutcome {
         outcome: crate::model::ValidationOutcome,
         provenance: Vec<ProvenanceRecord>,
     },
+    /// Proposal's `bump_tier` is non-applyable in v1 (Compatible or
+    /// Breaking — they need a Cargo.toml constraint edit, not just a
+    /// lockfile bump). Worker short-circuits before apply/validate and
+    /// emits this so the reporter can surface the discovery without
+    /// pretending it ran CI.
+    Discovered {
+        #[allow(dead_code)] // carried for symmetry with sibling variants
+        eco_idx: usize,
+        #[allow(dead_code)] // carried for receipt correlation
+        proposal: Proposal,
+        provenance: Vec<ProvenanceRecord>,
+    },
+}
+
+/// Returns `(lockfile_only, compatible, breaking)` counts from a stream of
+/// proposals. Used by the text reporter to surface the tier breakdown
+/// without re-walking the worker pool outcomes.
+fn tier_counts<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) -> (usize, usize, usize) {
+    use crate::model::BumpTier;
+    let mut lockfile_only = 0usize;
+    let mut compatible = 0usize;
+    let mut breaking = 0usize;
+    for proposal in proposals {
+        match proposal.bump_tier {
+            BumpTier::LockfileOnly => lockfile_only += 1,
+            BumpTier::Compatible => compatible += 1,
+            BumpTier::Breaking => breaking += 1,
+        }
+    }
+    (lockfile_only, compatible, breaking)
+}
+
+/// Prints the per-tier discovered-bump table to stdout.
+///
+/// Format:
+///
+/// ```text
+/// assay: discovered upgrades (not auto-applied — manifest constraint edit required):
+///   compatible:
+///     cargo_metadata  0.18.1 -> 0.20.0
+///   breaking:
+///     serde  1.0.215 -> 2.0.0
+/// ```
+fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) {
+    use crate::model::BumpTier;
+    let mut compatible: Vec<&Proposal> = Vec::new();
+    let mut breaking: Vec<&Proposal> = Vec::new();
+    for p in proposals {
+        match p.bump_tier {
+            BumpTier::Compatible => compatible.push(p),
+            BumpTier::Breaking => breaking.push(p),
+            BumpTier::LockfileOnly => {}
+        }
+    }
+    if compatible.is_empty() && breaking.is_empty() {
+        return;
+    }
+    println!("assay: discovered upgrades (not auto-applied — manifest constraint edit required):");
+    let print_group = |label: &str, mut group: Vec<&Proposal>| {
+        if group.is_empty() {
+            return;
+        }
+        group.sort_by(|a, b| a.subject.cmp(&b.subject));
+        println!("  {label}:");
+        for p in group {
+            let mut line = format!("    {}  {} -> {}", p.subject, p.from, p.to);
+            if !p.notes.is_empty() {
+                line.push_str(&format!("  [{}]", p.notes.join(", ")));
+            }
+            println!("{line}");
+        }
+    };
+    print_group("compatible", compatible);
+    print_group("breaking", breaking);
+}
+
+/// Short-circuit for proposals whose `bump_tier` isn't safe to auto-apply
+/// in v1.
+///
+/// Returns `None` for [`BumpTier::LockfileOnly`] (the full apply → validate
+/// pipeline owns those). Returns `Some(WorkerOutcome::Discovered)` for
+/// [`BumpTier::Compatible`] and [`BumpTier::Breaking`] — these need a
+/// Cargo.toml constraint edit and the constraint-edit applier is a
+/// separate (still-pending) piece of work. Until that lands, surfacing
+/// the bump as a discovery record is the correct behavior.
+fn short_circuit_for_tier(
+    proposal: &Proposal,
+    eco_idx: usize,
+    ecosystem_name: &str,
+) -> Option<WorkerOutcome> {
+    use crate::model::BumpTier;
+    match proposal.bump_tier {
+        BumpTier::LockfileOnly => None,
+        tier @ (BumpTier::Compatible | BumpTier::Breaking) => {
+            let record = ProvenanceRecord {
+                tool: "assay".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                stage: format!("proposer.{ecosystem_name}.discover"),
+                subject: proposal.id.clone(),
+                status: Classification::Exact,
+                summary: format!(
+                    "discovered {} bump for {} ({} -> {}); report-only — constraint widening required",
+                    tier.as_str(),
+                    proposal.subject,
+                    proposal.from,
+                    proposal.to,
+                ),
+                artifact_path: None,
+                details: Some(serde_json::json!({ "bump_tier": tier.as_str() })),
+            };
+            Some(WorkerOutcome::Discovered {
+                eco_idx,
+                proposal: proposal.clone(),
+                provenance: vec![record],
+            })
+        }
+    }
 }
 
 /// Worker body: prepare sandbox → apply proposal → gate workflows → validate.
@@ -608,6 +750,12 @@ fn process_proposal_unit(
     run_id: &str,
     ctx: &WorkerContext<'_>,
 ) -> WorkerOutcome {
+    let ecosystem_name = registry[unit.eco_idx].name();
+    if let Some(short_circuit) =
+        short_circuit_for_tier(&unit.proposal, unit.eco_idx, ecosystem_name)
+    {
+        return short_circuit;
+    }
     let mut records: Vec<ProvenanceRecord> = Vec::new();
     let ecosystem = registry[unit.eco_idx].as_ref();
 
@@ -1502,6 +1650,79 @@ fn report_json(name: &str, manifests: &[Manifest]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------------------
+    // short_circuit_for_tier — non-LockfileOnly tiers must bypass apply.
+    // -------------------------------------------------------------------------
+
+    fn proposal_with_tier(tier: crate::model::BumpTier) -> Proposal {
+        Proposal {
+            id: "cargo-foo-2-0-0".into(),
+            ecosystem: "cargo".into(),
+            kind: crate::model::ProposalKind::Version,
+            subject: "foo".into(),
+            from: "1.0.0".into(),
+            to: "2.0.0".into(),
+            initial_classification: crate::model::Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: tier,
+        }
+    }
+
+    #[test]
+    fn short_circuit_returns_none_for_lockfile_only() {
+        // LockfileOnly must flow through the full apply → validate
+        // pipeline. Short-circuit returning Some here would silently
+        // skip CI validation.
+        let result = short_circuit_for_tier(
+            &proposal_with_tier(crate::model::BumpTier::LockfileOnly),
+            0,
+            "cargo",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn short_circuit_returns_discovered_for_compatible() {
+        let outcome = short_circuit_for_tier(
+            &proposal_with_tier(crate::model::BumpTier::Compatible),
+            0,
+            "cargo",
+        )
+        .expect("Compatible must short-circuit");
+        match outcome {
+            WorkerOutcome::Discovered { provenance, .. } => {
+                assert_eq!(provenance.len(), 1);
+                assert_eq!(provenance[0].stage, "proposer.cargo.discover");
+                assert!(provenance[0].summary.contains("compatible"));
+                // Tier must be recoverable from details JSON for the
+                // receipt loader and any future tier-grouped reporter.
+                let details = provenance[0].details.as_ref().expect("details required");
+                assert_eq!(details["bump_tier"], "compatible");
+            }
+            other => panic!("expected Discovered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_circuit_returns_discovered_for_breaking() {
+        let outcome = short_circuit_for_tier(
+            &proposal_with_tier(crate::model::BumpTier::Breaking),
+            0,
+            "cargo",
+        )
+        .expect("Breaking must short-circuit");
+        match outcome {
+            WorkerOutcome::Discovered { provenance, .. } => {
+                assert_eq!(
+                    provenance[0].details.as_ref().unwrap()["bump_tier"],
+                    "breaking"
+                );
+            }
+            other => panic!("expected Discovered, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_cli_accepts_analyze_with_defaults() {
