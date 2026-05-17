@@ -33,6 +33,15 @@ use wait_timeout::ChildExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+/// In-memory cap per drained stream (stdout + stderr each). Prevents a
+/// runaway workflow whose CI output is gigabytes from OOMing the parent.
+/// Beyond this cap, bytes are silently dropped — the captured buffer
+/// will end with a synthetic `[assay: truncated at N bytes]` marker so
+/// the operator knows their full log lives only on disk (when a backend
+/// writes one). Defaults to 16 MiB which is comfortably more than any
+/// real PR-gate suite produces.
+pub const STREAM_CAPTURE_CAP: usize = 16 * 1024 * 1024;
+
 /// Outcome of [`run_with_timeout`].
 #[derive(Debug)]
 pub enum RunResult {
@@ -130,8 +139,35 @@ where
     };
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
+        let mut buf = Vec::with_capacity(8 * 1024);
+        let mut chunk = [0u8; 8 * 1024];
+        let mut total: usize = 0;
+        let mut truncated = false;
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if total + n <= STREAM_CAPTURE_CAP {
+                        buf.extend_from_slice(&chunk[..n]);
+                        total += n;
+                    } else if total < STREAM_CAPTURE_CAP {
+                        let remaining = STREAM_CAPTURE_CAP - total;
+                        buf.extend_from_slice(&chunk[..remaining]);
+                        total = STREAM_CAPTURE_CAP;
+                        truncated = true;
+                    } else {
+                        truncated = true;
+                        // Keep draining so the pipe doesn't back-pressure
+                        // the child, but discard bytes past the cap.
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if truncated {
+            let marker = format!("\n[assay: truncated at {STREAM_CAPTURE_CAP} bytes]\n");
+            buf.extend_from_slice(marker.as_bytes());
+        }
         let _ = tx.send(buf);
     });
     DrainHandle::Live { rx, handle }
@@ -257,6 +293,53 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// Drain a reader of arbitrary size through the same code path
+    /// `run_with_timeout` uses, then assert on the captured buffer.
+    fn drain_to_completion<R: Read + Send + 'static>(reader: R) -> Vec<u8> {
+        let handle = drain_into_thread(Some(reader));
+        handle.join().unwrap_or_default()
+    }
+
+    #[test]
+    fn drainer_caps_in_memory_capture_at_stream_capture_cap() {
+        // A reader that yields 2× the cap of `A` bytes.
+        struct BigReader {
+            remaining: usize,
+        }
+        impl Read for BigReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.remaining);
+                for slot in buf.iter_mut().take(n) {
+                    *slot = b'A';
+                }
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+        let total_size = STREAM_CAPTURE_CAP * 2;
+        let captured = drain_to_completion(BigReader {
+            remaining: total_size,
+        });
+        // Captured is at most CAP + the truncation marker.
+        assert!(captured.len() > STREAM_CAPTURE_CAP);
+        assert!(captured.len() < STREAM_CAPTURE_CAP + 200);
+        // Truncation marker present.
+        let tail = String::from_utf8_lossy(&captured[captured.len().saturating_sub(80)..]);
+        assert!(
+            tail.contains("[assay: truncated"),
+            "expected truncation marker in captured tail; tail was: {tail}"
+        );
+    }
+
+    #[test]
+    fn drainer_does_not_truncate_when_well_under_cap() {
+        let captured = drain_to_completion("hello world".as_bytes());
+        assert_eq!(captured, b"hello world");
     }
 
     #[test]
