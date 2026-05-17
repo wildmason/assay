@@ -120,6 +120,20 @@ pub trait ValidatorBackend: Send + Sync {
 
     /// Stable name for receipts / provenance.
     fn name(&self) -> &'static str;
+
+    /// Whether the backend needs a real `.github/workflows/*.yml` file
+    /// to validate against. [`ForgeRunBackend`] returns `true` (it runs
+    /// the named workflow). [`BuildTestBackend`] and [`CustomBackend`]
+    /// return `false` — they validate the tree itself (cargo build/test
+    /// or an operator-supplied gate command) and need only one
+    /// invocation per proposal.
+    ///
+    /// Default is `true` so a future workflow-bound backend doesn't
+    /// silently elide its workflow requirement by forgetting to
+    /// override.
+    fn needs_workflow_file(&self) -> bool {
+        true
+    }
 }
 
 // =============================================================================
@@ -521,6 +535,12 @@ impl ValidatorBackend for BuildTestBackend {
         self.label
     }
 
+    fn needs_workflow_file(&self) -> bool {
+        // We validate by running `cargo build` + `cargo test` against
+        // the prepared tree — no .github/workflows/*.yml required.
+        false
+    }
+
     fn validate_workflow(
         &self,
         workflow: &Path,
@@ -796,6 +816,12 @@ impl ValidatorBackend for CustomBackend {
         self.label
     }
 
+    fn needs_workflow_file(&self) -> bool {
+        // The gate command is operator-supplied and runs against the
+        // tree itself. Workflow paths are irrelevant.
+        false
+    }
+
     fn validate_workflow(
         &self,
         workflow: &Path,
@@ -956,6 +982,14 @@ impl Validator {
         workflow_paths: &[PathBuf],
     ) -> Result<ValidationOutcome> {
         if workflow_paths.is_empty() {
+            if !self.backend.needs_workflow_file() {
+                // Tree-mode backend (BuildTest / Custom). Run once
+                // against the prepared tree using a sentinel workflow
+                // path — backends that don't consume the path ignore
+                // it; the receipt's validated_workflows reflects the
+                // sentinel so the operator can see what was run.
+                return self.run_tree_mode_backend(proposal, workspace);
+            }
             return Ok(ValidationOutcome {
                 proposal_id: proposal.id.clone(),
                 conclusion: "unvalidated".to_string(),
@@ -1064,6 +1098,54 @@ impl Validator {
             conclusion,
             ci_forge_run_ids: run_ids,
             validated_workflows: validated,
+            classification,
+            notes,
+        })
+    }
+
+    /// Tree-mode dispatch: a backend that doesn't need a workflow file
+    /// (BuildTest, Custom) is invoked exactly once against the prepared
+    /// tree. The synthetic workflow path is reported in
+    /// `validated_workflows` so the receipt names what was run.
+    fn run_tree_mode_backend(
+        &self,
+        proposal: &Proposal,
+        workspace: &Path,
+    ) -> Result<ValidationOutcome> {
+        let log_dir = tempfile::Builder::new()
+            .prefix("assay-validator-")
+            .tempdir()
+            .map_err(|source| Error::Io {
+                path: workspace.to_path_buf(),
+                source,
+            })?;
+        let synthetic = PathBuf::from(format!("<tree:{}>", self.backend.name()));
+        let stem = "tree-mode";
+        let log_path = log_dir.path().join(format!("{stem}.log"));
+        let outcome = self.backend.validate_workflow(
+            &synthetic,
+            workspace,
+            self.workflow_timeout,
+            &log_path,
+        )?;
+        let mut notes = Vec::new();
+        let (classification, conclusion) = match &outcome.result {
+            WorkflowResult::Pass => (Classification::Exact, "success".to_string()),
+            WorkflowResult::Fail(flavor) => {
+                let flavor_label = match flavor {
+                    FailureFlavor::Regression { details } => format!("REGRESSION ({details})"),
+                    FailureFlavor::SetupFailure { reason } => format!("SETUP-FAILURE ({reason})"),
+                    FailureFlavor::Timeout => "TIMEOUT".to_string(),
+                };
+                notes.push(format!("tree-mode validation concluded {flavor_label}"));
+                (Classification::Unsupported, "failure".to_string())
+            }
+        };
+        Ok(ValidationOutcome {
+            proposal_id: proposal.id.clone(),
+            conclusion,
+            ci_forge_run_ids: outcome.forge_run_id.into_iter().collect(),
+            validated_workflows: vec![synthetic],
             classification,
             notes,
         })

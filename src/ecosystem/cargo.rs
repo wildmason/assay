@@ -640,11 +640,63 @@ fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposa
     // installed.
     let combined = format!("{}\n{}", dry_run_output.stdout, dry_run_output.stderr);
     let mut proposals = propose_from_cargo_stdout(&combined, &manifest_paths)?;
-    proposals.extend(propose_unchanged_from_cargo_stdout(
-        &combined,
-        &manifest_paths,
-    ));
+
+    // Unchanged-line proposals get filtered against the set of *direct*
+    // workspace dependencies. cargo's verbose output also lists
+    // transitive deps that are "behind latest", but those have no
+    // constraint entry in this workspace's manifests — they'd be
+    // bumped by widening the parent direct dep. Surfacing them as
+    // proposals here would create fake actionable items the applier
+    // would (correctly) refuse with "expected to widen the constraint
+    // for X but no manifest carried a matching dep entry".
+    let unchanged = propose_unchanged_from_cargo_stdout(&combined, &manifest_paths);
+    let direct = collect_direct_dep_names(repo)?;
+    proposals.extend(filter_to_direct_deps(unchanged, &direct));
     Ok(proposals)
+}
+
+/// Returns the set of *direct* (declared in some workspace member's
+/// Cargo.toml) dependency names. Used to drop transitive-only entries
+/// from the Unchanged-line tier proposals — the constraint editor can
+/// only widen entries that actually appear in a manifest.
+fn collect_direct_dep_names(repo: &Path) -> Result<std::collections::BTreeSet<String>> {
+    use cargo_metadata::MetadataCommand;
+    let manifest_path = repo.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let metadata = MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .no_deps()
+        .exec()
+        .map_err(|e| {
+            Error::other(format!(
+                "cargo metadata (for direct-dep filter) failed: {e}"
+            ))
+        })?;
+    let mut names = std::collections::BTreeSet::new();
+    for pkg in &metadata.packages {
+        for dep in &pkg.dependencies {
+            // `dep.name` is the source-of-truth package name even when
+            // a member renames via `foo = { package = "actual", ... }`.
+            names.insert(dep.name.clone());
+        }
+    }
+    Ok(names)
+}
+
+/// Pure filter: keep only proposals whose `subject` (crate name) is in
+/// `direct_names`. Split out so the proposer's transitive-dep filter
+/// can be exercised against synthetic inputs without spinning up
+/// cargo metadata.
+fn filter_to_direct_deps(
+    proposals: Vec<Proposal>,
+    direct_names: &std::collections::BTreeSet<String>,
+) -> Vec<Proposal> {
+    proposals
+        .into_iter()
+        .filter(|p| direct_names.contains(&p.subject))
+        .collect()
 }
 
 /// Build [`BumpTier::Compatible`] and [`BumpTier::Breaking`] proposals from
@@ -1165,6 +1217,40 @@ warning: not updating lockfile due to dry run
         let stdout = "   Updating serde v1.0.200 -> v1.0.215\n";
         let proposals = propose_unchanged_from_cargo_stdout(stdout, &[]);
         assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn filter_to_direct_deps_keeps_only_named_subjects() {
+        // Real-world failure mode caught in dogfood: cargo's verbose
+        // output mentions transitive deps (generic-array, wasip2) that
+        // aren't in any of our manifests. The applier would refuse to
+        // widen them. The proposer must drop them before they ship.
+        use std::collections::BTreeSet;
+        let proposals = vec![
+            sample_cargo_proposal_named("serde"),
+            sample_cargo_proposal_named("generic-array"),
+            sample_cargo_proposal_named("tokio"),
+            sample_cargo_proposal_named("wasip2"),
+        ];
+        let direct: BTreeSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+        let kept = filter_to_direct_deps(proposals, &direct);
+        let subjects: Vec<&str> = kept.iter().map(|p| p.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["serde", "tokio"]);
+    }
+
+    fn sample_cargo_proposal_named(name: &str) -> Proposal {
+        Proposal {
+            id: format!("cargo-{name}-test"),
+            ecosystem: "cargo".into(),
+            kind: crate::model::ProposalKind::Version,
+            subject: name.into(),
+            from: "1.0.0".into(),
+            to: "1.5.0".into(),
+            initial_classification: crate::model::Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+        }
     }
 
     #[test]

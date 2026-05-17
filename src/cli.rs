@@ -631,15 +631,15 @@ fn tier_counts<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) -> (usize,
     (lockfile_only, compatible, breaking)
 }
 
-/// Prints the per-tier discovered-bump table to stdout.
+/// Prints the per-tier upgrade table to stdout.
 ///
 /// Format:
 ///
 /// ```text
-/// assay: discovered upgrades (not auto-applied — manifest constraint edit required):
-///   compatible:
+/// assay: per-tier upgrades:
+///   compatible (within-major; manifest constraint widening applied):
 ///     cargo_metadata  0.18.1 -> 0.20.0
-///   breaking:
+///   breaking (crosses semver-major; manifest edit applied):
 ///     serde  1.0.215 -> 2.0.0
 /// ```
 fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) {
@@ -656,7 +656,7 @@ fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal
     if compatible.is_empty() && breaking.is_empty() {
         return;
     }
-    println!("assay: discovered upgrades (not auto-applied — manifest constraint edit required):");
+    println!("assay: per-tier upgrades:");
     let print_group = |label: &str, mut group: Vec<&Proposal>| {
         if group.is_empty() {
             return;
@@ -1987,10 +1987,13 @@ mod tests {
             fail_fast: false,
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
-        // The Validator field isn't pub, but `validate` against an empty
-        // tree and no workflows surfaces a deterministic outcome we can
-        // assert on — the *unvalidated* path doesn't run the backend, so
-        // the assertion focuses on the construction succeeding.
+        // CustomBackend reports `needs_workflow_file() == false`, so the
+        // validator runs the gate command once against the tree using a
+        // synthetic workflow path. With `make test` (the gate) failing on
+        // an empty tempdir, we expect a real failure conclusion — what
+        // we're verifying here is that the backend was actually invoked,
+        // not the no-workflows "unvalidated" stub that the previous
+        // implementation returned.
         let tmp = tempfile::tempdir().unwrap();
         let outcome = validator
             .validate(
@@ -2010,7 +2013,16 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(outcome.conclusion, "unvalidated");
+        assert_ne!(
+            outcome.conclusion, "unvalidated",
+            "CustomBackend must run even when no workflows exist; got {outcome:?}",
+        );
+        assert_eq!(outcome.validated_workflows.len(), 1);
+        let displayed = outcome.validated_workflows[0].display().to_string();
+        assert!(
+            displayed.starts_with("<tree:"),
+            "synthetic workflow path expected, got {displayed}",
+        );
     }
 
     #[test]
