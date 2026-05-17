@@ -95,6 +95,21 @@ pub trait DependencyEcosystem: Send + Sync {
     /// entails (rewriting `Cargo.lock`, mutating `uses:` SHAs, etc.).
     fn apply_proposal(&self, proposal: &Proposal, tree_path: &Path) -> Result<()>;
 
+    /// Copy the validated change-set from `sandbox` to `host`, returning
+    /// the host-relative paths assay modified (suitable for `git add`).
+    ///
+    /// Per Arch-5 in the plan, the validated sandbox state is **copied
+    /// back** to the operator's tree rather than re-derived. This avoids
+    /// non-determinism from registry state or upstream metadata changing
+    /// between sandbox-apply and host-apply.
+    ///
+    /// Ecosystems are responsible for refusing mid-flight host edits that
+    /// would invalidate the copy-back. GHA uses its existing `from`
+    /// mismatch defense (`rewrite_uses_in_workflow` errors if the host
+    /// file no longer contains `<subject>@<from>`); Cargo has no such
+    /// concern because `Cargo.lock` is regenerable, not a contract.
+    fn copy_back(&self, proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>>;
+
     /// Render an ecosystem-specific fragment for the PR body. Result is
     /// already sanitized (the ecosystem is responsible for routing any
     /// upstream-supplied strings through `sanitize::*` first).

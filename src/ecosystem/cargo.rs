@@ -109,6 +109,22 @@ impl DependencyEcosystem for CargoEcosystem {
         apply_cargo_update_to_tree(tree_path)
     }
 
+    fn copy_back(&self, _proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
+        let sandbox_lock = sandbox.join("Cargo.lock");
+        if !sandbox_lock.is_file() {
+            return Err(Error::other(format!(
+                "Cargo.lock missing from sandbox at `{}`; cannot copy back",
+                sandbox.display()
+            )));
+        }
+        let host_lock = host.join("Cargo.lock");
+        std::fs::copy(&sandbox_lock, &host_lock).map_err(|source| Error::Io {
+            path: host_lock,
+            source,
+        })?;
+        Ok(vec![PathBuf::from("Cargo.lock")])
+    }
+
     fn pr_body_fragment(&self, proposal: &Proposal, outcome: &ValidationOutcome) -> String {
         format!(
             "- **{crate}**: `{from}` → `{to}` ({classification})",
@@ -855,6 +871,61 @@ mod tests {
                 assert!(message.contains("not found"));
             }
             other => panic!("expected InvalidManifest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_back_copies_sandbox_lockfile_to_host() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(sandbox.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(host.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let sandbox_lock_contents = lockfile_with(&[("serde", "1.0.215")]);
+        std::fs::write(sandbox.path().join("Cargo.lock"), &sandbox_lock_contents).unwrap();
+        // Host starts with an older lock — copy-back must overwrite.
+        std::fs::write(
+            host.path().join("Cargo.lock"),
+            lockfile_with(&[("serde", "1.0.200")]),
+        )
+        .unwrap();
+
+        let eco = CargoEcosystem;
+        let proposal = sample_cargo_proposal();
+        let modified = eco
+            .copy_back(&proposal, sandbox.path(), host.path())
+            .expect("copy-back should succeed");
+        assert_eq!(modified, vec![PathBuf::from("Cargo.lock")]);
+        let post = std::fs::read_to_string(host.path().join("Cargo.lock")).unwrap();
+        assert_eq!(post, sandbox_lock_contents);
+    }
+
+    #[test]
+    fn copy_back_errors_when_sandbox_lockfile_missing() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let eco = CargoEcosystem;
+        let proposal = sample_cargo_proposal();
+        let err = eco
+            .copy_back(&proposal, sandbox.path(), host.path())
+            .expect_err("copy-back without sandbox lock should fail");
+        assert!(
+            err.to_string().contains("missing from sandbox"),
+            "error should explain the missing lockfile: {err}"
+        );
+    }
+
+    fn sample_cargo_proposal() -> Proposal {
+        Proposal {
+            id: "cargo-serde-1-0-215".into(),
+            ecosystem: "cargo".into(),
+            kind: crate::model::ProposalKind::Version,
+            subject: "serde".into(),
+            from: "1.0.200".into(),
+            to: "1.0.215".into(),
+            initial_classification: crate::model::Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
         }
     }
 

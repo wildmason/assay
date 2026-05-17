@@ -1,6 +1,6 @@
 //! CLI surface for `assay`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,7 @@ use crate::model::{
     RepositoryRef, RunSummary,
 };
 use crate::receipt::write_run_receipt;
+use crate::sanitize::sanitize_commit_subject;
 use crate::validator::{CustomBackend, Validator, ValidatorExecutor};
 use crate::workflow_filter::WorkflowFilter;
 
@@ -277,6 +278,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut proposals_passed = 0usize;
     let mut proposals_failed = 0usize;
     let mut proposals_unvalidated = 0usize;
+    let mut completed_runs: Vec<ProposalRun> = Vec::new();
+    let mut pre_validation_failures = 0usize;
 
     if matches!(mode, ApplyMode::ApplyLocal) && !all_proposals.is_empty() {
         let validator =
@@ -298,6 +301,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         details: None,
                     });
                     proposals_failed += 1;
+                    pre_validation_failures += 1;
                     continue;
                 }
             };
@@ -313,6 +317,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     details: None,
                 });
                 proposals_failed += 1;
+                pre_validation_failures += 1;
                 continue;
             }
             provenance.records.push(ProvenanceRecord {
@@ -321,19 +326,17 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 stage: format!("applier.{}", ecosystem.name()),
                 subject: proposal.id.clone(),
                 status: Classification::Exact,
-                summary: "applied to isolated retained worktree".into(),
+                summary: "applied to sandbox worktree".into(),
                 artifact_path: None,
-                details: Some(serde_json::json!({ "worktree": apply_tree })),
+                details: Some(serde_json::json!({ "sandbox": apply_tree })),
             });
 
-            // Validate the bump via ci-forge.
             let workflow_paths = ecosystem
                 .gate_workflows(proposal, &apply_tree)
                 .unwrap_or_default();
             let outcome = match validator.validate(proposal, &apply_tree, &workflow_paths) {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    // Best-effort: skip validation when forge isn't on PATH.
                     proposals_unvalidated += 1;
                     provenance.records.push(ProvenanceRecord {
                         tool: "assay".into(),
@@ -367,9 +370,26 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 artifact_path: None,
                 details: Some(serde_json::to_value(&outcome).map_err(Error::Json)?),
             });
+            completed_runs.push(ProposalRun {
+                eco_idx: *eco_idx,
+                proposal: proposal.clone(),
+                sandbox: apply_tree,
+                outcome,
+            });
         }
     } else {
         proposals_unvalidated = all_proposals.len();
+    }
+
+    let mut commit_summary: Option<CommitSummary> = None;
+    if matches!(mode, ApplyMode::ApplyLocal) && !all_proposals.is_empty() {
+        commit_summary = Some(perform_apply_local_commit(
+            &args.repo,
+            &registry,
+            &mut completed_runs,
+            pre_validation_failures,
+            &mut provenance,
+        )?);
     }
 
     let summary = RunSummary {
@@ -406,12 +426,41 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         );
         if matches!(mode, ApplyMode::ApplyLocal) {
             println!(
-                "assay: applied {} / failed {} / unvalidated {}",
+                "assay: validated {} green / {} red / {} unvalidated",
                 proposals_passed, proposals_failed, proposals_unvalidated,
             );
+            match &commit_summary {
+                Some(CommitSummary::Committed {
+                    bump_count,
+                    paths,
+                    subject,
+                }) => {
+                    println!(
+                        "assay: committed {} bump(s) to current branch as `{}` ({} path(s) updated: {})",
+                        bump_count,
+                        subject,
+                        paths.len(),
+                        paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                Some(CommitSummary::SkippedDueToFailures { red_count, total }) => {
+                    println!(
+                        "assay: refused to commit (--apply-local requires all-green); {} of {} proposal(s) failed validation",
+                        red_count, total,
+                    );
+                }
+                Some(CommitSummary::NothingToCommit) => {
+                    println!("assay: nothing to commit (no green proposals)");
+                }
+                None => {}
+            }
             if !all_proposals.is_empty() {
                 println!(
-                    "assay: applied worktrees are retained under {}",
+                    "assay: sandbox worktrees retained for audit under {}",
                     args.repo
                         .join(".assay")
                         .join("runs")
@@ -422,6 +471,209 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             }
         }
         println!("assay: receipt written to {}", run_json_path.display());
+    }
+    Ok(())
+}
+
+/// One proposal's full lifecycle through the apply-local pipeline:
+/// applier produced a sandbox tree, validator scored it. Held in memory
+/// until the post-loop commit phase decides whether to copy-back.
+struct ProposalRun {
+    eco_idx: usize,
+    proposal: Proposal,
+    sandbox: PathBuf,
+    outcome: crate::model::ValidationOutcome,
+}
+
+/// What happened during the post-validation `--apply-local` commit phase.
+#[derive(Debug)]
+enum CommitSummary {
+    /// All proposals validated green and the commit was created.
+    Committed {
+        bump_count: usize,
+        paths: Vec<PathBuf>,
+        subject: String,
+    },
+    /// One or more proposals didn't validate green; refusing to commit
+    /// preserves the "atomic, all-green" semantic of `--apply-local`.
+    SkippedDueToFailures { red_count: usize, total: usize },
+    /// No proposals reached validation cleanly — nothing to commit.
+    NothingToCommit,
+}
+
+/// Run the post-validation commit phase for `--apply-local`.
+///
+/// Per plan §C.6.a: validate all proposals first, then if every proposal
+/// validated green, sort by proposal ID (Conc-9), copy-back each from
+/// its sandbox to the host tree, and create one atomic commit. If any
+/// proposal didn't validate green (failure, unvalidated, or pre-apply
+/// failure), refuse to commit — the user can re-run after fixing the
+/// failing proposals.
+fn perform_apply_local_commit(
+    repo: &Path,
+    registry: &[Box<dyn DependencyEcosystem>],
+    completed_runs: &mut [ProposalRun],
+    pre_validation_failures: usize,
+    provenance: &mut Provenance,
+) -> Result<CommitSummary> {
+    let red_count = pre_validation_failures
+        + completed_runs
+            .iter()
+            .filter(|r| r.outcome.conclusion != "success")
+            .count();
+    let total = completed_runs.len() + pre_validation_failures;
+    if total == 0 {
+        return Ok(CommitSummary::NothingToCommit);
+    }
+    if red_count > 0 {
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "publisher.apply_local".into(),
+            subject: "<aggregate>".into(),
+            status: Classification::Unsupported,
+            summary: format!(
+                "refused to commit: {} of {} proposal(s) didn't validate green",
+                red_count, total
+            ),
+            artifact_path: None,
+            details: None,
+        });
+        return Ok(CommitSummary::SkippedDueToFailures { red_count, total });
+    }
+
+    // All-green: sort by proposal ID for byte-deterministic commits
+    // (Conc-9), then copy each sandbox's validated change-set back to
+    // the host tree.
+    completed_runs.sort_by(|a, b| a.proposal.id.cmp(&b.proposal.id));
+
+    let mut modified_paths: Vec<PathBuf> = Vec::new();
+    let mut body_lines: Vec<String> = Vec::new();
+    for run in completed_runs.iter() {
+        let ecosystem = registry[run.eco_idx].as_ref();
+        let modified = ecosystem
+            .copy_back(&run.proposal, &run.sandbox, repo)
+            .map_err(|err| {
+                Error::other(format!(
+                    "copy-back failed for proposal `{}`: {err}",
+                    run.proposal.id
+                ))
+            })?;
+        for path in &modified {
+            if !modified_paths.contains(path) {
+                modified_paths.push(path.clone());
+            }
+        }
+        body_lines.push(format!(
+            "- {} {} -> {} ({})",
+            run.proposal.subject,
+            run.proposal.from,
+            run.proposal.to,
+            run.outcome.classification.as_str()
+        ));
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "publisher.apply_local".into(),
+            subject: run.proposal.id.clone(),
+            status: Classification::Exact,
+            summary: format!("copied back {} path(s)", modified.len()),
+            artifact_path: None,
+            details: Some(serde_json::json!({
+                "modified": modified.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            })),
+        });
+    }
+
+    if modified_paths.is_empty() {
+        return Ok(CommitSummary::NothingToCommit);
+    }
+
+    let raw_subject = if completed_runs.len() == 1 {
+        let p = &completed_runs[0].proposal;
+        format!(
+            "chore(deps): bump {} from {} to {}",
+            p.subject, p.from, p.to
+        )
+    } else {
+        format!("chore(deps): bump {} dependencies", completed_runs.len())
+    };
+    let subject = sanitize_commit_subject(&raw_subject)
+        .map_err(|err| {
+            Error::other(format!(
+                "internal: generated commit subject failed sanitization: {err}"
+            ))
+        })?
+        .to_string();
+    let body = body_lines.join("\n");
+
+    git_add_paths(repo, &modified_paths)?;
+    git_commit(repo, &subject, &body)?;
+
+    provenance.records.push(ProvenanceRecord {
+        tool: "assay".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        stage: "publisher.apply_local".into(),
+        subject: "<commit>".into(),
+        status: Classification::Exact,
+        summary: subject.clone(),
+        artifact_path: None,
+        details: Some(serde_json::json!({
+            "bump_count": completed_runs.len(),
+            "modified_paths": modified_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        })),
+    });
+
+    Ok(CommitSummary::Committed {
+        bump_count: completed_runs.len(),
+        paths: modified_paths,
+        subject,
+    })
+}
+
+/// Stage exactly the listed paths via `git add`. Refuses paths that
+/// resolve outside the repo to defend against `..` traversal.
+fn git_add_paths(repo: &Path, paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("add").arg("--").current_dir(repo);
+    for path in paths {
+        cmd.arg(path);
+    }
+    let output = cmd.output().map_err(|source| Error::Io {
+        path: repo.to_path_buf(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(Error::other(format!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Create a single commit on the current branch with the given subject
+/// and body. Refuses to amend; if there's nothing staged, returns an
+/// error rather than silently no-opping.
+fn git_commit(repo: &Path, subject: &str, body: &str) -> Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("commit").current_dir(repo);
+    cmd.arg("-m").arg(subject);
+    if !body.is_empty() {
+        cmd.arg("-m").arg(body);
+    }
+    let output = cmd.output().map_err(|source| Error::Io {
+        path: repo.to_path_buf(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(Error::other(format!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     Ok(())
 }
@@ -988,6 +1240,259 @@ mod tests {
                 "gate override should waive the host-executor safety gate: {err}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // perform_apply_local_commit — end-to-end apply-local
+    // -------------------------------------------------------------------------
+
+    fn init_git_repo(repo: &std::path::Path) {
+        git(repo, ["init", "-q"]);
+        git(repo, ["config", "user.email", "assay@example.invalid"]);
+        git(repo, ["config", "user.name", "assay-test"]);
+        git(repo, ["config", "commit.gpgsign", "false"]);
+    }
+
+    fn sample_cargo_proposal_for_apply() -> crate::model::Proposal {
+        crate::model::Proposal {
+            id: "cargo-serde-1-0-215".into(),
+            ecosystem: "cargo".into(),
+            kind: crate::model::ProposalKind::Version,
+            subject: "serde".into(),
+            from: "1.0.200".into(),
+            to: "1.0.215".into(),
+            initial_classification: crate::model::Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+        }
+    }
+
+    fn sample_outcome(conclusion: &str) -> crate::model::ValidationOutcome {
+        crate::model::ValidationOutcome {
+            proposal_id: "cargo-serde-1-0-215".into(),
+            conclusion: conclusion.into(),
+            ci_forge_run_ids: Vec::new(),
+            validated_workflows: Vec::new(),
+            classification: crate::model::Classification::Exact,
+            notes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn perform_apply_local_commit_creates_one_commit_when_all_green() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let repo = repo_tmp.path();
+        init_git_repo(repo);
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+        git(repo, ["add", "Cargo.toml", "Cargo.lock"]);
+        git(repo, ["commit", "-m", "init"]);
+
+        // Set up a sandbox whose Cargo.lock differs from the host's.
+        let sandbox_tmp = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_tmp.path();
+        std::fs::write(
+            sandbox.join("Cargo.lock"),
+            "version = 3\n[[package]]\nname = \"serde\"\nversion = \"1.0.215\"\n",
+        )
+        .unwrap();
+
+        let registry = crate::ecosystem::default_registry();
+        let mut completed_runs = vec![ProposalRun {
+            eco_idx: 0, // cargo
+            proposal: sample_cargo_proposal_for_apply(),
+            sandbox: sandbox.to_path_buf(),
+            outcome: sample_outcome("success"),
+        }];
+        let mut provenance = crate::model::Provenance::default();
+
+        let summary =
+            perform_apply_local_commit(repo, &registry, &mut completed_runs, 0, &mut provenance)
+                .expect("apply-local commit should succeed");
+
+        match summary {
+            CommitSummary::Committed {
+                bump_count,
+                paths,
+                subject,
+            } => {
+                assert_eq!(bump_count, 1);
+                assert_eq!(paths, vec![PathBuf::from("Cargo.lock")]);
+                assert!(
+                    subject.starts_with("chore(deps): bump serde from 1.0.200 to 1.0.215"),
+                    "subject should describe the single bump: {subject}"
+                );
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+
+        // Host Cargo.lock must now match sandbox.
+        let host_lock = std::fs::read_to_string(repo.join("Cargo.lock")).unwrap();
+        assert!(
+            host_lock.contains("1.0.215"),
+            "host lock should carry the validated bump: {host_lock}"
+        );
+
+        // Exactly one new commit was added.
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&log.stdout);
+        assert_eq!(
+            stdout.lines().count(),
+            2,
+            "expected init + apply commit, got:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn perform_apply_local_commit_refuses_when_any_proposal_failed() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let repo = repo_tmp.path();
+        init_git_repo(repo);
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+        git(repo, ["add", "Cargo.toml", "Cargo.lock"]);
+        git(repo, ["commit", "-m", "init"]);
+
+        let sandbox_tmp = tempfile::tempdir().unwrap();
+        std::fs::write(sandbox_tmp.path().join("Cargo.lock"), "version = 3\n").unwrap();
+
+        let registry = crate::ecosystem::default_registry();
+        // One green proposal + one failed validation. The mixed state
+        // should refuse the commit.
+        let mut completed_runs = vec![
+            ProposalRun {
+                eco_idx: 0,
+                proposal: sample_cargo_proposal_for_apply(),
+                sandbox: sandbox_tmp.path().to_path_buf(),
+                outcome: sample_outcome("success"),
+            },
+            ProposalRun {
+                eco_idx: 0,
+                proposal: crate::model::Proposal {
+                    id: "cargo-tokio-1-x".into(),
+                    ..sample_cargo_proposal_for_apply()
+                },
+                sandbox: sandbox_tmp.path().to_path_buf(),
+                outcome: sample_outcome("failure"),
+            },
+        ];
+        let mut provenance = crate::model::Provenance::default();
+
+        let summary =
+            perform_apply_local_commit(repo, &registry, &mut completed_runs, 0, &mut provenance)
+                .expect("refusal is not an error result");
+
+        match summary {
+            CommitSummary::SkippedDueToFailures { red_count, total } => {
+                assert_eq!(red_count, 1, "one failure should be counted");
+                assert_eq!(total, 2);
+            }
+            other => panic!("expected SkippedDueToFailures, got {other:?}"),
+        }
+
+        // No new commits beyond `init`.
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&log.stdout);
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "no apply commit should have been created: {stdout}"
+        );
+    }
+
+    #[test]
+    fn perform_apply_local_commit_is_deterministic_across_runs() {
+        let setup = || -> (tempfile::TempDir, tempfile::TempDir) {
+            let repo_tmp = tempfile::tempdir().unwrap();
+            let repo = repo_tmp.path();
+            init_git_repo(repo);
+            std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+            std::fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+            git(repo, ["add", "Cargo.toml", "Cargo.lock"]);
+            git(repo, ["commit", "-m", "init"]);
+            let sandbox_tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                sandbox_tmp.path().join("Cargo.lock"),
+                "version = 3\n[[package]]\nname = \"serde\"\nversion = \"1.0.215\"\n",
+            )
+            .unwrap();
+            (repo_tmp, sandbox_tmp)
+        };
+
+        let run = |repo: &std::path::Path, sandbox: &std::path::Path| -> String {
+            let registry = crate::ecosystem::default_registry();
+            // Three proposals in DIFFERENT input orders to prove the
+            // sort-by-id step normalizes the result.
+            let mut completed_runs = vec![
+                ProposalRun {
+                    eco_idx: 0,
+                    proposal: crate::model::Proposal {
+                        id: "cargo-z".into(),
+                        subject: "z-crate".into(),
+                        from: "1.0".into(),
+                        to: "1.1".into(),
+                        ..sample_cargo_proposal_for_apply()
+                    },
+                    sandbox: sandbox.to_path_buf(),
+                    outcome: sample_outcome("success"),
+                },
+                ProposalRun {
+                    eco_idx: 0,
+                    proposal: crate::model::Proposal {
+                        id: "cargo-a".into(),
+                        subject: "a-crate".into(),
+                        from: "1.0".into(),
+                        to: "1.1".into(),
+                        ..sample_cargo_proposal_for_apply()
+                    },
+                    sandbox: sandbox.to_path_buf(),
+                    outcome: sample_outcome("success"),
+                },
+                ProposalRun {
+                    eco_idx: 0,
+                    proposal: crate::model::Proposal {
+                        id: "cargo-m".into(),
+                        subject: "m-crate".into(),
+                        from: "1.0".into(),
+                        to: "1.1".into(),
+                        ..sample_cargo_proposal_for_apply()
+                    },
+                    sandbox: sandbox.to_path_buf(),
+                    outcome: sample_outcome("success"),
+                },
+            ];
+            let mut provenance = crate::model::Provenance::default();
+            perform_apply_local_commit(repo, &registry, &mut completed_runs, 0, &mut provenance)
+                .unwrap();
+            let output = std::process::Command::new("git")
+                .args(["log", "--pretty=format:%s%n%b", "-n", "1"])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        let (repo1, sb1) = setup();
+        let (repo2, sb2) = setup();
+        let commit1 = run(repo1.path(), sb1.path());
+        let commit2 = run(repo2.path(), sb2.path());
+        assert_eq!(
+            commit1, commit2,
+            "two runs against same inputs must produce byte-identical commits"
+        );
+        // Body order should be alphabetical-by-proposal-id.
+        let a_pos = commit1.find("a-crate").expect("a-crate in body");
+        let m_pos = commit1.find("m-crate").expect("m-crate in body");
+        let z_pos = commit1.find("z-crate").expect("z-crate in body");
+        assert!(a_pos < m_pos && m_pos < z_pos, "body order must be sorted");
     }
 
     #[test]

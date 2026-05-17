@@ -127,6 +127,54 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
         Ok(Vec::new())
     }
 
+    fn copy_back(&self, proposal: &Proposal, _sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
+        if !matches!(proposal.kind, crate::model::ProposalKind::ActionPin) {
+            return Err(Error::other(format!(
+                "GitHubActionsEcosystem expected ActionPin, got {:?}",
+                proposal.kind
+            )));
+        }
+        let mut modified = Vec::new();
+        for manifest_path in &proposal.manifest_paths {
+            let absolute = host.join(manifest_path);
+            let original = std::fs::read_to_string(&absolute).map_err(|source| Error::Io {
+                path: absolute.clone(),
+                source,
+            })?;
+            // rewrite_uses_in_workflow refuses on `from` mismatch with a
+            // clear error — that's the mid-flight-edit defense. We don't
+            // need to compare sandbox vs host bytes here; the from-pin
+            // check is sufficient.
+            let rewritten = rewrite_uses_in_workflow(
+                &original,
+                &proposal.subject,
+                &proposal.from,
+                &proposal.to,
+                proposal.notes.iter().find_map(|n| n.strip_prefix("tag:")),
+            )
+            .map_err(|err| {
+                Error::other(format!(
+                    "copy-back rejected for `{}`: the host workflow file at `{}` does not contain `{}@{}`. \
+                     The file may have been edited between validation and apply-local. \
+                     Re-run assay against the current tree, or revert the local edit.\n\
+                     underlying error: {err}",
+                    proposal.id,
+                    absolute.display(),
+                    proposal.subject,
+                    proposal.from,
+                ))
+            })?;
+            if rewritten != original {
+                std::fs::write(&absolute, rewritten).map_err(|source| Error::Io {
+                    path: absolute.clone(),
+                    source,
+                })?;
+                modified.push(manifest_path.clone());
+            }
+        }
+        Ok(modified)
+    }
+
     fn apply_proposal(&self, proposal: &Proposal, tree_path: &Path) -> Result<()> {
         if !matches!(proposal.kind, crate::model::ProposalKind::ActionPin) {
             return Err(Error::other(format!(
@@ -751,6 +799,83 @@ jobs:
             }
             assert_eq!(orig_line, new_line);
         }
+    }
+
+    #[test]
+    fn copy_back_rewrites_host_workflow_when_from_matches() {
+        let host = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let workflows = host.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let wf_path = workflows.join("ci.yml");
+        let wf_content = format!(
+            "name: ci\non: pull_request\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@{OLD}\n"
+        );
+        std::fs::write(&wf_path, &wf_content).unwrap();
+
+        let proposal = crate::model::Proposal {
+            id: "gha-actions-checkout-fedcba".into(),
+            ecosystem: "github-actions".into(),
+            kind: crate::model::ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: OLD.into(),
+            to: NEW.into(),
+            initial_classification: crate::model::Classification::Exact,
+            manifest_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
+            notes: vec![],
+        };
+        let eco = GitHubActionsEcosystem;
+        let modified = eco
+            .copy_back(&proposal, sandbox.path(), host.path())
+            .expect("copy-back should succeed");
+        assert_eq!(modified, vec![PathBuf::from(".github/workflows/ci.yml")]);
+        let post = std::fs::read_to_string(&wf_path).unwrap();
+        assert!(
+            post.contains(&format!("actions/checkout@{NEW}")),
+            "host workflow should carry the new SHA: {post}"
+        );
+    }
+
+    #[test]
+    fn copy_back_refuses_when_host_file_edited_mid_flight() {
+        let host = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let workflows = host.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let wf_path = workflows.join("ci.yml");
+        // Host file no longer contains `from` — simulating an operator edit
+        // that happened between sandbox-apply and copy-back. The rewriter's
+        // from-mismatch defense should fire.
+        let edited_content = "name: ci\non: pull_request\njobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4-unrelated-edit\n";
+        std::fs::write(&wf_path, edited_content).unwrap();
+
+        let proposal = crate::model::Proposal {
+            id: "gha-actions-checkout-fedcba".into(),
+            ecosystem: "github-actions".into(),
+            kind: crate::model::ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: OLD.into(),
+            to: NEW.into(),
+            initial_classification: crate::model::Classification::Exact,
+            manifest_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
+            notes: vec![],
+        };
+        let eco = GitHubActionsEcosystem;
+        let err = eco
+            .copy_back(&proposal, sandbox.path(), host.path())
+            .expect_err("from-mismatch should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("copy-back rejected"),
+            "error should call out copy-back rejection: {msg}"
+        );
+        assert!(
+            msg.contains("between validation and apply-local"),
+            "error should suggest the mid-flight-edit cause: {msg}"
+        );
+        // Host file should be UNCHANGED.
+        let post = std::fs::read_to_string(&wf_path).unwrap();
+        assert_eq!(post, edited_content);
     }
 
     #[test]
