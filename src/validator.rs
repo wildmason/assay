@@ -362,6 +362,185 @@ pub fn parse_forge_run_output(stdout: &str) -> Option<ForgeRunSummary> {
 }
 
 // =============================================================================
+// BuildTestBackend
+// =============================================================================
+
+/// Manifest-inferred build+test backend — the fallback when `forge` is
+/// not on PATH or the project has no `.github/workflows/` directory.
+///
+/// Runs a configured sequence of commands (e.g. `cargo build --workspace`
+/// then `cargo test --workspace`). Each command runs sequentially; the
+/// first non-success short-circuits to a `Regression` outcome; a missing
+/// binary produces a `SetupFailure`.
+///
+/// v1 limitation: when the `Validator` iterates N workflows with this
+/// backend, the configured commands run N times. Commit D's backend
+/// selection logic will compensate by passing a single synthetic workflow
+/// when this backend is chosen, so the multi-run cost is paid once.
+#[derive(Debug, Clone)]
+pub struct BuildTestBackend {
+    commands: Vec<Vec<String>>,
+    label: &'static str,
+}
+
+impl BuildTestBackend {
+    /// Canonical Cargo invocation: `cargo build --workspace` then
+    /// `cargo test --workspace`.
+    pub fn cargo() -> Self {
+        Self {
+            commands: vec![
+                vec!["cargo".into(), "build".into(), "--workspace".into()],
+                vec!["cargo".into(), "test".into(), "--workspace".into()],
+            ],
+            label: "build-test-cargo",
+        }
+    }
+
+    /// Explicit constructor for tests + future ecosystems (npm/pnpm/yarn).
+    pub fn with_commands(commands: Vec<Vec<String>>, label: &'static str) -> Self {
+        Self { commands, label }
+    }
+
+    /// Read-only accessor — useful for tests asserting the inferred command
+    /// shape without spawning anything.
+    pub fn commands(&self) -> &[Vec<String>] {
+        &self.commands
+    }
+
+    /// Infer the right command sequence from the project's manifest.
+    /// Returns `None` if no supported manifest is present (the operator
+    /// should pass `--gate-cmd` or install `forge`).
+    pub fn infer(project_root: &Path) -> Option<Self> {
+        if project_root.join("Cargo.toml").is_file() {
+            return Some(Self::cargo());
+        }
+        // v2: detect package.json / go.mod / pyproject.toml / Gemfile here
+        // and produce the matching test-runner invocation.
+        None
+    }
+
+    /// Classify a pre-collected sequence of command outputs without
+    /// spawning anything. Separated from `validate_workflow` so the
+    /// classification logic is unit-testable.
+    fn classify(
+        &self,
+        workflow: &Path,
+        results: &[(Vec<String>, std::io::Result<std::process::Output>)],
+        duration_ms: u128,
+        log_path: &Path,
+    ) -> WorkflowOutcome {
+        let mut combined_stderr = String::new();
+        for (cmd, result) in results {
+            match result {
+                Ok(output) => {
+                    combined_stderr.push_str(&format!(
+                        "=== {} ===\n{}\n",
+                        cmd.join(" "),
+                        String::from_utf8_lossy(&output.stderr),
+                    ));
+                    if !output.status.success() {
+                        let exit_label = output
+                            .status
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into());
+                        let stderr_tail_str = stderr_tail(&combined_stderr, 4096);
+                        return WorkflowOutcome {
+                            workflow: workflow.to_path_buf(),
+                            backend: self.label,
+                            result: WorkflowResult::Fail(FailureFlavor::Regression {
+                                details: format!("`{}` exited {exit_label}", cmd.join(" ")),
+                            }),
+                            forge_run_id: None,
+                            duration_ms,
+                            stderr_tail: stderr_tail_str,
+                            log_path: log_path.to_path_buf(),
+                        };
+                    }
+                }
+                Err(err) => {
+                    let bin = cmd.first().map(String::as_str).unwrap_or("(empty)");
+                    let reason = if err.kind() == std::io::ErrorKind::NotFound {
+                        format!("binary `{bin}` not found on PATH")
+                    } else {
+                        format!("couldn't spawn `{bin}`: {err}")
+                    };
+                    return WorkflowOutcome {
+                        workflow: workflow.to_path_buf(),
+                        backend: self.label,
+                        result: WorkflowResult::Fail(FailureFlavor::SetupFailure { reason }),
+                        forge_run_id: None,
+                        duration_ms,
+                        stderr_tail: String::new(),
+                        log_path: log_path.to_path_buf(),
+                    };
+                }
+            }
+        }
+        WorkflowOutcome {
+            workflow: workflow.to_path_buf(),
+            backend: self.label,
+            result: WorkflowResult::Pass,
+            forge_run_id: None,
+            duration_ms,
+            stderr_tail: String::new(),
+            log_path: log_path.to_path_buf(),
+        }
+    }
+}
+
+impl ValidatorBackend for BuildTestBackend {
+    fn name(&self) -> &'static str {
+        self.label
+    }
+
+    fn validate_workflow(
+        &self,
+        workflow: &Path,
+        tree: &Path,
+        _timeout: Duration,
+        log_path: &Path,
+    ) -> Result<WorkflowOutcome> {
+        let started = Instant::now();
+        let mut results = Vec::new();
+        for cmd in &self.commands {
+            if cmd.is_empty() {
+                continue;
+            }
+            let result = Command::new(&cmd[0])
+                .args(&cmd[1..])
+                .current_dir(tree)
+                .env("CARGO_TERM_COLOR", "never")
+                .output();
+            results.push((cmd.clone(), result));
+        }
+
+        // Best-effort log write — non-fatal on error.
+        let mut log_content = String::new();
+        for (cmd, result) in &results {
+            log_content.push_str(&format!("=== {} ===\n", cmd.join(" ")));
+            match result {
+                Ok(o) => log_content.push_str(&format!(
+                    "exit: {}\nstdout:\n{}\nstderr:\n{}\n\n",
+                    o.status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into()),
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                )),
+                Err(e) => log_content.push_str(&format!("spawn error: {e}\n\n")),
+            }
+        }
+        let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
+        let _ = std::fs::write(log_path, log_content);
+
+        let duration_ms = started.elapsed().as_millis();
+        Ok(self.classify(workflow, &results, duration_ms, log_path))
+    }
+}
+
+// =============================================================================
 // Validator (thin orchestrator over backends)
 // =============================================================================
 
@@ -883,5 +1062,120 @@ mod tests {
         assert_eq!(outcome.conclusion, "success");
         assert!(matches!(outcome.classification, Classification::Exact));
         assert!(outcome.notes.is_empty(), "passing run should have no notes");
+    }
+
+    // -------------------------------------------------------------------------
+    // BuildTestBackend
+    // -------------------------------------------------------------------------
+
+    /// Platform-portable "exit with code" argv (cmd /C on Windows, sh -c on Unix).
+    fn shell_exit_argv(code: u8) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".into(), "/C".into(), format!("exit {code}")]
+        } else {
+            vec!["sh".into(), "-c".into(), format!("exit {code}")]
+        }
+    }
+
+    #[test]
+    fn build_test_backend_cargo_command_sequence_is_canonical() {
+        let backend = BuildTestBackend::cargo();
+        let commands = backend.commands();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], vec!["cargo", "build", "--workspace"]);
+        assert_eq!(commands[1], vec!["cargo", "test", "--workspace"]);
+        assert_eq!(backend.name(), "build-test-cargo");
+    }
+
+    #[test]
+    fn build_test_backend_infer_detects_cargo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let backend = BuildTestBackend::infer(tmp.path()).expect("Cargo.toml should be detected");
+        assert_eq!(backend.name(), "build-test-cargo");
+    }
+
+    #[test]
+    fn build_test_backend_infer_returns_none_for_empty_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(BuildTestBackend::infer(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn build_test_backend_validates_pass_when_all_commands_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BuildTestBackend::with_commands(
+            vec![shell_exit_argv(0), shell_exit_argv(0)],
+            "test-pass",
+        );
+        let outcome = backend
+            .validate_workflow(
+                Path::new("ci.yml"),
+                tmp.path(),
+                Duration::from_secs(30),
+                &tmp.path().join("log.txt"),
+            )
+            .unwrap();
+        assert!(matches!(outcome.result, WorkflowResult::Pass));
+        assert_eq!(outcome.backend, "test-pass");
+        assert!(outcome.forge_run_id.is_none());
+    }
+
+    #[test]
+    fn build_test_backend_validates_regression_on_nonzero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        // First command succeeds; second fails. Short-circuits to a
+        // Regression pinned to the failing command.
+        let backend = BuildTestBackend::with_commands(
+            vec![shell_exit_argv(0), shell_exit_argv(101)],
+            "test-fail",
+        );
+        let outcome = backend
+            .validate_workflow(
+                Path::new("ci.yml"),
+                tmp.path(),
+                Duration::from_secs(30),
+                &tmp.path().join("log.txt"),
+            )
+            .unwrap();
+        match outcome.result {
+            WorkflowResult::Fail(FailureFlavor::Regression { details }) => {
+                assert!(
+                    details.contains("101"),
+                    "regression details should include the exit code: {details}"
+                );
+            }
+            other => panic!("expected Regression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_test_backend_validates_setup_failure_on_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BuildTestBackend::with_commands(
+            vec![vec!["nonexistent-binary-zzz-assay-test-12345".into()]],
+            "test-missing",
+        );
+        let outcome = backend
+            .validate_workflow(
+                Path::new("ci.yml"),
+                tmp.path(),
+                Duration::from_secs(30),
+                &tmp.path().join("log.txt"),
+            )
+            .unwrap();
+        match outcome.result {
+            WorkflowResult::Fail(FailureFlavor::SetupFailure { reason }) => {
+                assert!(
+                    reason.contains("nonexistent-binary"),
+                    "reason should name the missing binary: {reason}"
+                );
+                assert!(
+                    reason.contains("not found"),
+                    "reason should indicate missing-binary: {reason}"
+                );
+            }
+            other => panic!("expected SetupFailure, got {other:?}"),
+        }
     }
 }
