@@ -121,6 +121,14 @@ fn finalize(doc: DocumentMut, outcome: EditOutcome) -> Result<Option<(String, Ed
 /// Drill into `doc` at the dotted path, then try to edit an entry
 /// named `crate_name`. Returns `None` if the table doesn't exist or
 /// the dep entry isn't present.
+///
+/// Lookup is by **effective package name**, not by raw table key. Cargo
+/// supports a renamed-dep syntax — `memmap = { package = "memmap2", ... }`
+/// — where the local key (`memmap`) differs from the actual registry
+/// package (`memmap2`). The `package = "..."` field, when present, is
+/// the source of truth for what crate this entry resolves to;
+/// `cargo_metadata` reports that name in `dep.name`, so the proposer
+/// emits `subject = "memmap2"` and the editor must match accordingly.
 fn try_edit_at(
     doc: &mut DocumentMut,
     path: &[&str],
@@ -138,11 +146,40 @@ fn try_edit_at(
     let Some(table) = cursor.as_table_like_mut() else {
         return Ok(None);
     };
-    let Some(entry) = table.get_mut(crate_name) else {
+    let matched_key: Option<String> = table.iter().find_map(|(key, item)| {
+        let effective = entry_package_name(item).unwrap_or_else(|| key.to_string());
+        if effective == crate_name {
+            Some(key.to_string())
+        } else {
+            None
+        }
+    });
+    let Some(key) = matched_key else {
         return Ok(None);
     };
+    let entry = table
+        .get_mut(&key)
+        .expect("key was just enumerated from the same table");
     let table_label = path.join(".");
     edit_entry(entry, &table_label, new_version)
+}
+
+/// Return the `package = "..."` field value when the entry uses cargo's
+/// renamed-dep syntax; `None` for bare-string deps or inline/full tables
+/// without a `package` field (the table key is the package name in
+/// those cases).
+fn entry_package_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Value(Value::InlineTable(t)) => {
+            t.get("package").and_then(|v| v.as_str()).map(String::from)
+        }
+        Item::Table(t) => t
+            .get("package")
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        _ => None,
+    }
 }
 
 /// Edit a single dep entry (one of the three TOML shapes Cargo accepts).
@@ -490,6 +527,112 @@ serde = { version = 1 }
 "#;
         let result = update_constraint(toml, "serde", "1.0.0");
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Renamed deps via cargo's `{ package = "real-name", ... }` syntax.
+    //
+    // Real-world case caught by the ripgrep dogfood (2026-05-18):
+    // `crates/searcher/Cargo.toml` declares
+    //   memmap = { package = "memmap2", version = "0.9.0" }
+    // The local key is `memmap`; the actual registry package is `memmap2`.
+    // `cargo_metadata` reports the package name (`memmap2`), so the
+    // proposer correctly emits proposal subject = "memmap2", but the
+    // editor's direct table-key lookup misses the entry (key is "memmap",
+    // not "memmap2") and the apply fails with "no manifest carried a
+    // matching dep entry."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn edits_renamed_inline_table_dep_by_package_field() {
+        let toml = r#"[dependencies]
+memmap = { package = "memmap2", version = "0.9.0" }
+"#;
+        let (out, outcome) = update_constraint(toml, "memmap2", "0.9.10")
+            .unwrap()
+            .unwrap();
+        // Version widened, package field preserved, local rename key intact.
+        assert!(out.contains(r#"version = "0.9.10""#), "got: {out}");
+        assert!(out.contains(r#"package = "memmap2""#), "got: {out}");
+        assert!(out.contains("memmap = {"), "got: {out}");
+        assert_eq!(outcome.previous, "0.9.0");
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn edits_renamed_full_table_dep_by_package_field() {
+        let toml = r#"[dependencies.memmap]
+package = "memmap2"
+version = "0.9.0"
+"#;
+        let (out, outcome) = update_constraint(toml, "memmap2", "0.9.10")
+            .unwrap()
+            .unwrap();
+        assert!(out.contains(r#"version = "0.9.10""#), "got: {out}");
+        assert!(out.contains(r#"package = "memmap2""#), "got: {out}");
+        assert_eq!(outcome.previous, "0.9.0");
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn renamed_dep_does_not_match_on_local_key_alone() {
+        // `memmap = { package = "different-pkg", ... }` — the local key
+        // collides with what the caller is searching for, but the
+        // `package` field says this entry IS NOT `memmap`. Editor must
+        // return None so the caller keeps walking other manifests.
+        let toml = r#"[dependencies]
+memmap = { package = "different-pkg", version = "0.9.0" }
+"#;
+        let result = update_constraint(toml, "memmap", "0.9.10").unwrap();
+        assert!(
+            result.is_none(),
+            "key=memmap with package=different-pkg must NOT match query crate_name=memmap"
+        );
+    }
+
+    #[test]
+    fn unrenamed_dep_still_matches_by_table_key() {
+        // Sanity regression: when `package` is absent, the table key IS
+        // the package name. Pre-fix behavior must keep working.
+        let toml = r#"[dependencies]
+serde = "1.0"
+"#;
+        let (out, outcome) = update_constraint(toml, "serde", "1.5.2").unwrap().unwrap();
+        assert!(out.contains(r#"serde = "1.5.2""#));
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn walker_handles_renamed_dep_in_member_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Mirror ripgrep's shape: member declares the dep under a local
+        // rename. The walker must locate it via the `package` field and
+        // widen the constraint in place.
+        let root_toml = "[workspace]\n\
+            resolver = \"2\"\n\
+            members = [\"a\", \"b\"]\n";
+        build_walker_fixture(
+            root,
+            root_toml,
+            &[
+                (
+                    "a",
+                    r#"memmap = { package = "memmap2", version = "0.9.0" }"#,
+                ),
+                ("b", ""),
+            ],
+        );
+
+        let modified = apply_constraint_widening_to_workspace(root, "memmap2", "0.9.10").unwrap();
+        assert_eq!(modified, vec![PathBuf::from("a/Cargo.toml")]);
+        let a = std::fs::read_to_string(root.join("a/Cargo.toml")).unwrap();
+        assert!(a.contains(r#"version = "0.9.10""#), "a: {a}");
+        assert!(a.contains(r#"package = "memmap2""#), "a: {a}");
+        assert!(
+            a.contains("memmap = {"),
+            "local rename key must survive: {a}"
+        );
     }
 
     // -------------------------------------------------------------------------
