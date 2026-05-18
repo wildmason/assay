@@ -185,26 +185,20 @@ impl DependencyEcosystem for NpmEcosystem {
     }
 
     fn copy_back(&self, _proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
-        let Some(flavor) = detect_flavor(sandbox) else {
-            return Err(Error::other(format!(
-                "no lockfile in sandbox at `{}`; cannot copy back",
-                sandbox.display()
-            )));
-        };
-        let mut copied = Vec::new();
-        for relative in ["package.json", flavor.lockfile_name()] {
-            let sb = sandbox.join(relative);
-            let host_path = host.join(relative);
-            if !sb.is_file() {
-                continue;
-            }
-            std::fs::copy(&sb, &host_path).map_err(|source| Error::Io {
-                path: host_path,
-                source,
-            })?;
-            copied.push(PathBuf::from(relative));
-        }
-        Ok(copied)
+        copy_back_npm_sandbox(sandbox, host)
+    }
+
+    fn copy_back_merged(
+        &self,
+        _proposals: &[&Proposal],
+        sandbox: &Path,
+        host: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        // For npm, copy-back is bulk-by-design (the whole package.json
+        // and lockfile pair). Each per-proposal copy_back would just
+        // re-ship the same bytes, so the merged path collapses to ONE
+        // bulk copy from the merged sandbox to host.
+        copy_back_npm_sandbox(sandbox, host)
     }
 
     fn pr_body_fragment(&self, proposal: &Proposal, outcome: &ValidationOutcome) -> String {
@@ -216,6 +210,34 @@ impl DependencyEcosystem for NpmEcosystem {
             classification = outcome.classification.as_str(),
         )
     }
+}
+
+/// Bulk copy-back: ship the sandbox's `package.json` + flavor-specific
+/// lockfile to host. Used by both the per-proposal `copy_back` and the
+/// merged-set `copy_back_merged` because the unit of change for npm is
+/// always the whole manifest+lockfile pair regardless of how many
+/// proposals contributed to the sandbox state.
+fn copy_back_npm_sandbox(sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
+    let Some(flavor) = detect_flavor(sandbox) else {
+        return Err(Error::other(format!(
+            "no lockfile in sandbox at `{}`; cannot copy back",
+            sandbox.display()
+        )));
+    };
+    let mut copied = Vec::new();
+    for relative in ["package.json", flavor.lockfile_name()] {
+        let sb = sandbox.join(relative);
+        let host_path = host.join(relative);
+        if !sb.is_file() {
+            continue;
+        }
+        std::fs::copy(&sb, &host_path).map_err(|source| Error::Io {
+            path: host_path,
+            source,
+        })?;
+        copied.push(PathBuf::from(relative));
+    }
+    Ok(copied)
 }
 
 /// Single entry from `npm outdated --json` / `pnpm outdated --format=json`.

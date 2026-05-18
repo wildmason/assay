@@ -208,6 +208,17 @@ pub struct RunSummary {
     /// behind-latest gap. `#[serde(default)]` for receipt back-compat.
     #[serde(default)]
     pub proposals_discovered: usize,
+    /// Proposals that greened individually but were dropped by the
+    /// multi-proposal merge applier because including them in the
+    /// merged ship turned the merged-set validation red. Always
+    /// `proposals_shipped + proposals_merged_dropped == proposals_passed`.
+    /// `#[serde(default)]` for receipt back-compat.
+    #[serde(default)]
+    pub proposals_merged_dropped: usize,
+    /// Proposals that landed in the resulting commit (apply-local) or
+    /// pushed branch (apply-pr). `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub proposals_shipped: usize,
     pub prs_opened: usize,
 }
 

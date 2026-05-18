@@ -109,8 +109,31 @@ impl DependencyEcosystem for CargoEcosystem {
         apply_cargo_proposal(proposal, tree_path)
     }
 
+    fn apply_merged(&self, proposals: &[&Proposal], tree_path: &Path) -> Result<()> {
+        apply_cargo_proposals_merged(proposals, tree_path)
+    }
+
+    fn merge_is_redundant(&self, proposals: &[&Proposal]) -> bool {
+        // All-LockfileOnly proposals don't touch Cargo.toml, and
+        // `cargo update --workspace` produces a deterministic Cargo.lock
+        // shared across every per-proposal sandbox. The merge step's
+        // sandbox + revalidate is pure overhead for this case.
+        proposals
+            .iter()
+            .all(|p| matches!(p.bump_tier, BumpTier::LockfileOnly))
+    }
+
     fn copy_back(&self, proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
         copy_back_cargo_proposal(proposal, sandbox, host)
+    }
+
+    fn copy_back_merged(
+        &self,
+        proposals: &[&Proposal],
+        sandbox: &Path,
+        host: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        copy_back_cargo_proposals_merged(proposals, sandbox, host)
     }
 
     fn pr_body_fragment(&self, proposal: &Proposal, outcome: &ValidationOutcome) -> String {
@@ -527,6 +550,105 @@ pub fn copy_back_cargo_proposal(
         }
         copied.sort();
         // Dedup just in case (Cargo.lock first, manifests after).
+        copied.dedup();
+    }
+
+    Ok(copied)
+}
+
+/// Apply a set of cargo proposals to ONE sandbox tree as a single merged
+/// edit. Constraint widenings for all Compatible/Breaking proposals are
+/// applied to the workspace manifests first, then `cargo update --workspace`
+/// runs ONCE to refresh the lockfile against the merged constraint state.
+///
+/// This is the multi-proposal merge path used by `--apply-local` /
+/// `--apply-pr` after per-proposal validation: it produces a sandbox
+/// whose Cargo.toml + Cargo.lock pair reflects every shipped bump in
+/// one consistent state, defeating the prior per-proposal copy-back
+/// last-write-wins bug for Compatible/Breaking tiers.
+pub fn apply_cargo_proposals_merged(proposals: &[&Proposal], tree_path: &Path) -> Result<()> {
+    for proposal in proposals {
+        if matches!(proposal.bump_tier, BumpTier::LockfileOnly) {
+            continue;
+        }
+        let modified =
+            crate::ecosystem::cargo_manifest_editor::apply_constraint_widening_to_workspace(
+                tree_path,
+                &proposal.subject,
+                &proposal.to,
+            )?;
+        if modified.is_empty() {
+            return Err(Error::other(format!(
+                "expected to widen the constraint for `{}` in {} workspace but no manifest carried a matching dep entry",
+                proposal.subject,
+                tree_path.display(),
+            )));
+        }
+    }
+    apply_cargo_update_to_tree(tree_path)
+}
+
+/// Copy a merged cargo sandbox's full validated change-set back to host.
+///
+/// Always carries `Cargo.lock`. If ANY proposal in the merged set is
+/// non-LockfileOnly, walks the workspace manifests and ships any whose
+/// bytes differ between sandbox and host (the merged apply may have
+/// widened constraints across several Cargo.toml files when the same
+/// crate is declared in multiple workspace members).
+///
+/// Replaces the default per-proposal `copy_back` loop on the merge path:
+/// without this override the orchestrator would copy the same lockfile +
+/// manifest pair N times, which is wasteful but otherwise correct.
+pub fn copy_back_cargo_proposals_merged(
+    proposals: &[&Proposal],
+    sandbox: &Path,
+    host: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut copied: Vec<PathBuf> = Vec::new();
+
+    let sandbox_lock = sandbox.join("Cargo.lock");
+    if !sandbox_lock.is_file() {
+        return Err(Error::other(format!(
+            "Cargo.lock missing from sandbox at `{}`; cannot copy back",
+            sandbox.display()
+        )));
+    }
+    let host_lock = host.join("Cargo.lock");
+    std::fs::copy(&sandbox_lock, &host_lock).map_err(|source| Error::Io {
+        path: host_lock,
+        source,
+    })?;
+    copied.push(PathBuf::from("Cargo.lock"));
+
+    let any_non_lockfile_only = proposals
+        .iter()
+        .any(|p| !matches!(p.bump_tier, BumpTier::LockfileOnly));
+    if any_non_lockfile_only {
+        let manifests = crate::ecosystem::cargo_manifest_editor::list_workspace_manifests(sandbox)?;
+        for sb_manifest in manifests {
+            let rel = sb_manifest
+                .strip_prefix(sandbox)
+                .unwrap_or(&sb_manifest)
+                .to_path_buf();
+            if !sb_manifest.is_file() {
+                continue;
+            }
+            let host_manifest = host.join(&rel);
+            let sb_bytes = std::fs::read(&sb_manifest).map_err(|source| Error::Io {
+                path: sb_manifest.clone(),
+                source,
+            })?;
+            let host_bytes = std::fs::read(&host_manifest).unwrap_or_default();
+            if sb_bytes == host_bytes {
+                continue;
+            }
+            std::fs::copy(&sb_manifest, &host_manifest).map_err(|source| Error::Io {
+                path: host_manifest,
+                source,
+            })?;
+            copied.push(rel);
+        }
+        copied.sort();
         copied.dedup();
     }
 
@@ -1599,5 +1721,174 @@ warning: not updating lockfile due to dry run
             }
             other => panic!("expected InvalidManifest, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-proposal merge applier — apply_cargo_proposals_merged
+    // -------------------------------------------------------------------------
+
+    fn proposal_with_tier(subject: &str, tier: BumpTier) -> Proposal {
+        Proposal {
+            bump_tier: tier,
+            subject: subject.into(),
+            id: format!("cargo-{subject}-1-2-3"),
+            ..sample_cargo_proposal()
+        }
+    }
+
+    #[test]
+    fn merge_is_redundant_returns_true_for_all_lockfile_only() {
+        let eco = CargoEcosystem;
+        let a = proposal_with_tier("serde", BumpTier::LockfileOnly);
+        let b = proposal_with_tier("tokio", BumpTier::LockfileOnly);
+        let c = proposal_with_tier("reqwest", BumpTier::LockfileOnly);
+        let proposals: Vec<&Proposal> = vec![&a, &b, &c];
+        assert!(eco.merge_is_redundant(&proposals));
+    }
+
+    #[test]
+    fn merge_is_redundant_returns_false_when_any_compatible_present() {
+        let eco = CargoEcosystem;
+        let a = proposal_with_tier("serde", BumpTier::LockfileOnly);
+        let b = proposal_with_tier("tokio", BumpTier::Compatible);
+        let proposals: Vec<&Proposal> = vec![&a, &b];
+        assert!(!eco.merge_is_redundant(&proposals));
+    }
+
+    #[test]
+    fn merge_is_redundant_returns_false_when_any_breaking_present() {
+        let eco = CargoEcosystem;
+        let a = proposal_with_tier("serde", BumpTier::LockfileOnly);
+        let b = proposal_with_tier("tokio", BumpTier::Breaking);
+        let proposals: Vec<&Proposal> = vec![&a, &b];
+        assert!(!eco.merge_is_redundant(&proposals));
+    }
+
+    #[test]
+    fn copy_back_merged_ships_lockfile_for_all_lockfile_only_set() {
+        // All-LockfileOnly: copy_back_merged must ship JUST Cargo.lock
+        // — manifest scan is skipped because no proposal touched
+        // Cargo.toml in the merge sandbox.
+        let sandbox = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        // Sandbox + host both look like a single-crate workspace.
+        std::fs::write(
+            sandbox.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = []\n",
+        )
+        .unwrap();
+        let sandbox_lock = lockfile_with(&[("serde", "1.0.215")]);
+        std::fs::write(sandbox.path().join("Cargo.lock"), &sandbox_lock).unwrap();
+        std::fs::write(host.path().join("Cargo.lock"), "version = 3\n").unwrap();
+
+        let a = proposal_with_tier("serde", BumpTier::LockfileOnly);
+        let b = proposal_with_tier("tokio", BumpTier::LockfileOnly);
+        let proposals: Vec<&Proposal> = vec![&a, &b];
+        let modified = copy_back_cargo_proposals_merged(&proposals, sandbox.path(), host.path())
+            .expect("copy-back-merged should succeed");
+        assert_eq!(modified, vec![PathBuf::from("Cargo.lock")]);
+        let post = std::fs::read_to_string(host.path().join("Cargo.lock")).unwrap();
+        assert_eq!(post, sandbox_lock);
+    }
+
+    #[test]
+    fn copy_back_merged_ships_lockfile_and_diffed_manifests_for_mixed_set() {
+        // Mixed-tier (any non-LockfileOnly present): walks the workspace
+        // manifests and ships any whose bytes differ between sandbox + host.
+        let sandbox = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        // Workspace root, one member `a`. Both sandbox + host start
+        // identical except for `a/Cargo.toml` — sandbox's manifest has
+        // a widened constraint on tokio.
+        for root in [sandbox.path(), host.path()] {
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[workspace]\nresolver = \"2\"\nmembers = [\"a\"]\n",
+            )
+            .unwrap();
+            std::fs::create_dir(root.join("a")).unwrap();
+            std::fs::create_dir(root.join("a/src")).unwrap();
+            std::fs::write(root.join("a/src/lib.rs"), "").unwrap();
+        }
+        // Sandbox has the widened constraint; host has the narrower one.
+        std::fs::write(
+            sandbox.path().join("a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = \"1.45\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            host.path().join("a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntokio = \"1.40\"\n",
+        )
+        .unwrap();
+        let sandbox_lock = lockfile_with(&[("tokio", "1.45.0")]);
+        std::fs::write(sandbox.path().join("Cargo.lock"), &sandbox_lock).unwrap();
+        std::fs::write(
+            host.path().join("Cargo.lock"),
+            lockfile_with(&[("tokio", "1.40.0")]),
+        )
+        .unwrap();
+
+        let p = proposal_with_tier("tokio", BumpTier::Compatible);
+        let proposals: Vec<&Proposal> = vec![&p];
+        let modified = copy_back_cargo_proposals_merged(&proposals, sandbox.path(), host.path())
+            .expect("copy-back-merged should succeed");
+        // Cargo.lock + a/Cargo.toml (workspace root unchanged → not
+        // copied).
+        assert!(modified.contains(&PathBuf::from("Cargo.lock")));
+        assert!(
+            modified.contains(&PathBuf::from("a").join("Cargo.toml")),
+            "the widened member manifest must be in the copy-back set: got {modified:?}"
+        );
+        // Workspace root is identical in both → must NOT appear.
+        assert!(
+            !modified.contains(&PathBuf::from("Cargo.toml")),
+            "unchanged workspace root must not be copied: got {modified:?}"
+        );
+        let post_member = std::fs::read_to_string(host.path().join("a/Cargo.toml")).unwrap();
+        assert!(post_member.contains("tokio = \"1.45\""));
+        let post_lock = std::fs::read_to_string(host.path().join("Cargo.lock")).unwrap();
+        assert_eq!(post_lock, sandbox_lock);
+    }
+
+    #[test]
+    fn copy_back_merged_errors_when_sandbox_lockfile_missing() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let p = proposal_with_tier("serde", BumpTier::LockfileOnly);
+        let proposals: Vec<&Proposal> = vec![&p];
+        let err = copy_back_cargo_proposals_merged(&proposals, sandbox.path(), host.path())
+            .expect_err("must reject missing sandbox lock");
+        assert!(
+            format!("{err}").contains("Cargo.lock missing"),
+            "error should explain the missing lockfile: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_cargo_proposals_merged_errors_when_constraint_widening_target_absent() {
+        // Compatible/Breaking proposal targeting a crate that's NOT in
+        // the workspace manifest must fail with the cargo applier's
+        // canonical "no manifest carried a matching dep entry" message.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = []\n",
+        )
+        .unwrap();
+        let p = proposal_with_tier("nonexistent-crate", BumpTier::Compatible);
+        let proposals: Vec<&Proposal> = vec![&p];
+        let err = apply_cargo_proposals_merged(&proposals, tmp.path())
+            .expect_err("must fail when no manifest carries the target");
+        assert!(
+            format!("{err}").contains("no manifest carried a matching dep entry"),
+            "error should explain the missing target: {err}"
+        );
     }
 }

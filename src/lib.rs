@@ -4,6 +4,7 @@
 //!
 //! See `docs/assay-plan.md` for the design document this crate implements.
 
+pub mod apply_merger;
 pub mod cli;
 pub mod config;
 pub mod ecosystem;

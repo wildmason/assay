@@ -99,6 +99,45 @@ pub trait DependencyEcosystem: Send + Sync {
     /// entails (rewriting `Cargo.lock`, mutating `uses:` SHAs, etc.).
     fn apply_proposal(&self, proposal: &Proposal, tree_path: &Path) -> Result<()>;
 
+    /// Apply multiple proposals against the **same** sandbox tree.
+    ///
+    /// The default impl loops [`apply_proposal`] in order. Each ecosystem's
+    /// per-proposal apply is assumed to compose additively against a tree
+    /// that already contains earlier proposals' edits (cargo widens
+    /// constraints in distinct crate names and re-runs `cargo update`; npm
+    /// snapshot-restores `package.json` only for the LockfileOnly path so
+    /// chained Compatible/Breaking widenings survive; GHA rewrites
+    /// `uses:@SHA` refs that are addressed by name and don't collide).
+    ///
+    /// This is the core of the multi-proposal merge applier — `--apply-local`
+    /// and `--apply-pr` use it to produce a single sandbox whose state
+    /// reflects ALL validated greens at once, defeating the prior
+    /// last-write-wins copy-back semantic.
+    ///
+    /// Ecosystems can override for efficiency (e.g. defer
+    /// `cargo update --workspace` to once at the end).
+    fn apply_merged(&self, proposals: &[&Proposal], tree_path: &Path) -> Result<()> {
+        for proposal in proposals {
+            self.apply_proposal(proposal, tree_path)?;
+        }
+        Ok(())
+    }
+
+    /// Reports whether per-proposal sandboxes are guaranteed byte-equivalent
+    /// to a fresh merged-sandbox apply for `proposals`. When true, the
+    /// orchestrator skips the (otherwise expensive) merge-sandbox + revalidate
+    /// dance and copies back from one of the existing per-proposal sandboxes
+    /// — they're all the same shape anyway.
+    ///
+    /// Default: false (always merge — safe everywhere). Cargo overrides to
+    /// `true` when every proposal in the set is [`BumpTier::LockfileOnly`]
+    /// because `cargo update --workspace` is deterministic and comprehensive:
+    /// every per-proposal sandbox lands on the same `Cargo.lock`, and no
+    /// proposal touches `Cargo.toml`, so last-write-wins is byte-correct.
+    fn merge_is_redundant(&self, _proposals: &[&Proposal]) -> bool {
+        false
+    }
+
     /// Copy the validated change-set from `sandbox` to `host`, returning
     /// the host-relative paths assay modified (suitable for `git add`).
     ///
@@ -113,6 +152,34 @@ pub trait DependencyEcosystem: Send + Sync {
     /// file no longer contains `<subject>@<from>`); Cargo has no such
     /// concern because `Cargo.lock` is regenerable, not a contract.
     fn copy_back(&self, proposal: &Proposal, sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>>;
+
+    /// Copy a merged sandbox's accumulated change-set back to host.
+    ///
+    /// Default impl runs [`copy_back`] per proposal in order and dedups
+    /// returned paths. Ecosystems whose `copy_back` ships bulk artifacts
+    /// (cargo: whole `Cargo.lock` + workspace manifests; npm: whole
+    /// `package.json` + lockfile) override to copy ONCE — calling the
+    /// per-proposal copy_back loop on a merged sandbox would just shuffle
+    /// the same bytes N times. Ecosystems whose `copy_back` is a per-
+    /// proposal rewrite of the host (GHA, with its `from`-mismatch defense
+    /// for each `uses:@SHA`) inherit the default safely.
+    fn copy_back_merged(
+        &self,
+        proposals: &[&Proposal],
+        sandbox: &Path,
+        host: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for proposal in proposals {
+            let modified = self.copy_back(proposal, sandbox, host)?;
+            for m in modified {
+                if !paths.contains(&m) {
+                    paths.push(m);
+                }
+            }
+        }
+        Ok(paths)
+    }
 
     /// Render an ecosystem-specific fragment for the PR body. Result is
     /// already sanitized (the ecosystem is responsible for routing any

@@ -424,29 +424,43 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
 
     let mut commit_summary: Option<CommitSummary> = None;
     let mut pr_summary: Option<ApplyPrSummary> = None;
-    if matches!(mode, ApplyMode::ApplyLocal) && !all_proposals.is_empty() {
-        commit_summary = Some(perform_apply_local_commit(
-            &args.repo,
-            &registry,
-            &mut completed_runs,
-            pre_validation_failures,
-            &mut provenance,
-        )?);
-    }
-    if matches!(mode, ApplyMode::ApplyPr) && !all_proposals.is_empty() {
-        let backend = GhCliBackend::default();
-        pr_summary = Some(perform_apply_pr(
-            &args.repo,
-            &registry,
-            &mut completed_runs,
-            pre_validation_failures,
-            &mut provenance,
-            &backend,
-            &args.remote,
-            &run_id,
-        )?);
+    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr) && !all_proposals.is_empty() {
+        // The Validator built above runs the merge step's revalidation
+        // pass for any ecosystem with two or more individually-green
+        // proposals. When the run is report-only or had no proposals,
+        // no validator was built — but we wouldn't be inside this block
+        // either, so the unwrap is safe by construction.
+        let validator =
+            build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
+        if matches!(mode, ApplyMode::ApplyLocal) {
+            commit_summary = Some(perform_apply_local_commit(
+                &args.repo,
+                &registry,
+                &mut completed_runs,
+                pre_validation_failures,
+                &mut provenance,
+                &validator,
+                &run_id,
+            )?);
+        }
+        if matches!(mode, ApplyMode::ApplyPr) {
+            let backend = GhCliBackend::default();
+            pr_summary = Some(perform_apply_pr(
+                &args.repo,
+                &registry,
+                &mut completed_runs,
+                pre_validation_failures,
+                &mut provenance,
+                &backend,
+                &args.remote,
+                &run_id,
+                &validator,
+            )?);
+        }
     }
 
+    let (proposals_shipped, proposals_merged_dropped) =
+        ship_counts(&commit_summary, &pr_summary, proposals_passed);
     let summary = RunSummary {
         manifests_scanned: total_manifests,
         proposals_total: all_proposals.len(),
@@ -456,6 +470,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         // Reserved for future tier short-circuits; today all three
         // tiers flow through apply+validate.
         proposals_discovered: 0,
+        proposals_merged_dropped,
+        proposals_shipped,
         prs_opened: 0,
     };
     let finished_at = iso8601_now();
@@ -504,6 +520,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     bump_count,
                     paths,
                     subject,
+                    merged_drops,
                 }) => {
                     println!(
                         "assay: committed {} bump(s) to current branch as `{}` ({} path(s) updated: {})",
@@ -516,12 +533,30 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
+                    if !merged_drops.is_empty() {
+                        println!(
+                            "assay: {} individually-green proposal(s) dropped from the merged ship (see receipt for details)",
+                            merged_drops.len()
+                        );
+                        for drop in merged_drops {
+                            println!("  - {}: {}", drop.proposal_id, drop.reason);
+                        }
+                    }
                 }
                 Some(CommitSummary::SkippedDueToFailures { red_count, total }) => {
                     println!(
                         "assay: refused to commit (--apply-local requires all-green); {} of {} proposal(s) failed validation",
                         red_count, total,
                     );
+                }
+                Some(CommitSummary::AllDroppedByMerge { drops }) => {
+                    println!(
+                        "assay: every individually-green proposal was dropped by the merge step ({} drop(s)); nothing committed",
+                        drops.len()
+                    );
+                    for drop in drops {
+                        println!("  - {}: {}", drop.proposal_id, drop.reason);
+                    }
                 }
                 Some(CommitSummary::NothingToCommit) => {
                     println!("assay: nothing to commit (no green proposals)");
@@ -550,16 +585,35 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     url,
                     branch,
                     bump_count,
+                    merged_drops,
                 }) => {
                     println!(
                         "assay: opened PR for {bump_count} bump(s) on branch `{branch}`: {url}"
                     );
+                    if !merged_drops.is_empty() {
+                        println!(
+                            "assay: {} individually-green proposal(s) dropped from the merged ship (see receipt for details)",
+                            merged_drops.len()
+                        );
+                        for drop in merged_drops {
+                            println!("  - {}: {}", drop.proposal_id, drop.reason);
+                        }
+                    }
                 }
                 Some(ApplyPrSummary::SkippedDueToFailures { red_count, total }) => {
                     println!(
                         "assay: refused to open PR (--apply-pr requires all-green); {} of {} proposal(s) failed validation",
                         red_count, total,
                     );
+                }
+                Some(ApplyPrSummary::AllDroppedByMerge { drops }) => {
+                    println!(
+                        "assay: every individually-green proposal was dropped by the merge step ({} drop(s)); no PR opened",
+                        drops.len()
+                    );
+                    for drop in drops {
+                        println!("  - {}: {}", drop.proposal_id, drop.reason);
+                    }
                 }
                 Some(ApplyPrSummary::NothingToPublish) => {
                     println!("assay: nothing to publish (no green proposals)");
@@ -812,17 +866,76 @@ struct ProposalRun {
 /// What happened during the post-validation `--apply-local` commit phase.
 #[derive(Debug)]
 enum CommitSummary {
-    /// All proposals validated green and the commit was created.
+    /// At least one proposal validated green individually AND survived
+    /// the merge step. The atomic commit captures whatever the merge
+    /// step shipped (which may exclude individually-green proposals
+    /// the merge step had to drop — see `merged_drops`).
     Committed {
         bump_count: usize,
         paths: Vec<PathBuf>,
         subject: String,
+        /// Individually-green proposals that the merge step dropped
+        /// because including them turned the merged validation red.
+        /// The commit ships the largest subset that greened.
+        merged_drops: Vec<MergedDropInfo>,
     },
-    /// One or more proposals didn't validate green; refusing to commit
-    /// preserves the "atomic, all-green" semantic of `--apply-local`.
+    /// One or more proposals didn't validate green individually; refusing
+    /// to commit preserves the "atomic, all-individually-green" precondition
+    /// of `--apply-local`.
     SkippedDueToFailures { red_count: usize, total: usize },
+    /// Every individually-green proposal was dropped by the merge step —
+    /// no subset of the greens validated together. Nothing to commit but
+    /// the per-proposal greens are visible in the receipt and the operator
+    /// can split into smaller batches.
+    AllDroppedByMerge { drops: Vec<MergedDropInfo> },
     /// No proposals reached validation cleanly — nothing to commit.
     NothingToCommit,
+}
+
+/// Receipt-friendly view of a merge-step drop.
+#[derive(Debug, Clone)]
+pub(crate) struct MergedDropInfo {
+    pub proposal_id: String,
+    pub reason: String,
+}
+
+/// Compute the `(proposals_shipped, proposals_merged_dropped)` counters
+/// for the `RunSummary` from the apply outcome.
+///
+/// For modes that never run apply (report-only, or no proposals at all):
+/// shipped is 0 and dropped is 0. For apply-local + apply-pr:
+/// shipped is the count that landed in the commit/PR, dropped is the
+/// count of individually-green proposals the merge step rejected.
+/// The invariant `shipped + dropped == proposals_passed` holds for the
+/// happy path; on the `SkippedDueToFailures` / `NothingToCommit` paths
+/// nothing ships but greens haven't been dropped by the merge step
+/// either, so both counters return 0.
+fn ship_counts(
+    commit: &Option<CommitSummary>,
+    pr: &Option<ApplyPrSummary>,
+    _proposals_passed: usize,
+) -> (usize, usize) {
+    match (commit, pr) {
+        (
+            Some(CommitSummary::Committed {
+                bump_count,
+                merged_drops,
+                ..
+            }),
+            _,
+        ) => (*bump_count, merged_drops.len()),
+        (Some(CommitSummary::AllDroppedByMerge { drops }), _) => (0, drops.len()),
+        (
+            _,
+            Some(ApplyPrSummary::Published {
+                bump_count,
+                merged_drops,
+                ..
+            }),
+        ) => (*bump_count, merged_drops.len()),
+        (_, Some(ApplyPrSummary::AllDroppedByMerge { drops })) => (0, drops.len()),
+        _ => (0, 0),
+    }
 }
 
 /// Run the post-validation commit phase for `--apply-local`.
@@ -839,6 +952,8 @@ fn perform_apply_local_commit(
     completed_runs: &mut [ProposalRun],
     pre_validation_failures: usize,
     provenance: &mut Provenance,
+    validator: &Validator,
+    run_id: &str,
 ) -> Result<CommitSummary> {
     let red_count = pre_validation_failures
         + completed_runs
@@ -866,21 +981,80 @@ fn perform_apply_local_commit(
         return Ok(CommitSummary::SkippedDueToFailures { red_count, total });
     }
 
-    // All-green: sort by proposal ID for byte-deterministic commits
-    // (Conc-9), then copy each sandbox's validated change-set back to
-    // the host tree.
+    // All-green individually. Sort by proposal ID for byte-deterministic
+    // commits (Conc-9), then run the multi-proposal merge applier to
+    // collapse per-ecosystem greens into one sandbox per ecosystem
+    // (defeats the prior per-proposal copy-back last-write-wins bug for
+    // cargo Compatible/Breaking and all npm tiers).
     completed_runs.sort_by(|a, b| a.proposal.id.cmp(&b.proposal.id));
 
+    let ship_plan = build_ship_plan_from_runs(
+        repo,
+        run_id,
+        registry,
+        validator,
+        completed_runs,
+        provenance,
+    )?;
+
+    // Identify which runs survived the merge step.
+    let mut shipped_flat: Vec<(usize, &ProposalRun)> = Vec::new();
+    for outcome in &ship_plan {
+        for run_idx in &outcome.shipped {
+            shipped_flat.push((outcome.eco_idx, &completed_runs[*run_idx]));
+        }
+    }
+    let merged_drops: Vec<MergedDropInfo> = ship_plan
+        .iter()
+        .flat_map(|o| {
+            o.dropped.iter().map(|d| MergedDropInfo {
+                proposal_id: completed_runs[d.run_idx].proposal.id.clone(),
+                reason: d.reason.clone(),
+            })
+        })
+        .collect();
+
+    if shipped_flat.is_empty() {
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "publisher.apply_local".into(),
+            subject: "<aggregate>".into(),
+            status: Classification::Unsupported,
+            summary: format!(
+                "refused to commit: every individually-green proposal was dropped by the merge step ({} drop(s))",
+                merged_drops.len()
+            ),
+            artifact_path: None,
+            details: Some(serde_json::json!({
+                "drops": merged_drops.iter().map(|d| serde_json::json!({
+                    "proposal_id": d.proposal_id,
+                    "reason": d.reason,
+                })).collect::<Vec<_>>(),
+            })),
+        });
+        return Ok(CommitSummary::AllDroppedByMerge {
+            drops: merged_drops,
+        });
+    }
+
     let mut modified_paths: Vec<PathBuf> = Vec::new();
-    let mut body_lines: Vec<String> = Vec::new();
-    for run in completed_runs.iter() {
-        let ecosystem = registry[run.eco_idx].as_ref();
+    for outcome in &ship_plan {
+        if outcome.shipped.is_empty() {
+            continue;
+        }
+        let ecosystem = registry[outcome.eco_idx].as_ref();
+        let shipped_proposals: Vec<&Proposal> = outcome
+            .shipped
+            .iter()
+            .map(|i| &completed_runs[*i].proposal)
+            .collect();
         let modified = ecosystem
-            .copy_back(&run.proposal, &run.sandbox, repo)
+            .copy_back_merged(&shipped_proposals, &outcome.sandbox, repo)
             .map_err(|err| {
                 Error::other(format!(
-                    "copy-back failed for proposal `{}`: {err}",
-                    run.proposal.id
+                    "merged copy-back failed for `{}` ecosystem: {err}",
+                    ecosystem.name()
                 ))
             })?;
         for path in &modified {
@@ -888,22 +1062,21 @@ fn perform_apply_local_commit(
                 modified_paths.push(path.clone());
             }
         }
-        body_lines.push(format!(
-            "- {} {} -> {} ({})",
-            run.proposal.subject,
-            run.proposal.from,
-            run.proposal.to,
-            run.outcome.classification.as_str()
-        ));
         provenance.records.push(ProvenanceRecord {
             tool: "assay".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             stage: "publisher.apply_local".into(),
-            subject: run.proposal.id.clone(),
+            subject: format!("<merged:{}>", ecosystem.name()),
             status: Classification::Exact,
-            summary: format!("copied back {} path(s)", modified.len()),
+            summary: format!(
+                "copied back {} path(s) for {} merged proposal(s)",
+                modified.len(),
+                shipped_proposals.len()
+            ),
             artifact_path: None,
             details: Some(serde_json::json!({
+                "ecosystem": ecosystem.name(),
+                "proposals": shipped_proposals.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
                 "modified": modified.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })),
         });
@@ -913,14 +1086,15 @@ fn perform_apply_local_commit(
         return Ok(CommitSummary::NothingToCommit);
     }
 
-    let raw_subject = if completed_runs.len() == 1 {
-        let p = &completed_runs[0].proposal;
+    let body = build_commit_body(completed_runs, &shipped_flat, &merged_drops);
+    let raw_subject = if shipped_flat.len() == 1 {
+        let p = &shipped_flat[0].1.proposal;
         format!(
             "chore(deps): bump {} from {} to {}",
             p.subject, p.from, p.to
         )
     } else {
-        format!("chore(deps): bump {} dependencies", completed_runs.len())
+        format!("chore(deps): bump {} dependencies", shipped_flat.len())
     };
     let subject = sanitize_commit_subject(&raw_subject)
         .map_err(|err| {
@@ -929,7 +1103,6 @@ fn perform_apply_local_commit(
             ))
         })?
         .to_string();
-    let body = body_lines.join("\n");
 
     git_add_paths(repo, &modified_paths)?;
     git_commit(repo, &subject, &body)?;
@@ -943,16 +1116,87 @@ fn perform_apply_local_commit(
         summary: subject.clone(),
         artifact_path: None,
         details: Some(serde_json::json!({
-            "bump_count": completed_runs.len(),
+            "bump_count": shipped_flat.len(),
+            "merged_drops": merged_drops.iter().map(|d| serde_json::json!({
+                "proposal_id": d.proposal_id,
+                "reason": d.reason,
+            })).collect::<Vec<_>>(),
             "modified_paths": modified_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         })),
     });
 
     Ok(CommitSummary::Committed {
-        bump_count: completed_runs.len(),
+        bump_count: shipped_flat.len(),
         paths: modified_paths,
         subject,
+        merged_drops,
     })
+}
+
+/// Build the commit body from the shipped + dropped lists. Each shipped
+/// proposal gets one bullet (subject vN -> vN+1 (classification)); if
+/// any proposals were dropped by the merge step, a second section flags
+/// them with the reason so the operator can re-batch them manually.
+fn build_commit_body(
+    completed_runs: &[ProposalRun],
+    shipped_flat: &[(usize, &ProposalRun)],
+    merged_drops: &[MergedDropInfo],
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (_eco, run) in shipped_flat {
+        lines.push(format!(
+            "- {} {} -> {} ({})",
+            run.proposal.subject,
+            run.proposal.from,
+            run.proposal.to,
+            run.outcome.classification.as_str()
+        ));
+    }
+    if !merged_drops.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Dropped by merge step ({} individually-green proposal(s) excluded because the merged validation reded):",
+            merged_drops.len()
+        ));
+        for drop in merged_drops {
+            let proposal_subject = completed_runs
+                .iter()
+                .find(|r| r.proposal.id == drop.proposal_id)
+                .map(|r| {
+                    format!(
+                        "{} {} -> {}",
+                        r.proposal.subject, r.proposal.from, r.proposal.to
+                    )
+                })
+                .unwrap_or_else(|| drop.proposal_id.clone());
+            lines.push(format!("- {} ({})", proposal_subject, drop.reason));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Run the merge applier across `completed_runs`, returning a per-
+/// ecosystem ship plan. Thin wrapper so cli.rs holds the borrow shape
+/// (constructing the &[RunRef] view) and apply_merger owns the merge
+/// algorithm.
+fn build_ship_plan_from_runs(
+    repo: &Path,
+    run_id: &str,
+    registry: &[Box<dyn DependencyEcosystem>],
+    validator: &Validator,
+    completed_runs: &[ProposalRun],
+    provenance: &mut Provenance,
+) -> Result<Vec<crate::apply_merger::EcosystemMergeOutcome>> {
+    let run_refs: Vec<crate::apply_merger::RunRef<'_>> = completed_runs
+        .iter()
+        .map(|r| crate::apply_merger::RunRef {
+            eco_idx: r.eco_idx,
+            proposal: &r.proposal,
+            sandbox: r.sandbox.as_path(),
+            outcome: &r.outcome,
+        })
+        .collect();
+    crate::apply_merger::build_ship_plan(repo, run_id, registry, validator, &run_refs, provenance)
 }
 
 /// Outcome of `--apply-pr` orchestration.
@@ -962,20 +1206,25 @@ enum ApplyPrSummary {
         url: String,
         branch: String,
         bump_count: usize,
+        merged_drops: Vec<MergedDropInfo>,
     },
     SkippedDueToFailures {
         red_count: usize,
         total: usize,
     },
+    /// Every individually-green proposal was dropped by the merge step.
+    AllDroppedByMerge {
+        drops: Vec<MergedDropInfo>,
+    },
     NothingToPublish,
 }
 
-/// Compute a deterministic branch name covering every green proposal.
+/// Compute a deterministic branch name covering every shipped proposal.
 ///
 /// Single-bump → `branch_name_for_bump(eco, subject, from, to)`.
 /// Multi-bump → `assay/multi/<N>-<short-hash-of-all-ids>` so the name
 /// remains injective on the set of proposals AND stable across re-runs.
-fn compute_branch_name_for_runs(runs: &[ProposalRun]) -> String {
+fn compute_branch_name_for_runs(runs: &[&ProposalRun]) -> String {
     if runs.len() == 1 {
         let p = &runs[0].proposal;
         return crate::publisher::branch_name::branch_name_for_bump(
@@ -997,7 +1246,7 @@ fn compute_branch_name_for_runs(runs: &[ProposalRun]) -> String {
 }
 
 /// Run the post-validation `--apply-pr` flow:
-/// branch → worktree → copy_back → commit → push → open PR.
+/// branch → worktree → merge-apply → copy_back → commit → push → open PR.
 #[allow(clippy::too_many_arguments)]
 fn perform_apply_pr(
     repo: &Path,
@@ -1008,6 +1257,7 @@ fn perform_apply_pr(
     backend: &dyn PullRequestBackend,
     remote: &str,
     run_id: &str,
+    validator: &Validator,
 ) -> Result<ApplyPrSummary> {
     let red_count = pre_validation_failures
         + completed_runs
@@ -1037,9 +1287,54 @@ fn perform_apply_pr(
 
     completed_runs.sort_by(|a, b| a.proposal.id.cmp(&b.proposal.id));
 
+    let ship_plan = build_ship_plan_from_runs(
+        repo,
+        run_id,
+        registry,
+        validator,
+        completed_runs,
+        provenance,
+    )?;
+
+    let mut shipped_flat: Vec<(usize, &ProposalRun)> = Vec::new();
+    for outcome in &ship_plan {
+        for run_idx in &outcome.shipped {
+            shipped_flat.push((outcome.eco_idx, &completed_runs[*run_idx]));
+        }
+    }
+    let merged_drops: Vec<MergedDropInfo> = ship_plan
+        .iter()
+        .flat_map(|o| {
+            o.dropped.iter().map(|d| MergedDropInfo {
+                proposal_id: completed_runs[d.run_idx].proposal.id.clone(),
+                reason: d.reason.clone(),
+            })
+        })
+        .collect();
+
+    if shipped_flat.is_empty() {
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "publisher.apply_pr".into(),
+            subject: "<aggregate>".into(),
+            status: Classification::Unsupported,
+            summary: format!(
+                "refused to open PR: every individually-green proposal was dropped by the merge step ({} drop(s))",
+                merged_drops.len()
+            ),
+            artifact_path: None,
+            details: None,
+        });
+        return Ok(ApplyPrSummary::AllDroppedByMerge {
+            drops: merged_drops,
+        });
+    }
+
     let (owner, repo_name) = parse_owner_repo_from_origin(repo, remote)
         .map_err(|err| Error::other(format!("couldn't determine owner/repo: {err}")))?;
-    let branch = compute_branch_name_for_runs(completed_runs);
+    let shipped_runs: Vec<&ProposalRun> = shipped_flat.iter().map(|(_, r)| *r).collect();
+    let branch = compute_branch_name_for_runs(&shipped_runs);
     crate::publisher::git_push::validate_branch_name(&branch).map_err(|err| {
         Error::other(format!(
             "internal: generated branch name `{branch}` fails validation: {err}"
@@ -1083,17 +1378,24 @@ fn perform_apply_pr(
         )));
     }
 
-    // Copy back into the worktree.
+    // Copy back into the worktree, per merged-ecosystem set.
     let mut modified_paths: Vec<PathBuf> = Vec::new();
-    let mut body_lines: Vec<String> = Vec::new();
-    for run in completed_runs.iter() {
-        let ecosystem = registry[run.eco_idx].as_ref();
+    for outcome in &ship_plan {
+        if outcome.shipped.is_empty() {
+            continue;
+        }
+        let ecosystem = registry[outcome.eco_idx].as_ref();
+        let shipped_proposals: Vec<&Proposal> = outcome
+            .shipped
+            .iter()
+            .map(|i| &completed_runs[*i].proposal)
+            .collect();
         let modified = ecosystem
-            .copy_back(&run.proposal, &run.sandbox, &worktree)
+            .copy_back_merged(&shipped_proposals, &outcome.sandbox, &worktree)
             .map_err(|err| {
                 Error::other(format!(
-                    "copy-back failed for proposal `{}`: {err}",
-                    run.proposal.id
+                    "merged copy-back failed for `{}` ecosystem: {err}",
+                    ecosystem.name()
                 ))
             })?;
         for path in &modified {
@@ -1101,22 +1403,22 @@ fn perform_apply_pr(
                 modified_paths.push(path.clone());
             }
         }
-        body_lines.push(format!(
-            "- {} {} -> {} ({})",
-            run.proposal.subject,
-            run.proposal.from,
-            run.proposal.to,
-            run.outcome.classification.as_str()
-        ));
         provenance.records.push(ProvenanceRecord {
             tool: "assay".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             stage: "publisher.apply_pr".into(),
-            subject: run.proposal.id.clone(),
+            subject: format!("<merged:{}>", ecosystem.name()),
             status: Classification::Exact,
-            summary: format!("copied back {} path(s)", modified.len()),
+            summary: format!(
+                "copied back {} path(s) for {} merged proposal(s)",
+                modified.len(),
+                shipped_proposals.len()
+            ),
             artifact_path: None,
-            details: None,
+            details: Some(serde_json::json!({
+                "ecosystem": ecosystem.name(),
+                "proposals": shipped_proposals.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            })),
         });
     }
 
@@ -1124,14 +1426,15 @@ fn perform_apply_pr(
         return Ok(ApplyPrSummary::NothingToPublish);
     }
 
-    let raw_subject = if completed_runs.len() == 1 {
-        let p = &completed_runs[0].proposal;
+    let body = build_commit_body(completed_runs, &shipped_flat, &merged_drops);
+    let raw_subject = if shipped_flat.len() == 1 {
+        let p = &shipped_flat[0].1.proposal;
         format!(
             "chore(deps): bump {} from {} to {}",
             p.subject, p.from, p.to
         )
     } else {
-        format!("chore(deps): bump {} dependencies", completed_runs.len())
+        format!("chore(deps): bump {} dependencies", shipped_flat.len())
     };
     let subject = sanitize_commit_subject(&raw_subject)
         .map_err(|err| {
@@ -1140,7 +1443,6 @@ fn perform_apply_pr(
             ))
         })?
         .to_string();
-    let body = body_lines.join("\n");
     git_add_paths(&worktree, &modified_paths)?;
     git_commit(&worktree, &subject, &body)?;
 
@@ -1161,15 +1463,15 @@ fn perform_apply_pr(
 
     // Open the PR. Title overrides build_pull_request_request's default
     // "Bump <subject>" shape so the multi-bump case reads cleanly.
-    let title = if completed_runs.len() == 1 {
+    let title = if shipped_flat.len() == 1 {
         format!(
             "Bump {} from {} to {}",
-            completed_runs[0].proposal.subject,
-            completed_runs[0].proposal.from,
-            completed_runs[0].proposal.to,
+            shipped_flat[0].1.proposal.subject,
+            shipped_flat[0].1.proposal.from,
+            shipped_flat[0].1.proposal.to,
         )
     } else {
-        format!("Bump {} dependencies via assay", completed_runs.len())
+        format!("Bump {} dependencies via assay", shipped_flat.len())
     };
     let base = detect_default_branch(repo, remote).unwrap_or_else(|| "main".into());
     let mut request = build_pull_request_request(PullRequestParams {
@@ -1210,7 +1512,8 @@ fn perform_apply_pr(
     Ok(ApplyPrSummary::Published {
         url: response.url,
         branch,
-        bump_count: completed_runs.len(),
+        bump_count: shipped_flat.len(),
+        merged_drops,
     })
 }
 
@@ -2149,6 +2452,16 @@ mod tests {
         git(repo, ["config", "commit.gpgsign", "false"]);
     }
 
+    /// Builds a `Validator` whose backend is a never-invoked CustomBackend.
+    /// Used by `perform_apply_local_commit` tests where the merge step
+    /// either doesn't fire (size-1 set, red-count short-circuit) or is
+    /// declared redundant by the ecosystem (cargo all-LockfileOnly).
+    fn test_validator_unused() -> crate::validator::Validator {
+        crate::validator::Validator::with_backend(Box::new(crate::validator::CustomBackend::new(
+            vec!["__assay_test_never_invoked__".into()],
+        )))
+    }
+
     fn sample_cargo_proposal_for_apply() -> crate::model::Proposal {
         crate::model::Proposal {
             id: "cargo-serde-1-0-215".into(),
@@ -2203,21 +2516,34 @@ mod tests {
         }];
         let mut provenance = crate::model::Provenance::default();
 
-        let summary =
-            perform_apply_local_commit(repo, &registry, &mut completed_runs, 0, &mut provenance)
-                .expect("apply-local commit should succeed");
+        let validator = test_validator_unused();
+        let summary = perform_apply_local_commit(
+            repo,
+            &registry,
+            &mut completed_runs,
+            0,
+            &mut provenance,
+            &validator,
+            "assay-test-run",
+        )
+        .expect("apply-local commit should succeed");
 
         match summary {
             CommitSummary::Committed {
                 bump_count,
                 paths,
                 subject,
+                merged_drops,
             } => {
                 assert_eq!(bump_count, 1);
                 assert_eq!(paths, vec![PathBuf::from("Cargo.lock")]);
                 assert!(
                     subject.starts_with("chore(deps): bump serde from 1.0.200 to 1.0.215"),
                     "subject should describe the single bump: {subject}"
+                );
+                assert!(
+                    merged_drops.is_empty(),
+                    "single-proposal apply has no drops"
                 );
             }
             other => panic!("expected Committed, got {other:?}"),
@@ -2279,9 +2605,17 @@ mod tests {
         ];
         let mut provenance = crate::model::Provenance::default();
 
-        let summary =
-            perform_apply_local_commit(repo, &registry, &mut completed_runs, 0, &mut provenance)
-                .expect("refusal is not an error result");
+        let validator = test_validator_unused();
+        let summary = perform_apply_local_commit(
+            repo,
+            &registry,
+            &mut completed_runs,
+            0,
+            &mut provenance,
+            &validator,
+            "assay-test-run",
+        )
+        .expect("refusal is not an error result");
 
         match summary {
             CommitSummary::SkippedDueToFailures { red_count, total } => {
@@ -2430,6 +2764,7 @@ mod tests {
             },
         };
 
+        let validator = test_validator_unused();
         let summary = perform_apply_pr(
             &repo,
             &registry,
@@ -2439,6 +2774,7 @@ mod tests {
             &backend,
             "origin",
             "assay-test-run-pushed",
+            &validator,
         )
         .expect("apply-pr should succeed");
 
@@ -2447,10 +2783,15 @@ mod tests {
                 url,
                 branch,
                 bump_count,
+                merged_drops,
             } => {
                 assert_eq!(bump_count, 1);
                 assert!(branch.starts_with("assay/cargo/serde-"));
                 assert!(url.contains("/pull/"));
+                assert!(
+                    merged_drops.is_empty(),
+                    "single-proposal apply has no drops"
+                );
             }
             other => panic!("expected Published, got {other:?}"),
         }
@@ -2484,6 +2825,7 @@ mod tests {
             },
         };
 
+        let validator = test_validator_unused();
         let summary = perform_apply_pr(
             &repo,
             &registry,
@@ -2493,6 +2835,7 @@ mod tests {
             &backend,
             "origin",
             "assay-test-run-refused",
+            &validator,
         )
         .expect("refusal is not an error result");
 
@@ -2553,6 +2896,7 @@ mod tests {
             },
         };
 
+        let validator = test_validator_unused();
         let err = perform_apply_pr(
             &repo,
             &registry,
@@ -2562,6 +2906,7 @@ mod tests {
             &backend,
             "origin",
             "assay-test-run-protected",
+            &validator,
         )
         .expect_err("protected branch metadata must reject");
         assert!(
@@ -2636,8 +2981,17 @@ mod tests {
                 },
             ];
             let mut provenance = crate::model::Provenance::default();
-            perform_apply_local_commit(repo, &registry, &mut completed_runs, 0, &mut provenance)
-                .unwrap();
+            let validator = test_validator_unused();
+            perform_apply_local_commit(
+                repo,
+                &registry,
+                &mut completed_runs,
+                0,
+                &mut provenance,
+                &validator,
+                "assay-test-run",
+            )
+            .unwrap();
             let output = std::process::Command::new("git")
                 .args(["log", "--pretty=format:%s%n%b", "-n", "1"])
                 .current_dir(repo)
