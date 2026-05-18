@@ -132,7 +132,8 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
             client = client.with_cache_root(root);
         }
         client = client.with_offline_mode(!ctx.allow_network);
-        Ok(build_action_proposals(manifests, &client))
+        let proposals = build_action_proposals(manifests, &client);
+        Ok(filter_ignored_actions(proposals, &ctx.ignored_subjects))
     }
 
     fn gate_workflows(&self, _proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
@@ -484,6 +485,24 @@ impl WithTargetTag for (String, String, Option<String>, String) {
             target_tag,
         }
     }
+}
+
+/// Filter out proposals whose `subject` (`owner/repo`) appears in the
+/// per-ecosystem ignore list from `.assay.toml`. The match is exact —
+/// `actions/checkout` in the ignore list silences every workflow
+/// referencing `actions/checkout` but leaves `actions/checkout-fork`
+/// untouched. Glob support is a possible follow-up.
+pub(crate) fn filter_ignored_actions(
+    proposals: Vec<Proposal>,
+    ignored: &[String],
+) -> Vec<Proposal> {
+    if ignored.is_empty() {
+        return proposals;
+    }
+    proposals
+        .into_iter()
+        .filter(|p| !ignored.iter().any(|i| i == &p.subject))
+        .collect()
 }
 
 /// Match the operator's tag granularity when picking a bump target.
@@ -1755,6 +1774,73 @@ jobs:
             proposals.is_empty(),
             "no proposal should be emitted when API can't resolve"
         );
+    }
+
+    #[test]
+    fn filter_ignored_drops_matching_subjects() {
+        let make = |subject: &str| Proposal {
+            id: format!("gha-{}", subject.replace('/', "-")),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: subject.into(),
+            from: "v1".into(),
+            to: "v2".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+        };
+        let proposals = vec![
+            make("actions/checkout"),
+            make("actions/setup-node"),
+            make("dtolnay/rust-toolchain"),
+        ];
+        let ignored = vec!["actions/checkout".to_string()];
+        let kept = filter_ignored_actions(proposals, &ignored);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|p| p.subject != "actions/checkout"));
+    }
+
+    #[test]
+    fn filter_ignored_is_exact_match_not_substring() {
+        // Subject `actions/checkout` ignored — `actions/checkout-fork`
+        // must NOT be filtered. Exact-match prevents accidental
+        // overreach.
+        let make = |subject: &str| Proposal {
+            id: format!("gha-{}", subject.replace('/', "-")),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: subject.into(),
+            from: "v1".into(),
+            to: "v2".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+        };
+        let proposals = vec![make("actions/checkout"), make("actions/checkout-fork")];
+        let kept = filter_ignored_actions(proposals, &["actions/checkout".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].subject, "actions/checkout-fork");
+    }
+
+    #[test]
+    fn filter_ignored_with_empty_list_is_passthrough() {
+        let make = |subject: &str| Proposal {
+            id: subject.into(),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: subject.into(),
+            from: "v1".into(),
+            to: "v2".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+        };
+        let original = vec![make("a/b"), make("c/d")];
+        let kept = filter_ignored_actions(original.clone(), &[]);
+        assert_eq!(kept.len(), original.len());
     }
 
     #[test]

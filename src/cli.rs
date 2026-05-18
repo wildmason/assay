@@ -270,15 +270,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     }
 
     let registry = default_registry();
-    // Always point the action_store at `<repo>/.assay/actions/`. Online
-    // runs write resolved GitHub Action releases there so offline reruns
-    // can re-emit proposals without network access; offline runs read
-    // from it. The directory is created lazily by the proposer on first
-    // successful write.
-    let context = EcosystemContext {
-        action_store: Some(args.repo.join(".assay").join("actions")),
-        allow_network: !args.offline,
-    };
+    // Load .assay.toml if present (falls back to documented defaults
+    // when absent). The ignore list per ecosystem flows from the
+    // config into per-ecosystem `EcosystemContext` instances.
+    let config = crate::config::load(&args.repo)?;
     let started_at = iso8601_now();
     let run_id = generate_run_id();
     let mut total_manifests = 0usize;
@@ -307,6 +302,14 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             });
         }
         if !manifests.is_empty() {
+            // Build a per-ecosystem context with the matching ignore
+            // list from .assay.toml. Other fields (action_store,
+            // allow_network) are run-wide.
+            let context = EcosystemContext {
+                action_store: Some(args.repo.join(".assay").join("actions")),
+                allow_network: !args.offline,
+                ignored_subjects: resolve_ignore_list(&config, ecosystem.name()),
+            };
             let proposals = ecosystem.propose_updates(&manifests, &args.repo, &context)?;
             for proposal in &proposals {
                 provenance.records.push(ProvenanceRecord {
@@ -1872,6 +1875,23 @@ fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
         include_globs: args.include_workflows.clone(),
         exclude_globs: args.exclude_workflows.clone(),
         ..base
+    }
+}
+
+/// Return the `.assay.toml` ignore list for `ecosystem_name`. When the
+/// config has no entry for this ecosystem, returns an empty Vec.
+///
+/// npm and yarn1 share the npm ecosystem entry (both use the
+/// `NpmEcosystem` impl). Other ecosystems get their own section in
+/// the config.
+fn resolve_ignore_list(config: &crate::config::AssayConfig, ecosystem_name: &str) -> Vec<String> {
+    match ecosystem_name {
+        "cargo" => config.ecosystems.cargo.ignore.clone(),
+        "github-actions" => config.ecosystems.github_actions.ignore.clone(),
+        // npm/yarn1/pnpm aren't represented in the .assay.toml today;
+        // a future config rev can add an `npm` section. For now return
+        // an empty list (no ignores), matching the no-config default.
+        _ => Vec::new(),
     }
 }
 

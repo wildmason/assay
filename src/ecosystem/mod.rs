@@ -46,6 +46,12 @@ pub struct EcosystemContext {
     /// proposers must produce best-effort offline results and classify
     /// the proposal as `simulated` rather than `exact`.
     pub allow_network: bool,
+    /// Subjects (`owner/repo`, crate name, npm package name) the proposer
+    /// should skip when emitting proposals. Populated from
+    /// `.assay.toml`'s `[ecosystems.<eco>.ignore]` list — the cli filters
+    /// it to the entries matching the active ecosystem before constructing
+    /// the context, so each proposer sees only its own ignore list.
+    pub ignored_subjects: Vec<String>,
 }
 
 /// The trait an ecosystem must implement to participate in the

@@ -78,6 +78,17 @@ pub struct EcosystemEntry {
     /// parallelism; any other value caps the per-ecosystem worker count.
     #[serde(default)]
     pub max_parallel: usize,
+    /// Per-ecosystem ignore list. Entries match the proposer's `subject`
+    /// field — for GitHub Actions that's `owner/repo` (e.g.
+    /// `"actions/checkout"`), for cargo a crate name, for npm a package
+    /// name. The proposer skips any aggregate / outdated row whose
+    /// subject equals an entry in this list.
+    ///
+    /// Useful when an action publishes noisy prereleases, an operator
+    /// intentionally pins below latest for compatibility reasons, or
+    /// when assay's proposed bump is wrong for some local reason.
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +221,7 @@ fn default_cargo_ecosystem() -> EcosystemEntry {
         // updates serialize anyway and risk lockfile contention. Cap-of-1
         // is conservative but predictable.
         max_parallel: 1,
+        ignore: Vec::new(),
     }
 }
 
@@ -222,6 +234,7 @@ fn default_github_actions_ecosystem() -> EcosystemEntry {
         // GHA bump-application is pure file rewriting — no shared mutable
         // resource. Bounded only by `--threads`.
         max_parallel: 0,
+        ignore: Vec::new(),
     }
 }
 
@@ -424,6 +437,43 @@ validate_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml
             .unwrap();
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], PathBuf::from(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn parses_per_ecosystem_ignore_list() {
+        let text = r#"
+[assay]
+schema_version = 1
+
+[ecosystems.github-actions]
+ignore = ["dtolnay/rust-toolchain", "actions/setup-deno"]
+
+[ecosystems.cargo]
+ignore = ["criterion"]
+"#;
+        let config = parse(text, Path::new(".assay.toml")).expect("ignore list parses");
+        assert_eq!(
+            config.ecosystems.github_actions.ignore,
+            vec![
+                "dtolnay/rust-toolchain".to_string(),
+                "actions/setup-deno".to_string()
+            ]
+        );
+        assert_eq!(
+            config.ecosystems.cargo.ignore,
+            vec!["criterion".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignore_defaults_to_empty_when_absent() {
+        let text = r#"
+[assay]
+schema_version = 1
+"#;
+        let config = parse(text, Path::new(".assay.toml")).unwrap();
+        assert!(config.ecosystems.github_actions.ignore.is_empty());
+        assert!(config.ecosystems.cargo.ignore.is_empty());
     }
 
     #[test]
