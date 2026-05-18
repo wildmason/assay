@@ -409,6 +409,14 @@ pub fn prepare_isolated_worktree(repo: &Path, run_id: &str, label: &str) -> Resu
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    // Materialize external path deps into the merge sandbox too.
+    // Same arithmetic + safety boundary as `prepare_apply_local_tree`;
+    // the merge worktree shares the same run-id-scoped directory so
+    // the materialization is shared across per-proposal and merge
+    // sandboxes within a run.
+    let run_root = repo.join(".assay").join("runs").join(run_id);
+    crate::external_deps::materialize_external_deps_into_sandbox(repo, &target_abs, &run_root)?;
+
     let final_target = match rel_sub_dir {
         Some(rel) if !rel.as_os_str().is_empty() => target_abs.join(rel),
         _ => target_abs,

@@ -1693,6 +1693,14 @@ fn prepare_apply_local_tree(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
+    // Materialize external path deps (e.g. helm's
+    // `wildmason-license = { path = "../../licensing/crate" }`) into
+    // the sandbox so cargo's path resolution from inside the worktree
+    // lands on real directories. No-op when the repo declares no
+    // external path deps.
+    let run_root = repo.join(".assay").join("runs").join(run_id);
+    crate::external_deps::materialize_external_deps_into_sandbox(repo, &target_abs, &run_root)?;
+
     // When `repo` is a sub-directory, the applier/validator expect to
     // run inside the same sub-dir of the worktree. Otherwise they
     // wouldn't find Cargo.toml / package.json relative to the operator-

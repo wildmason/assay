@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod ecosystem;
 pub mod error;
+pub mod external_deps;
 pub mod model;
 pub mod process_runner;
 pub mod publisher;
