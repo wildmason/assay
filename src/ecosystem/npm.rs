@@ -27,11 +27,13 @@
 //!   based on the caret-compat group of (`current`, `latest`). The
 //!   manifest constraint must be widened.
 //!
-//! Yarn 1 emits a wholly different output format and is **not** supported
-//! in v1 — assay reports the lockfile as detected but emits no proposals
-//! and a `notes` entry pointing the operator at npm/pnpm. Yarn 2+ ("Berry")
-//! offers `yarn npm outdated --json` which lands in the same shape and
-//! could be added later.
+//! Yarn 1 emits a different NDJSON shape (`{"type":"table","data":{...}}`)
+//! which the proposer parses via [`parse_yarn1_outdated_output`]. The
+//! applier shells out to `yarn upgrade <pkg>@<v> --exact` with the same
+//! snapshot/restore wrapper used for npm LockfileOnly bumps. Yarn 2+
+//! ("Berry") offers `yarn npm outdated --json` in the npm shape and
+//! could be added later — it falls through the npm path if the operator
+//! has set up `nodeLinker: node-modules`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -122,11 +124,6 @@ impl DependencyEcosystem for NpmEcosystem {
         let Some(flavor) = detect_flavor(repo) else {
             return Ok(Vec::new());
         };
-        if matches!(flavor, NpmFlavor::Yarn) {
-            // yarn1 emits a different format; defer support to a later
-            // commit so we don't ship a broken parser.
-            return Ok(Vec::new());
-        }
         let manifest_paths: Vec<PathBuf> = manifests
             .iter()
             .filter(|m| {
@@ -342,6 +339,75 @@ pub(crate) fn parse_npm_outdated_output(stdout: &str) -> Result<Vec<NpmOutdatedR
     Ok(rows)
 }
 
+/// Parse yarn1's `yarn outdated --json` output (newline-delimited JSON).
+///
+/// Yarn 1 wraps the actual data in a table envelope:
+///
+/// ```text
+/// {"type":"info","data":"Color legend : ..."}
+/// {"type":"table","data":{"head":["Package","Current","Wanted","Latest","Package Type","URL"],
+///   "body":[["lodash","4.17.20","4.17.21","4.18.1","dependencies","https://lodash.com/"]]}}
+/// ```
+///
+/// Each `body` row carries `[name, current, wanted, latest, package_type,
+/// url]`. We pick the first `type: "table"` line and emit one row per
+/// body entry.
+///
+/// Returns an empty Vec when the stream contains no `table` line (yarn
+/// emits `{"type":"info",...}` even when nothing is outdated).
+pub(crate) fn parse_yarn1_outdated_output(stdout: &str) -> Result<Vec<NpmOutdatedRow>> {
+    let mut rows: Vec<NpmOutdatedRow> = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "table" {
+            continue;
+        }
+        let Some(data) = value.get("data") else {
+            continue;
+        };
+        let Some(body) = data.get("body").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in body {
+            let Some(cells) = entry.as_array() else {
+                continue;
+            };
+            if cells.len() < 4 {
+                continue;
+            }
+            let Some(name) = cells.first().and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(current) = cells.get(1).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(wanted) = cells.get(2).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(latest) = cells.get(3).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            rows.push(NpmOutdatedRow {
+                name: name.to_string(),
+                current: Some(current.to_string()),
+                wanted: wanted.to_string(),
+                latest: latest.to_string(),
+            });
+        }
+        // Stop after the first table — yarn1 emits only one.
+        break;
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
 /// Builds proposals from parsed outdated rows. Tier mapping mirrors
 /// cargo's: when the lockfile-wanted version equals the registry latest,
 /// the bump only needs `npm update` (LockfileOnly). When it doesn't,
@@ -451,7 +517,7 @@ fn run_npm_proposer(
     let args: &[&str] = match flavor {
         NpmFlavor::Npm => &["outdated", "--json"],
         NpmFlavor::Pnpm => &["outdated", "--format=json"],
-        NpmFlavor::Yarn => unreachable!(),
+        NpmFlavor::Yarn => &["outdated", "--json"],
     };
 
     let mut cmd = std::process::Command::new(bin);
@@ -468,17 +534,23 @@ fn run_npm_proposer(
         )));
     };
     // npm outdated exits non-zero when packages are outdated; we ignore
-    // the exit code and rely on JSON parsing instead.
+    // the exit code and rely on parsing.
     let _ = status;
-    // we ignore the exit code and rely on JSON parsing.
     let stdout_str = String::from_utf8_lossy(&stdout);
 
-    let mut rows = parse_npm_outdated_output(&stdout_str)?;
+    let mut rows = match flavor {
+        NpmFlavor::Yarn => parse_yarn1_outdated_output(&stdout_str)?,
+        _ => parse_npm_outdated_output(&stdout_str)?,
+    };
     // When `node_modules` isn't materialized, `npm outdated` omits the
     // `current` field. Fall back to the package-lock.json's resolved
     // version so assay can still surface proposals without forcing the
-    // operator to run `npm install` first.
-    backfill_current_from_lockfile(repo, &mut rows)?;
+    // operator to run `npm install` first. (yarn1 typically reports
+    // `current` directly, but the backfill is a no-op for already-set
+    // rows.)
+    if matches!(flavor, NpmFlavor::Npm) {
+        backfill_current_from_lockfile(repo, &mut rows)?;
+    }
     let proposals = build_npm_proposals(&rows, manifest_paths);
     let direct = collect_direct_dep_names(repo)?;
     Ok(filter_to_direct_deps(proposals, &direct))
@@ -650,9 +722,10 @@ fn run_install_pinned(
             "--no-fund",
         ],
         NpmFlavor::Pnpm => vec!["add", &pinned, "--save-exact"],
-        NpmFlavor::Yarn => {
-            return Err(Error::other("yarn applier not implemented in v1"));
-        }
+        // yarn1: `yarn upgrade pkg@version --exact` bumps both
+        // package.json + yarn.lock; same snapshot/restore wrapper
+        // around it ensures LockfileOnly intent.
+        NpmFlavor::Yarn => vec!["upgrade", &pinned, "--exact"],
     };
     let package_json = tree_path.join("package.json");
     let snapshot = std::fs::read(&package_json).map_err(|source| Error::Io {
@@ -677,9 +750,9 @@ fn run_install_lockfile_only(flavor: NpmFlavor, tree_path: &Path) -> Result<()> 
     let args: &[&str] = match flavor {
         NpmFlavor::Npm => &["install", "--no-audit", "--no-fund"],
         NpmFlavor::Pnpm => &["install"],
-        NpmFlavor::Yarn => {
-            return Err(Error::other("yarn applier not implemented in v1"));
-        }
+        // yarn1: `yarn install` refreshes yarn.lock against the
+        // freshly-edited package.json.
+        NpmFlavor::Yarn => &["install"],
     };
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args).current_dir(tree_path);
@@ -1133,6 +1206,47 @@ mod tests {
         assert_eq!(rows[1].name, "lodash");
         assert_eq!(rows[1].current.as_deref(), Some("4.17.20"));
         assert_eq!(rows[1].latest, "4.18.1");
+    }
+
+    // -------------------------------------------------------------------------
+    // yarn1 NDJSON parser
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_yarn1_outdated_extracts_table_rows() {
+        // Real-ish shape from `yarn outdated --json` (yarn 1.22).
+        let stdout = r#"{"type":"info","data":"Color legend : ..."}
+{"type":"table","data":{"head":["Package","Current","Wanted","Latest","Package Type","URL"],"body":[["lodash","4.17.20","4.17.21","4.18.1","dependencies","https://lodash.com/"],["axios","1.6.0","1.6.7","1.16.1","dependencies","https://axios-http.com/"]]}}"#;
+        let rows = parse_yarn1_outdated_output(stdout).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Sorted by name → axios first.
+        assert_eq!(rows[0].name, "axios");
+        assert_eq!(rows[0].current.as_deref(), Some("1.6.0"));
+        assert_eq!(rows[0].wanted, "1.6.7");
+        assert_eq!(rows[0].latest, "1.16.1");
+        assert_eq!(rows[1].name, "lodash");
+    }
+
+    #[test]
+    fn parse_yarn1_outdated_returns_empty_when_no_table_line() {
+        // yarn emits an info preamble even when nothing is outdated.
+        let stdout = r#"{"type":"info","data":"Use \"yarn outdated --help\" for more"}"#;
+        let rows = parse_yarn1_outdated_output(stdout).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_yarn1_outdated_handles_empty_string() {
+        assert!(parse_yarn1_outdated_output("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_yarn1_outdated_ignores_garbage_lines() {
+        // Mixed valid + invalid lines — invalid skipped, valid kept.
+        let stdout = "not json\n{\"type\":\"table\",\"data\":{\"head\":[],\"body\":[[\"a\",\"1.0\",\"1.0\",\"2.0\",\"dependencies\",\"\"]]}}\n";
+        let rows = parse_yarn1_outdated_output(stdout).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "a");
     }
 
     // -------------------------------------------------------------------------
