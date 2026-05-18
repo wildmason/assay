@@ -168,10 +168,8 @@ impl DependencyEcosystem for NpmEcosystem {
         Ok(out)
     }
 
-    fn affected_consumers(&self, _proposal: &Proposal, _tree: &Path) -> Result<Vec<ConsumerId>> {
-        // npm/yarn/pnpm workspace member resolution lands in a follow-up;
-        // for v1 we collapse to a flat single-project report.
-        Ok(Vec::new())
+    fn affected_consumers(&self, proposal: &Proposal, tree: &Path) -> Result<Vec<ConsumerId>> {
+        resolve_npm_consumers(proposal, tree)
     }
 
     fn apply_proposal(&self, proposal: &Proposal, tree_path: &Path) -> Result<()> {
@@ -217,6 +215,12 @@ impl DependencyEcosystem for NpmEcosystem {
 /// merged-set `copy_back_merged` because the unit of change for npm is
 /// always the whole manifest+lockfile pair regardless of how many
 /// proposals contributed to the sandbox state.
+///
+/// Also walks workspace members (npm/yarn `workspaces` + pnpm-workspace.yaml)
+/// and ships any member `package.json` whose bytes differ between sandbox
+/// and host — Compatible / Breaking bumps widen constraints in each
+/// consuming member, and skipping those leaves the host commit out of
+/// sync with the validated state.
 fn copy_back_npm_sandbox(sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
     let Some(flavor) = detect_flavor(sandbox) else {
         return Err(Error::other(format!(
@@ -225,18 +229,37 @@ fn copy_back_npm_sandbox(sandbox: &Path, host: &Path) -> Result<Vec<PathBuf>> {
         )));
     };
     let mut copied = Vec::new();
-    for relative in ["package.json", flavor.lockfile_name()] {
-        let sb = sandbox.join(relative);
-        let host_path = host.join(relative);
+    let mut copy_if_differs = |relative: PathBuf| -> Result<()> {
+        let sb = sandbox.join(&relative);
         if !sb.is_file() {
-            continue;
+            return Ok(());
+        }
+        let host_path = host.join(&relative);
+        let sb_bytes = std::fs::read(&sb).map_err(|source| Error::Io {
+            path: sb.clone(),
+            source,
+        })?;
+        let host_bytes = std::fs::read(&host_path).unwrap_or_default();
+        if sb_bytes == host_bytes {
+            return Ok(());
         }
         std::fs::copy(&sb, &host_path).map_err(|source| Error::Io {
             path: host_path,
             source,
         })?;
-        copied.push(PathBuf::from(relative));
+        copied.push(relative);
+        Ok(())
+    };
+    copy_if_differs(PathBuf::from("package.json"))?;
+    copy_if_differs(PathBuf::from(flavor.lockfile_name()))?;
+    // Workspace members: copy any whose bytes differ. Discovery runs
+    // against the sandbox tree because the merge applier may have
+    // widened member manifests in there.
+    for member in detect_workspace_members(sandbox)? {
+        copy_if_differs(member.relative_path.join("package.json"))?;
     }
+    copied.sort();
+    copied.dedup();
     Ok(copied)
 }
 
@@ -251,6 +274,22 @@ struct OutdatedEntry {
     wanted: String,
     /// Most recent publish on the registry.
     latest: String,
+}
+
+/// One JSON value per dep emitted by `npm outdated --json`.
+///
+/// In a flat (single-project) project the shape is one [`OutdatedEntry`]
+/// per dep. In a workspace project (npm 7+ workspaces) it's an **array**
+/// of entries — one per consuming member — so the same dep can appear
+/// multiple times with the same (current, wanted, latest) tuple but
+/// different `dependent` values. The first entry suffices for proposal
+/// generation because npm hoists workspace deps to the root
+/// `node_modules`, so every consumer sees the same resolved version.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OutdatedValue {
+    Single(OutdatedEntry),
+    PerConsumer(Vec<OutdatedEntry>),
 }
 
 /// Parsed proposal-ready entry combining the dep name with its versions.
@@ -269,22 +308,36 @@ pub(crate) struct NpmOutdatedRow {
 /// Empty input (no outdated packages, both reporters emit `{}` and exit
 /// non-zero from npm — but with `--json` the body is still well-formed
 /// JSON) parses to an empty Vec.
+///
+/// Handles both the flat (single-project) shape `{ "lodash": {...} }`
+/// and the workspace shape `{ "lodash": [ {...}, {...} ] }` that npm 7+
+/// emits when the project has workspaces. Per-consumer arrays are
+/// collapsed to one row per dep using the first entry — assay treats
+/// the bump as a single workspace-level event; per-member dep
+/// declarations are surfaced via [`affected_consumers`] downstream.
 pub(crate) fn parse_npm_outdated_output(stdout: &str) -> Result<Vec<NpmOutdatedRow>> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let parsed: BTreeMap<String, OutdatedEntry> = serde_json::from_str(trimmed)
+    let parsed: BTreeMap<String, OutdatedValue> = serde_json::from_str(trimmed)
         .map_err(|e| Error::other(format!("npm outdated JSON: {e}")))?;
-    let mut rows: Vec<NpmOutdatedRow> = parsed
-        .into_iter()
-        .map(|(name, entry)| NpmOutdatedRow {
+    let mut rows: Vec<NpmOutdatedRow> = Vec::new();
+    for (name, value) in parsed {
+        let entry = match value {
+            OutdatedValue::Single(e) => e,
+            OutdatedValue::PerConsumer(entries) => match entries.into_iter().next() {
+                Some(e) => e,
+                None => continue,
+            },
+        };
+        rows.push(NpmOutdatedRow {
             name,
             current: entry.current,
             wanted: entry.wanted,
             latest: entry.latest,
-        })
-        .collect();
+        });
+    }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(rows)
 }
@@ -491,59 +544,32 @@ fn backfill_current_from_lockfile(repo: &Path, rows: &mut [NpmOutdatedRow]) -> R
 
 /// Read every dep name declared in `package.json`'s `dependencies`,
 /// `devDependencies`, `peerDependencies`, and `optionalDependencies`.
-/// Workspace members are handled by also reading each member listed in
-/// the root `workspaces` field.
+/// Workspace members are walked via [`detect_workspace_members`] so npm
+/// 7+ workspace globs (`packages/*`) and pnpm-workspace.yaml entries are
+/// all expanded before scanning for declared deps.
 pub(crate) fn collect_direct_dep_names(repo: &Path) -> Result<BTreeSet<String>> {
     let mut names = BTreeSet::new();
     let root_pkg = repo.join("package.json");
-    if !root_pkg.is_file() {
-        return Ok(names);
+    if root_pkg.is_file() {
+        let root_text = std::fs::read_to_string(&root_pkg).map_err(|source| Error::Io {
+            path: root_pkg.clone(),
+            source,
+        })?;
+        let root_value: serde_json::Value = serde_json::from_str(&root_text)
+            .map_err(|e| Error::other(format!("package.json parse: {e}")))?;
+        extend_dep_names(&root_value, &mut names);
     }
-    let root_text = std::fs::read_to_string(&root_pkg).map_err(|source| Error::Io {
-        path: root_pkg.clone(),
-        source,
-    })?;
-    let root_value: serde_json::Value = serde_json::from_str(&root_text)
-        .map_err(|e| Error::other(format!("package.json parse: {e}")))?;
-    extend_dep_names(&root_value, &mut names);
-
-    // Workspaces: declared in root as `"workspaces": [..]` (npm/yarn) or
-    // `"workspaces": { "packages": [..] }` (some configs). Glob entries
-    // like `packages/*` aren't expanded here — only literal paths. A
-    // full glob resolver lands in the workspace-aware applier follow-up.
-    if let Some(ws) = root_value.get("workspaces") {
-        let entries: Vec<String> = if let Some(arr) = ws.as_array() {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        } else if let Some(obj) = ws.as_object() {
-            obj.get("packages")
-                .and_then(|p| p.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        for entry in entries {
-            // Literal paths only for v1. Globs (`packages/*`) skipped.
-            if entry.contains('*') {
-                continue;
-            }
-            let member_pkg = repo.join(&entry).join("package.json");
-            if !member_pkg.is_file() {
-                continue;
-            }
-            let text = std::fs::read_to_string(&member_pkg).map_err(|source| Error::Io {
-                path: member_pkg.clone(),
-                source,
-            })?;
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                extend_dep_names(&value, &mut names);
-            }
+    for member in detect_workspace_members(repo)? {
+        let member_pkg = repo.join(&member.relative_path).join("package.json");
+        if !member_pkg.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&member_pkg).map_err(|source| Error::Io {
+            path: member_pkg.clone(),
+            source,
+        })?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            extend_dep_names(&value, &mut names);
         }
     }
     Ok(names)
@@ -710,7 +736,58 @@ pub(crate) fn update_package_json_constraint(
     if try_edit_package_json(&root_pkg, name, new_version)? {
         modified.push(PathBuf::from("package.json"));
     }
-    // Walk literal workspaces too (globs deferred to follow-up).
+    for member in detect_workspace_members(tree_path)? {
+        let member_pkg = tree_path.join(&member.relative_path).join("package.json");
+        if !member_pkg.is_file() {
+            continue;
+        }
+        if try_edit_package_json(&member_pkg, name, new_version)? {
+            modified.push(member.relative_path.join("package.json"));
+        }
+    }
+    modified.sort();
+    modified.dedup();
+    Ok(modified)
+}
+
+/// A workspace member discovered under `tree_path`.
+///
+/// `relative_path` is the workspace-relative directory holding the
+/// member's `package.json`. `name` is whatever the member's
+/// `package.json` declares (used as the [`ConsumerId`] in reports).
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceMember {
+    pub relative_path: PathBuf,
+    pub name: String,
+}
+
+/// Discover npm/yarn/pnpm workspace members under `tree_path`.
+///
+/// Reads `workspaces` from the root `package.json` (either an array or
+/// `{ packages: [...] }`) for npm/yarn, AND `packages:` from
+/// `pnpm-workspace.yaml` for pnpm. Both sources are unioned — projects
+/// rarely have both, but if they do we treat them as a combined set.
+///
+/// Glob patterns (`packages/*`, `apps/*-server`) are expanded relative
+/// to `tree_path`. Each resolved directory is included only if it
+/// contains a `package.json` with a parseable `name`. Members are
+/// sorted by relative path and deduped.
+///
+/// Returns an empty Vec when no workspace declaration exists (the
+/// single-project case).
+pub(crate) fn detect_workspace_members(tree_path: &Path) -> Result<Vec<WorkspaceMember>> {
+    // Canonicalize so `--repo .` works: the glob walker yields paths
+    // relative to CWD, and a `Path::strip_prefix(".")` against an
+    // already-relative match like `packages/alpha` fails. Resolving the
+    // tree to absolute makes the prefix-strip consistent regardless of
+    // how the operator invoked assay.
+    let tree_path_owned = match std::path::absolute(tree_path) {
+        Ok(p) => p,
+        Err(_) => tree_path.to_path_buf(),
+    };
+    let tree_path = tree_path_owned.as_path();
+    let mut patterns: BTreeSet<String> = BTreeSet::new();
+    let root_pkg = tree_path.join("package.json");
     if let Ok(text) = std::fs::read_to_string(&root_pkg)
         && let Ok(root_value) = serde_json::from_str::<serde_json::Value>(&text)
         && let Some(ws) = root_value.get("workspaces")
@@ -731,21 +808,127 @@ pub(crate) fn update_package_json_constraint(
         } else {
             Vec::new()
         };
-        for entry in entries {
-            if entry.contains('*') {
-                continue;
-            }
-            let member_pkg = tree_path.join(&entry).join("package.json");
-            if !member_pkg.is_file() {
-                continue;
-            }
-            if try_edit_package_json(&member_pkg, name, new_version)? {
-                modified.push(PathBuf::from(&entry).join("package.json"));
+        patterns.extend(entries);
+    }
+    let pnpm_ws = tree_path.join("pnpm-workspace.yaml");
+    if let Ok(text) = std::fs::read_to_string(&pnpm_ws)
+        && let Ok(value) = serde_yml::from_str::<serde_yml::Value>(&text)
+        && let Some(packages) = value.get("packages").and_then(|p| p.as_sequence())
+    {
+        for entry in packages {
+            if let Some(s) = entry.as_str() {
+                patterns.insert(s.to_string());
             }
         }
     }
-    modified.sort();
-    Ok(modified)
+
+    let mut resolved_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for pattern in &patterns {
+        // Negation patterns (lead with `!`) are pnpm-specific; v1
+        // doesn't honor them — flagged for a follow-up if real projects
+        // surface them.
+        if pattern.starts_with('!') {
+            continue;
+        }
+        if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+            let absolute_pattern = tree_path.join(pattern);
+            let pattern_str = match absolute_pattern.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            // The `glob` crate's pattern parser interprets `\` as an
+            // escape character on every platform, so Windows-style
+            // backslash separators (`C:\repo\packages\*`) produce zero
+            // matches. Normalize to forward slashes — `Path::strip_prefix`
+            // still works on the matched results because Rust's std
+            // accepts both separators on Windows.
+            let normalized = pattern_str.replace('\\', "/");
+            if let Ok(walker) = glob::glob(&normalized) {
+                for entry in walker.flatten() {
+                    if entry.is_dir() && entry.join("package.json").is_file() {
+                        if let Ok(rel) = entry.strip_prefix(tree_path) {
+                            resolved_dirs.insert(rel.to_path_buf());
+                        }
+                    }
+                }
+            }
+        } else {
+            let candidate = tree_path.join(pattern);
+            if candidate.is_dir() && candidate.join("package.json").is_file() {
+                resolved_dirs.insert(PathBuf::from(pattern));
+            }
+        }
+    }
+
+    let mut out: Vec<WorkspaceMember> = Vec::new();
+    for rel in resolved_dirs {
+        let pkg_path = tree_path.join(&rel).join("package.json");
+        let Ok(text) = std::fs::read_to_string(&pkg_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        out.push(WorkspaceMember {
+            relative_path: rel,
+            name: name.to_string(),
+        });
+    }
+    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(out)
+}
+
+/// Return the workspace members that declare `proposal.subject` as a
+/// direct dependency.
+///
+/// Mirrors cargo's `affected_consumers` semantics: a member is a
+/// "consumer" if its `package.json`'s `dependencies` /
+/// `devDependencies` / `peerDependencies` / `optionalDependencies`
+/// lists the bumped package. Self-references are excluded (a member
+/// whose own `name` matches `proposal.subject` is the bumped package,
+/// not a consumer).
+///
+/// Returns an empty Vec when no workspace declaration exists or no
+/// member declares the dep — the Reporter collapses to a flat single-
+/// project view in that case.
+fn resolve_npm_consumers(proposal: &Proposal, tree: &Path) -> Result<Vec<ConsumerId>> {
+    let mut consumers: Vec<ConsumerId> = Vec::new();
+    for member in detect_workspace_members(tree)? {
+        if member.name == proposal.subject {
+            continue;
+        }
+        let pkg_path = tree.join(&member.relative_path).join("package.json");
+        if package_json_declares(&pkg_path, &proposal.subject)? {
+            consumers.push(member.name.clone());
+        }
+    }
+    Ok(consumers)
+}
+
+fn package_json_declares(pkg_path: &Path, name: &str) -> Result<bool> {
+    let text = match std::fs::read_to_string(pkg_path) {
+        Ok(t) => t,
+        Err(_) => return Ok(false),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(false);
+    };
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(obj) = value.get(field).and_then(|v| v.as_object())
+            && obj.contains_key(name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn try_edit_package_json(path: &Path, name: &str, new_version: &str) -> Result<bool> {
@@ -902,6 +1085,31 @@ mod tests {
         let rows = parse_npm_outdated_output(stdout).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].current, None);
+    }
+
+    #[test]
+    fn parse_outdated_collapses_workspace_per_consumer_arrays() {
+        // npm 7+ workspaces emit ONE array per dep, with one entry per
+        // consumer. The (current, wanted, latest) tuple is identical
+        // across entries because npm hoists deps. Parser must accept
+        // the array shape and emit exactly one row per dep.
+        let stdout = r#"{
+            "lodash": [
+                {"current":"4.17.20","wanted":"4.17.20","latest":"4.18.1","dependent":"alpha"},
+                {"current":"4.17.20","wanted":"4.17.20","latest":"4.18.1","dependent":"beta"}
+            ],
+            "chalk": [
+                {"current":"4.1.0","wanted":"4.1.0","latest":"5.3.0","dependent":"alpha"}
+            ]
+        }"#;
+        let rows = parse_npm_outdated_output(stdout).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "chalk");
+        assert_eq!(rows[0].current.as_deref(), Some("4.1.0"));
+        assert_eq!(rows[0].latest, "5.3.0");
+        assert_eq!(rows[1].name, "lodash");
+        assert_eq!(rows[1].current.as_deref(), Some("4.17.20"));
+        assert_eq!(rows[1].latest, "4.18.1");
     }
 
     // -------------------------------------------------------------------------
@@ -1194,5 +1402,335 @@ mod tests {
             notes: vec![],
             bump_tier: BumpTier::Compatible,
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Workspace member discovery (npm/yarn `workspaces`, pnpm-workspace.yaml,
+    // glob expansion).
+    // -------------------------------------------------------------------------
+
+    fn proposal_for_subject(subject: &str) -> Proposal {
+        Proposal {
+            id: format!("npm-{subject}-test"),
+            ecosystem: EcosystemName::Npm.as_str().into(),
+            kind: ProposalKind::Version,
+            subject: subject.into(),
+            from: "1.0.0".into(),
+            to: "1.5.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+        }
+    }
+
+    fn write_pkg(path: &Path, json: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, json).unwrap();
+    }
+
+    #[test]
+    fn detect_workspace_members_returns_empty_for_single_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{"name":"single","version":"1.0.0"}"#,
+        );
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        assert!(
+            members.is_empty(),
+            "no workspaces field → no members: {members:?}"
+        );
+    }
+
+    #[test]
+    fn detect_workspace_members_reads_literal_workspaces_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{
+                "name":"root",
+                "workspaces":["packages/foo","packages/bar"]
+            }"#,
+        );
+        write_pkg(
+            &tmp.path().join("packages/foo/package.json"),
+            r#"{"name":"@scope/foo","version":"1.0.0"}"#,
+        );
+        write_pkg(
+            &tmp.path().join("packages/bar/package.json"),
+            r#"{"name":"@scope/bar","version":"1.0.0"}"#,
+        );
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].name, "@scope/bar");
+        assert_eq!(members[1].name, "@scope/foo");
+        assert_eq!(
+            members[0].relative_path,
+            PathBuf::from("packages").join("bar")
+        );
+    }
+
+    #[test]
+    fn detect_workspace_members_reads_object_form_with_packages_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{
+                "name":"root",
+                "workspaces":{"packages":["apps/web","apps/api"]}
+            }"#,
+        );
+        write_pkg(
+            &tmp.path().join("apps/web/package.json"),
+            r#"{"name":"web"}"#,
+        );
+        write_pkg(
+            &tmp.path().join("apps/api/package.json"),
+            r#"{"name":"api"}"#,
+        );
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["api", "web"]);
+    }
+
+    #[test]
+    fn detect_workspace_members_expands_glob_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        for name in ["alpha", "beta", "gamma"] {
+            write_pkg(
+                &tmp.path().join("packages").join(name).join("package.json"),
+                &format!(r#"{{"name":"{name}"}}"#),
+            );
+        }
+        // A non-package directory mixed in must NOT be reported.
+        std::fs::create_dir_all(tmp.path().join("packages/scripts")).unwrap();
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn detect_workspace_members_reads_pnpm_workspace_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        // pnpm doesn't use `workspaces` in package.json — only the YAML.
+        write_pkg(&tmp.path().join("package.json"), r#"{"name":"root"}"#);
+        std::fs::write(
+            tmp.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'libs/*'\n  - apps/dashboard\n",
+        )
+        .unwrap();
+        for name in ["a", "b"] {
+            write_pkg(
+                &tmp.path().join("libs").join(name).join("package.json"),
+                &format!(r#"{{"name":"@libs/{name}"}}"#),
+            );
+        }
+        write_pkg(
+            &tmp.path().join("apps/dashboard/package.json"),
+            r#"{"name":"dashboard"}"#,
+        );
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["dashboard", "@libs/a", "@libs/b"]);
+    }
+
+    #[test]
+    fn detect_workspace_members_ignores_negation_patterns() {
+        // pnpm supports `!packages/foo` to exclude — v1 doesn't honor
+        // these; the inclusion list wins. Just confirm we don't crash.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(&tmp.path().join("package.json"), r#"{"name":"root"}"#);
+        std::fs::write(
+            tmp.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/private'\n",
+        )
+        .unwrap();
+        for name in ["public", "private"] {
+            write_pkg(
+                &tmp.path().join("packages").join(name).join("package.json"),
+                &format!(r#"{{"name":"{name}"}}"#),
+            );
+        }
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        // Both pass for v1; documenting current behavior.
+        assert_eq!(names, vec!["private", "public"]);
+    }
+
+    #[test]
+    fn detect_workspace_members_skips_directories_without_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        std::fs::create_dir_all(tmp.path().join("packages/empty")).unwrap();
+        write_pkg(
+            &tmp.path().join("packages/real/package.json"),
+            r#"{"name":"real"}"#,
+        );
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    // -------------------------------------------------------------------------
+    // affected_consumers (Resolver — plan §C.3.5 for npm/yarn/pnpm)
+    // -------------------------------------------------------------------------
+
+    fn make_workspace(tmp: &tempfile::TempDir, deps_per_member: &[(&str, &str, &str)]) {
+        // `deps_per_member` is (member_dir, member_name, dep_block_json).
+        // Root declares packages/* as workspaces.
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        for (dir, name, dep_block) in deps_per_member {
+            write_pkg(
+                &tmp.path().join("packages").join(dir).join("package.json"),
+                &format!(r#"{{"name":"{name}",{dep_block}}}"#),
+            );
+        }
+    }
+
+    #[test]
+    fn affected_consumers_lists_members_that_directly_declare_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_workspace(
+            &tmp,
+            &[
+                ("a", "@scope/a", r#""dependencies":{"lodash":"^4.0.0"}"#),
+                ("b", "@scope/b", r#""dependencies":{"axios":"^1.0.0"}"#),
+                ("c", "@scope/c", r#""dependencies":{"lodash":"^4.0.0"}"#),
+            ],
+        );
+        let eco = NpmEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for_subject("lodash"), tmp.path())
+            .unwrap();
+        assert_eq!(consumers, vec!["@scope/a", "@scope/c"]);
+    }
+
+    #[test]
+    fn affected_consumers_returns_empty_when_no_member_consumes_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_workspace(
+            &tmp,
+            &[("a", "@scope/a", r#""dependencies":{"axios":"^1.0.0"}"#)],
+        );
+        let eco = NpmEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for_subject("nowhere-pkg"), tmp.path())
+            .unwrap();
+        assert!(consumers.is_empty());
+    }
+
+    #[test]
+    fn affected_consumers_excludes_self_when_target_is_workspace_member() {
+        // A workspace member named `lodash` is the bumped package, not
+        // its own consumer — matches cargo's affected_consumers semantics.
+        let tmp = tempfile::tempdir().unwrap();
+        make_workspace(
+            &tmp,
+            &[
+                ("a", "@scope/a", r#""dependencies":{"lodash":"^4.0.0"}"#),
+                ("b", "lodash", r#""version":"1.0.0""#),
+            ],
+        );
+        let eco = NpmEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for_subject("lodash"), tmp.path())
+            .unwrap();
+        assert_eq!(consumers, vec!["@scope/a"]);
+    }
+
+    #[test]
+    fn affected_consumers_walks_dev_peer_optional_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_workspace(
+            &tmp,
+            &[
+                ("a", "@scope/a", r#""devDependencies":{"jest":"^29.0.0"}"#),
+                ("b", "@scope/b", r#""peerDependencies":{"jest":"^29.0.0"}"#),
+                (
+                    "c",
+                    "@scope/c",
+                    r#""optionalDependencies":{"jest":"^29.0.0"}"#,
+                ),
+                ("d", "@scope/d", r#""dependencies":{"axios":"^1.0.0"}"#),
+            ],
+        );
+        let eco = NpmEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for_subject("jest"), tmp.path())
+            .unwrap();
+        assert_eq!(
+            consumers,
+            vec!["@scope/a", "@scope/b", "@scope/c"],
+            "every dep-shaped declaration counts"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // update_package_json_constraint — workspace + glob integration
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn update_constraint_widens_every_glob_resolved_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"],"dependencies":{"lodash":"^4.17.0"}}"#,
+        );
+        for name in ["alpha", "beta"] {
+            write_pkg(
+                &tmp.path().join("packages").join(name).join("package.json"),
+                &format!(r#"{{"name":"{name}","dependencies":{{"lodash":"^4.17.0"}}}}"#),
+            );
+        }
+        let modified = update_package_json_constraint(tmp.path(), "lodash", "4.18.1").unwrap();
+        let mut expected = vec![
+            PathBuf::from("package.json"),
+            PathBuf::from("packages").join("alpha").join("package.json"),
+            PathBuf::from("packages").join("beta").join("package.json"),
+        ];
+        expected.sort();
+        assert_eq!(modified, expected);
+        for path in &expected {
+            let text = std::fs::read_to_string(tmp.path().join(path)).unwrap();
+            assert!(
+                text.contains("\"^4.18.1\""),
+                "every package.json should have the widened constraint: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_constraint_skips_members_without_the_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(
+            &tmp.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        write_pkg(
+            &tmp.path().join("packages/has/package.json"),
+            r#"{"name":"has","dependencies":{"lodash":"^4.17.0"}}"#,
+        );
+        write_pkg(
+            &tmp.path().join("packages/missing/package.json"),
+            r#"{"name":"missing","dependencies":{"axios":"^1.0.0"}}"#,
+        );
+        let modified = update_package_json_constraint(tmp.path(), "lodash", "4.18.1").unwrap();
+        assert_eq!(
+            modified,
+            vec![PathBuf::from("packages").join("has").join("package.json")]
+        );
     }
 }
