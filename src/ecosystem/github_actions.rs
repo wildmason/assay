@@ -132,6 +132,7 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
             client = client.with_cache_root(root);
         }
         client = client.with_offline_mode(!ctx.allow_network);
+        client = client.with_refresh(ctx.refresh_cache);
         let proposals = build_action_proposals(manifests, &client);
         Ok(filter_ignored_actions(proposals, &ctx.ignored_subjects))
     }

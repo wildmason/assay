@@ -68,7 +68,23 @@ pub struct GitHubApiClient {
     /// In offline mode the client never invokes `gh`; it reads from
     /// `cache_root` only. Lookups that miss the cache return `None`.
     offline: bool,
+    /// Maximum age of a cache entry before it counts as stale.
+    /// Defaults to 7 days. Stale entries trigger a fresh fetch in
+    /// online mode; in offline mode stale entries return `None`
+    /// (operator should refresh or set `--serve-stale` — future flag).
+    cache_ttl_secs: u64,
+    /// When `true`, the client bypasses cache reads entirely and
+    /// forces a fresh fetch. Set by `--refresh-cache`. No-op in
+    /// offline mode (there's no source to fetch FROM offline, so
+    /// the flag is silently ignored and we still read cache).
+    refresh: bool,
 }
+
+/// Default cache TTL: 7 days. Short enough that "I'm offline today
+/// because of a flight" still works; long enough that random
+/// re-fetches don't churn the network for projects that bump deps
+/// quarterly.
+const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 impl Default for GitHubApiClient {
     fn default() -> Self {
@@ -78,6 +94,8 @@ impl Default for GitHubApiClient {
             tag_cache: RefCell::new(HashMap::new()),
             cache_root: None,
             offline: false,
+            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
+            refresh: false,
         }
     }
 }
@@ -118,6 +136,39 @@ impl GitHubApiClient {
         self.offline
     }
 
+    /// Override the cache TTL in seconds. `0` disables TTL entirely
+    /// (every cache hit is served). Default is 7 days.
+    pub fn with_cache_ttl(mut self, secs: u64) -> Self {
+        self.cache_ttl_secs = secs;
+        self
+    }
+
+    /// Force a fresh fetch on every lookup, bypassing the cache read
+    /// path. In offline mode the flag is silently ignored (no source
+    /// to refresh FROM offline).
+    pub fn with_refresh(mut self, refresh: bool) -> Self {
+        self.refresh = refresh;
+        self
+    }
+
+    /// Decide whether a cached entry with the given `fetched_at_unix_secs`
+    /// is fresh enough to serve.
+    fn cache_entry_is_fresh(&self, fetched_at_unix_secs: u64) -> bool {
+        if self.cache_ttl_secs == 0 {
+            return true;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Entries with fetched_at_unix_secs == 0 are pre-TTL-schema
+        // (or never timestamped); treat as ancient and stale.
+        if fetched_at_unix_secs == 0 {
+            return false;
+        }
+        now.saturating_sub(fetched_at_unix_secs) < self.cache_ttl_secs
+    }
+
     /// Resolve the latest non-prerelease, non-draft release for
     /// `owner/repo` to a `(tag, commit_sha)` pair.
     ///
@@ -136,12 +187,25 @@ impl GitHubApiClient {
         }
         let resolved = if self.offline {
             self.read_release_cache(owner, repo)
-        } else {
+        } else if self.refresh {
+            // --refresh-cache: skip the cache read, force fresh fetch.
             let live = self.fetch_latest_release_uncached(owner, repo);
             if let Some(ref info) = live {
                 let _ = self.write_release_cache(owner, repo, info);
             }
             live
+        } else {
+            // Try fresh cache first; on miss or stale, fetch live.
+            match self.read_release_cache(owner, repo) {
+                Some(info) => Some(info),
+                None => {
+                    let live = self.fetch_latest_release_uncached(owner, repo);
+                    if let Some(ref info) = live {
+                        let _ = self.write_release_cache(owner, repo, info);
+                    }
+                    live
+                }
+            }
         };
         self.cache.borrow_mut().insert(key, resolved.clone());
         Ok(resolved)
@@ -173,6 +237,9 @@ impl GitHubApiClient {
         let path = self.release_cache_path(owner, repo)?;
         let text = std::fs::read_to_string(&path).ok()?;
         let cached: CachedReleaseEntry = serde_json::from_str(&text).ok()?;
+        if !self.cache_entry_is_fresh(cached.fetched_at_unix_secs) {
+            return None;
+        }
         Some(ReleaseInfo {
             tag_name: cached.tag_name,
             commit_sha: cached.commit_sha,
@@ -191,10 +258,15 @@ impl GitHubApiClient {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let entry = CachedReleaseEntry {
             tag_name: info.tag_name.clone(),
             commit_sha: info.commit_sha.clone(),
             fetched_at: now_iso8601(),
+            fetched_at_unix_secs: now_unix,
         };
         let json = serde_json::to_string_pretty(&entry).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
@@ -216,6 +288,13 @@ impl GitHubApiClient {
         }
         let exists = if self.offline {
             self.read_tag_cache(owner, repo, tag).unwrap_or(false)
+        } else if self.refresh {
+            let api_path = format!("repos/{owner}/{repo}/git/refs/tags/{tag}");
+            let live = matches!(self.gh_api_get(&api_path), Ok(Some(_)));
+            let _ = self.write_tag_cache(owner, repo, tag, live);
+            live
+        } else if let Some(cached_exists) = self.read_tag_cache(owner, repo, tag) {
+            cached_exists
         } else {
             let api_path = format!("repos/{owner}/{repo}/git/refs/tags/{tag}");
             let live = matches!(self.gh_api_get(&api_path), Ok(Some(_)));
@@ -240,6 +319,9 @@ impl GitHubApiClient {
         let path = self.tag_cache_path(owner, repo, tag)?;
         let text = std::fs::read_to_string(&path).ok()?;
         let entry: CachedTagEntry = serde_json::from_str(&text).ok()?;
+        if !self.cache_entry_is_fresh(entry.fetched_at_unix_secs) {
+            return None;
+        }
         Some(entry.exists)
     }
 
@@ -256,10 +338,15 @@ impl GitHubApiClient {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let entry = CachedTagEntry {
             tag: tag.to_string(),
             exists,
             fetched_at: now_iso8601(),
+            fetched_at_unix_secs: now_unix,
         };
         let json = serde_json::to_string_pretty(&entry).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
@@ -303,10 +390,15 @@ impl GitHubApiClient {
 struct CachedReleaseEntry {
     tag_name: String,
     commit_sha: String,
-    /// Best-effort ISO 8601 wall-clock when the live lookup happened.
-    /// Not used for validation today; future TTL logic can read it.
+    /// Human-readable ISO 8601 wall-clock when the live lookup
+    /// happened. Informational only — TTL math uses
+    /// `fetched_at_unix_secs`.
     #[serde(default)]
     fetched_at: String,
+    /// Unix-epoch seconds at fetch time. Used by the TTL freshness
+    /// check. `0` for pre-TTL-schema entries — treated as ancient.
+    #[serde(default)]
+    fetched_at_unix_secs: u64,
 }
 
 /// On-disk schema for a cached `tag_exists` probe.
@@ -316,6 +408,8 @@ struct CachedTagEntry {
     exists: bool,
     #[serde(default)]
     fetched_at: String,
+    #[serde(default)]
+    fetched_at_unix_secs: u64,
 }
 
 /// Filesystem-safe per-action directory name. `actions/checkout`
@@ -484,6 +578,52 @@ mod tests {
             .with_offline_mode(true);
         let read = offline.latest_release("actions", "checkout").unwrap();
         assert_eq!(read, Some(info));
+    }
+
+    #[test]
+    fn stale_cache_entries_are_treated_as_missing() {
+        // Hand-write a CachedReleaseEntry with an ancient
+        // fetched_at_unix_secs (1970-01-01 = unix 0). The client's
+        // freshness check special-cases 0 as "ancient/never timestamped"
+        // → stale → read returns None.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("actions--ancient");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("release.json"),
+            r#"{"tag_name":"v1.0.0","commit_sha":"deadbeef","fetched_at":"1970-01-01T00:00:00Z","fetched_at_unix_secs":0}"#,
+        )
+        .unwrap();
+        let offline = GitHubApiClient::new()
+            .with_binary(PathBuf::from("__never__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        assert_eq!(
+            offline.latest_release("actions", "ancient").unwrap(),
+            None,
+            "ancient entry must read as None"
+        );
+    }
+
+    #[test]
+    fn cache_ttl_zero_means_no_expiry() {
+        // Hand-write an entry with fetched_at_unix_secs = 1 (just
+        // after the epoch). With TTL = 0, it should still be served.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("actions--ttl-zero");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("release.json"),
+            r#"{"tag_name":"v9.9.9","commit_sha":"cafebabe","fetched_at":"1970-01-01T00:00:01Z","fetched_at_unix_secs":1}"#,
+        )
+        .unwrap();
+        let offline = GitHubApiClient::new()
+            .with_binary(PathBuf::from("__never__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true)
+            .with_cache_ttl(0);
+        let info = offline.latest_release("actions", "ttl-zero").unwrap();
+        assert_eq!(info.unwrap().tag_name, "v9.9.9");
     }
 
     #[test]

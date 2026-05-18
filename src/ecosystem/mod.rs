@@ -52,6 +52,10 @@ pub struct EcosystemContext {
     /// it to the entries matching the active ecosystem before constructing
     /// the context, so each proposer sees only its own ignore list.
     pub ignored_subjects: Vec<String>,
+    /// `--refresh-cache`: when true, network-mode proposers bypass the
+    /// on-disk cache and force a fresh fetch for every lookup.
+    /// Ignored in offline mode (there's no source to refresh from).
+    pub refresh_cache: bool,
 }
 
 /// The trait an ecosystem must implement to participate in the

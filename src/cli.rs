@@ -154,6 +154,13 @@ pub struct AnalyzeArgs {
     /// unaffected. Defaults to network-enabled.
     #[arg(long)]
     pub offline: bool,
+
+    /// Bypass the action-store cache and force a fresh fetch for every
+    /// GitHub API lookup. No effect in `--offline` mode (no source to
+    /// refresh from). Default behavior: cache entries are served when
+    /// fresh (< 7 days old) and re-fetched when stale.
+    #[arg(long = "refresh-cache")]
+    pub refresh_cache: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -309,6 +316,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 action_store: Some(args.repo.join(".assay").join("actions")),
                 allow_network: !args.offline,
                 ignored_subjects: resolve_ignore_list(&config, ecosystem.name()),
+                refresh_cache: args.refresh_cache,
             };
             let proposals = ecosystem.propose_updates(&manifests, &args.repo, &context)?;
             for proposal in &proposals {
@@ -1991,6 +1999,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -2062,6 +2071,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -2237,6 +2247,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         }
     }
 
@@ -2331,6 +2342,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
         // CustomBackend reports `needs_workflow_file() == false`, so the
@@ -2395,6 +2407,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         // Just needs to not error during construction.
         build_validator(&args).expect("gate-file should always build");
@@ -2425,6 +2438,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -2469,6 +2483,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -3076,6 +3091,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -3104,6 +3120,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -3130,6 +3147,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -3158,6 +3176,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             offline: false,
+            refresh_cache: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
