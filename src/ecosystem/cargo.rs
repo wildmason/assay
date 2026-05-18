@@ -977,7 +977,7 @@ fn resolve_cargo_consumers(
     proposal: &Proposal,
     tree: &Path,
 ) -> Result<Vec<crate::model::ConsumerId>> {
-    use cargo_metadata::MetadataCommand;
+    use cargo_metadata::{CargoOpt, MetadataCommand};
 
     let manifest_path = tree.join("Cargo.toml");
     if !manifest_path.is_file() {
@@ -987,8 +987,15 @@ fn resolve_cargo_consumers(
         });
     }
 
+    // `--all-features` so optional deps appear in the resolve graph. The
+    // blast-radius signal is "which workspace members are affected if I
+    // merge this bump" — that has to include feature-gated consumers,
+    // because the bump applies regardless of which feature flags any
+    // individual CI run happens to exercise. Default `cargo metadata`
+    // resolves only default features and silently drops optional deps.
     let metadata = MetadataCommand::new()
         .manifest_path(&manifest_path)
+        .features(CargoOpt::AllFeatures)
         .exec()
         .map_err(|e| Error::other(format!("cargo metadata failed: {e}")))?;
 
@@ -1743,6 +1750,61 @@ warning: not updating lockfile due to dry run
             }
             other => panic!("expected InvalidManifest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn affected_consumers_includes_optional_feature_gated_consumers() {
+        // Real-world case caught by the ruff stress dogfood (2026-05-18):
+        // `crates/ruff_benchmark/Cargo.toml` declares
+        //   codspeed-criterion-compat = { workspace = true,
+        //                                  default-features = false,
+        //                                  optional = true }
+        // gated by the `codspeed` feature. Pre-fix this disappeared from
+        // the consumer list because `cargo metadata` (default features
+        // only) excluded it from the resolve graph, leaving the proposal
+        // line with no consumer suffix — silently understating the blast
+        // radius. With `CargoOpt::AllFeatures` the optional dep enters
+        // the resolve graph and the consumer is reported.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        for member in ["a", "b"] {
+            let dir = tmp.path().join(member);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::create_dir(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        }
+        std::fs::write(
+            tmp.path().join("a/Cargo.toml"),
+            "[package]\n\
+                name = \"a\"\n\
+                version = \"0.1.0\"\n\
+                edition = \"2021\"\n\
+                \n\
+                [dependencies]\n\
+                b = { path = \"../b\", optional = true }\n\
+                \n\
+                [features]\n\
+                codspeed = [\"b\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let eco = CargoEcosystem;
+        let consumers = eco
+            .affected_consumers(&proposal_for("b"), tmp.path())
+            .unwrap();
+        assert_eq!(
+            consumers,
+            vec!["a".to_string()],
+            "optional+feature-gated consumer must appear in blast-radius list",
+        );
     }
 
     // -------------------------------------------------------------------------
