@@ -52,6 +52,9 @@ pub struct GitHubApiClient {
     /// 404 / unauthorized / unparseable (recorded so we don't re-fire
     /// on every consumer of the same action).
     cache: RefCell<HashMap<(String, String), Option<ReleaseInfo>>>,
+    /// `(owner, repo, tag) → exists?` cache for [`Self::tag_exists`]
+    /// probes used by the granularity-aware target picker.
+    tag_cache: RefCell<HashMap<(String, String, String), bool>>,
 }
 
 impl Default for GitHubApiClient {
@@ -59,6 +62,7 @@ impl Default for GitHubApiClient {
         Self {
             gh_bin: PathBuf::from("gh"),
             cache: RefCell::new(HashMap::new()),
+            tag_cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -107,6 +111,26 @@ impl GitHubApiClient {
             tag_name,
             commit_sha: sha,
         })
+    }
+
+    /// Verify a tag (by name) exists on `owner/repo`. Used by the
+    /// granularity-aware target picker to confirm that a truncated
+    /// candidate (e.g. `v6` derived from `v6.0.2`) is actually a
+    /// real tag before proposing it.
+    ///
+    /// Returns:
+    /// - `true` if the tag ref resolves to a 200.
+    /// - `false` for 404, missing `gh`, unauthorized, or any other
+    ///   non-success — caller falls back to the full latest tag.
+    pub fn tag_exists(&self, owner: &str, repo: &str, tag: &str) -> bool {
+        let key = (owner.to_string(), repo.to_string(), tag.to_string());
+        if let Some(cached) = self.tag_cache.borrow().get(&key) {
+            return *cached;
+        }
+        let path = format!("repos/{owner}/{repo}/git/refs/tags/{tag}");
+        let exists = matches!(self.gh_api_get(&path), Ok(Some(_)));
+        self.tag_cache.borrow_mut().insert(key, exists);
+        exists
     }
 
     fn resolve_commit_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Option<String> {

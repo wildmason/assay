@@ -353,9 +353,9 @@ pub(crate) fn aggregate_actions_from_manifests(manifests: &[Manifest]) -> Vec<Ac
 /// - **SHA pin**: `from = current_sha`, `to = release.commit_sha`. The
 ///   `tag:` note carries the new release tag so the applier can rewrite
 ///   the trailing `# v3.5.2` comment on the same line.
-/// - **Tag pin**: `from = current_tag` (e.g. `v3`), `to = release.tag_name`
-///   (e.g. `v4`). No SHA resolution — the applier rewrites the tag
-///   directly via `rewrite_uses_in_workflow`.
+/// - **Tag pin**: `from = current_tag` (e.g. `v3`), `to = picked tag`
+///   (granularity-matched against current; see [`pick_target_tag`]).
+///   The applier rewrites the tag directly via `rewrite_uses_in_workflow`.
 ///
 /// Tier classification reuses [`classify_action_bump`] against the
 /// best-known from-tag (the comment for SHA pins, the pin itself for
@@ -371,50 +371,66 @@ pub(crate) fn build_action_proposals(
             Ok(Some(info)) => info,
             _ => continue,
         };
-        let (from, to, from_tag_for_tier, id_segment) = match agg.pin_kind {
+        let parts: ProposalParts = match agg.pin_kind {
             PinKind::Sha => {
                 if release.commit_sha.eq_ignore_ascii_case(&agg.current_ref) {
                     continue;
                 }
+                // For SHA pins, the trailing `# v3.5.2` comment dictates
+                // the operator's preferred granularity. Resolve the
+                // target tag against that comment when present.
+                let target_tag = match agg.current_tag.as_deref() {
+                    Some(comment) => {
+                        pick_target_tag(client, &agg.owner, &agg.repo, comment, &release.tag_name)
+                    }
+                    None => release.tag_name.clone(),
+                };
                 (
                     agg.current_ref.clone(),
                     release.commit_sha.clone(),
                     agg.current_tag.clone(),
                     short_sha(&release.commit_sha),
                 )
+                    // NB: target_tag flows into `notes` below; keep the
+                    // existing 4-tuple shape for SHA pins.
+                    .with_target_tag(target_tag)
             }
             PinKind::Tag => {
-                if agg.current_ref == release.tag_name {
+                let target_tag = pick_target_tag(
+                    client,
+                    &agg.owner,
+                    &agg.repo,
+                    &agg.current_ref,
+                    &release.tag_name,
+                );
+                if agg.current_ref == target_tag {
                     continue;
                 }
                 (
                     agg.current_ref.clone(),
-                    release.tag_name.clone(),
+                    target_tag.clone(),
                     Some(agg.current_ref.clone()),
-                    sanitize_id_segment(&release.tag_name),
+                    sanitize_id_segment(&target_tag),
                 )
+                    .with_target_tag(target_tag)
             }
         };
-        let tier = classify_action_bump(from_tag_for_tier.as_deref(), &release.tag_name);
+        let tier = classify_action_bump(parts.from_tag_for_tier.as_deref(), &release.tag_name);
         let subject = format!("{}/{}", agg.owner, agg.repo);
         let id = format!(
             "gha-{}-{}-{}",
             sanitize_id_segment(&agg.owner),
             sanitize_id_segment(&agg.repo),
-            id_segment,
+            parts.id_segment,
         );
-        // For tag pins where the from-tag IS already the resolved tag,
-        // the `tag:` note would be a no-op for the applier's comment
-        // rewriter (no comment to rewrite). Still emit it so the
-        // receipt's `to-tag` is recorded.
-        let notes = vec![format!("tag:{}", release.tag_name)];
+        let notes = vec![format!("tag:{}", parts.target_tag)];
         proposals.push(Proposal {
             id,
             ecosystem: EcosystemName::GitHubActions.as_str().to_string(),
             kind: ProposalKind::ActionPin,
             subject,
-            from,
-            to,
+            from: parts.from,
+            to: parts.to,
             initial_classification: Classification::Exact,
             manifest_paths: agg.manifest_paths,
             notes,
@@ -422,6 +438,144 @@ pub(crate) fn build_action_proposals(
         });
     }
     proposals
+}
+
+/// Carrier tuple for the per-proposal output of `build_action_proposals`.
+/// Bundles `from`, `to`, the from-tag-for-tier (best-effort), the id
+/// segment, and the resolved target-tag (used in the proposal's `notes`
+/// for the applier's comment-rewrite). The previous code used a 4-tuple
+/// then patched in the target tag — extracting it makes the
+/// granularity-picker integration honest.
+struct ProposalParts {
+    from: String,
+    to: String,
+    from_tag_for_tier: Option<String>,
+    id_segment: String,
+    target_tag: String,
+}
+
+trait WithTargetTag {
+    fn with_target_tag(self, target_tag: String) -> ProposalParts;
+}
+
+impl WithTargetTag for (String, String, Option<String>, String) {
+    fn with_target_tag(self, target_tag: String) -> ProposalParts {
+        ProposalParts {
+            from: self.0,
+            to: self.1,
+            from_tag_for_tier: self.2,
+            id_segment: self.3,
+            target_tag,
+        }
+    }
+}
+
+/// Match the operator's tag granularity when picking a bump target.
+///
+/// Most workflow files pin actions at major-only floating tags
+/// (`actions/checkout@v4`) because GitHub's documented examples do.
+/// `releases/latest` returns the full version (`v6.0.2`). Naively using
+/// the full version replaces the operator's intentional "track latest
+/// in this major" pin with a frozen patch-level pin — a behavior
+/// regression.
+///
+/// Strategy:
+/// 1. Count numeric segments in current_ref (after stripping leading `v`).
+///    `v4` = 1, `v4.1` = 2, `v4.1.2` = 3, anything unparseable = 0.
+/// 2. If current segments == 0 OR current >= latest_segments, return
+///    latest_tag verbatim.
+/// 3. Otherwise build a truncated candidate (`v6.0.2` → `v6` for
+///    segments=1, `v6.0` for segments=2) and probe upstream with
+///    [`GitHubApiClient::tag_exists`].
+/// 4. If the truncated tag exists upstream, use it. If not, fall back
+///    to the full latest tag — the maintainer didn't publish the
+///    major-only float, so we can't honor the operator's granularity
+///    without breaking the pin.
+fn pick_target_tag(
+    client: &GitHubApiClient,
+    owner: &str,
+    repo: &str,
+    current_tag: &str,
+    latest_tag: &str,
+) -> String {
+    let current_segments = count_version_segments(current_tag);
+    let latest_segments = count_version_segments(latest_tag);
+    if current_segments == 0 || current_segments >= latest_segments {
+        return latest_tag.to_string();
+    }
+    let candidate = match truncate_tag(latest_tag, current_segments) {
+        Some(c) => c,
+        None => return latest_tag.to_string(),
+    };
+    if candidate == latest_tag {
+        return latest_tag.to_string();
+    }
+    if client.tag_exists(owner, repo, &candidate) {
+        candidate
+    } else {
+        latest_tag.to_string()
+    }
+}
+
+/// Count numeric segments in a version-like tag. Strips a leading `v`
+/// or `V`. Stops at the first non-numeric segment (drops prerelease /
+/// build metadata). Returns 0 for unparseable tags.
+fn count_version_segments(tag: &str) -> usize {
+    let stripped = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    let mut count = 0;
+    for segment in stripped.split('.') {
+        // Stop at the first segment that contains non-digits (e.g.
+        // `0-rc.1`, `+build.5`). Prerelease segments don't count
+        // toward "the operator wants this much granularity".
+        let core = segment
+            .split_once(['-', '+'])
+            .map(|(before, _)| before)
+            .unwrap_or(segment);
+        if core.is_empty() || !core.chars().all(|c| c.is_ascii_digit()) {
+            return count;
+        }
+        count += 1;
+        // If the segment HAD a dash/plus, stop — the rest is metadata.
+        if segment != core {
+            return count;
+        }
+    }
+    count
+}
+
+/// Truncate a version tag to `target_segments` numeric segments,
+/// preserving the leading `v` if present and dropping any
+/// prerelease/build metadata. Returns `None` when the tag has fewer
+/// segments than requested (can't synthesize).
+fn truncate_tag(tag: &str, target_segments: usize) -> Option<String> {
+    let leading_v = tag.starts_with('v') || tag.starts_with('V');
+    let stripped = if leading_v { &tag[1..] } else { tag };
+    let mut numeric_parts: Vec<&str> = Vec::new();
+    for segment in stripped.split('.') {
+        let core = segment
+            .split_once(['-', '+'])
+            .map(|(before, _)| before)
+            .unwrap_or(segment);
+        if !core.chars().all(|c| c.is_ascii_digit()) || core.is_empty() {
+            break;
+        }
+        numeric_parts.push(core);
+        if segment != core {
+            break;
+        }
+    }
+    if numeric_parts.len() < target_segments {
+        return None;
+    }
+    let truncated: String = numeric_parts[..target_segments].join(".");
+    Some(if leading_v {
+        format!("v{truncated}")
+    } else {
+        truncated
+    })
 }
 
 /// Classify the upgrade tier of a `from-tag` → `to-tag` action bump.
@@ -463,15 +617,7 @@ pub(crate) fn classify_action_bump(from_tag: Option<&str>, to_tag: &str) -> Bump
 fn is_shortcut_ref(git_ref: &str) -> bool {
     matches!(
         git_ref.to_ascii_lowercase().as_str(),
-        "stable"
-            | "nightly"
-            | "beta"
-            | "latest"
-            | "main"
-            | "master"
-            | "head"
-            | "default"
-            | "trunk"
+        "stable" | "nightly" | "beta" | "latest" | "main" | "master" | "head" | "default" | "trunk"
     )
 }
 
@@ -1485,6 +1631,59 @@ jobs:
         assert_eq!(aggs[1].repo, "setup-node");
         assert_eq!(aggs[1].pin_kind, PinKind::Tag);
         assert_eq!(aggs[1].current_ref, "v4");
+    }
+
+    // -------------------------------------------------------------------------
+    // count_version_segments + truncate_tag (operator-granularity matching).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn count_segments_handles_common_shapes() {
+        assert_eq!(count_version_segments("v4"), 1);
+        assert_eq!(count_version_segments("v4.1"), 2);
+        assert_eq!(count_version_segments("v4.1.2"), 3);
+        assert_eq!(count_version_segments("4.1.2"), 3);
+        assert_eq!(count_version_segments("V3"), 1);
+    }
+
+    #[test]
+    fn count_segments_drops_prerelease_and_build() {
+        // `v1.2.3-rc.1` → 3 (the rc.1 is metadata, not granularity).
+        assert_eq!(count_version_segments("v1.2.3-rc.1"), 3);
+        // `v1.2.3+build.5` → 3.
+        assert_eq!(count_version_segments("v1.2.3+build.5"), 3);
+    }
+
+    #[test]
+    fn count_segments_returns_zero_for_unparseable() {
+        assert_eq!(count_version_segments("stable"), 0);
+        assert_eq!(count_version_segments(""), 0);
+        assert_eq!(count_version_segments("v"), 0);
+        assert_eq!(count_version_segments("2024.01.05"), 3); // valid numeric
+        // Mixed: non-numeric segment after numerics → stops counting.
+        assert_eq!(count_version_segments("1.2.alpha"), 2);
+    }
+
+    #[test]
+    fn truncate_tag_drops_segments_preserving_v_prefix() {
+        assert_eq!(truncate_tag("v6.0.2", 1).as_deref(), Some("v6"));
+        assert_eq!(truncate_tag("v6.0.2", 2).as_deref(), Some("v6.0"));
+        assert_eq!(truncate_tag("v6.0.2", 3).as_deref(), Some("v6.0.2"));
+        assert_eq!(truncate_tag("6.0.2", 1).as_deref(), Some("6"));
+    }
+
+    #[test]
+    fn truncate_tag_drops_prerelease() {
+        // The truncated form drops -rc.1 — operators wanting a hard
+        // pin at the rc would supply 3 segments to start with.
+        assert_eq!(truncate_tag("v6.0.2-rc.1", 2).as_deref(), Some("v6.0"));
+    }
+
+    #[test]
+    fn truncate_tag_returns_none_when_not_enough_segments() {
+        // Can't synthesize segments that don't exist.
+        assert_eq!(truncate_tag("v6", 2), None);
+        assert_eq!(truncate_tag("v6.0", 3), None);
     }
 
     #[test]
