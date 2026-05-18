@@ -45,6 +45,8 @@ pub struct EcosystemsSection {
         rename = "github-actions"
     )]
     pub github_actions: EcosystemEntry,
+    #[serde(default = "default_npm_ecosystem")]
+    pub npm: EcosystemEntry,
 }
 
 impl Default for EcosystemsSection {
@@ -52,6 +54,7 @@ impl Default for EcosystemsSection {
         Self {
             cargo: default_cargo_ecosystem(),
             github_actions: default_github_actions_ecosystem(),
+            npm: default_npm_ecosystem(),
         }
     }
 }
@@ -195,6 +198,7 @@ impl Default for AssayConfig {
             ecosystems: EcosystemsSection {
                 cargo: default_cargo_ecosystem(),
                 github_actions: default_github_actions_ecosystem(),
+                npm: default_npm_ecosystem(),
             },
             pull_request: PullRequestSection {
                 labels: vec!["assay".into(), "dependencies".into()],
@@ -234,6 +238,21 @@ fn default_github_actions_ecosystem() -> EcosystemEntry {
         // GHA bump-application is pure file rewriting — no shared mutable
         // resource. Bounded only by `--threads`.
         max_parallel: 0,
+        ignore: Vec::new(),
+    }
+}
+
+fn default_npm_ecosystem() -> EcosystemEntry {
+    EcosystemEntry {
+        enabled: true,
+        validate_workflows: WorkflowSelection::default(),
+        grouping: Grouping::AllInOne,
+        allow_major: false,
+        // npm/pnpm/yarn all hold global cache locks (`~/.npm/_cacache`,
+        // `~/.local/share/pnpm/store`, etc.) and serialize concurrent
+        // `install` invocations anyway. Cap-of-1 avoids the cache-lock
+        // contention surface entirely.
+        max_parallel: 1,
         ignore: Vec::new(),
     }
 }
@@ -291,10 +310,67 @@ mod tests {
         assert_eq!(config.meta.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(config.ecosystems.cargo.enabled);
         assert!(config.ecosystems.github_actions.enabled);
+        assert!(config.ecosystems.npm.enabled);
+        // Per-ecosystem parallelism defaults: cargo and npm both serialize
+        // (cache-lock contention); github-actions is unbounded.
+        assert_eq!(config.ecosystems.cargo.max_parallel, 1);
+        assert_eq!(config.ecosystems.npm.max_parallel, 1);
+        assert_eq!(config.ecosystems.github_actions.max_parallel, 0);
         assert!(config.safety.refuse_in_ci);
         assert!(config.safety.refuse_dirty_tree);
         assert!(config.safety.require_force_for_overrides);
         assert_eq!(config.validation.executor, ValidationExecutor::Docker);
+    }
+
+    #[test]
+    fn cargo_max_parallel_can_be_overridden_in_config() {
+        // An operator who knows their CI environment allows multiple
+        // concurrent `cargo update` invocations (or who's running with a
+        // per-process registry cache) can opt into higher concurrency.
+        let text = r#"
+[assay]
+schema_version = 1
+
+[ecosystems.cargo]
+max_parallel = 4
+"#;
+        let config = parse(text, Path::new(".assay.toml")).expect("parses ok");
+        assert_eq!(config.ecosystems.cargo.max_parallel, 4);
+        // Unmentioned ecosystems keep their defaults.
+        assert_eq!(config.ecosystems.npm.max_parallel, 1);
+        assert_eq!(config.ecosystems.github_actions.max_parallel, 0);
+    }
+
+    #[test]
+    fn npm_max_parallel_can_be_overridden_in_config() {
+        let text = r#"
+[assay]
+schema_version = 1
+
+[ecosystems.npm]
+max_parallel = 2
+"#;
+        let config = parse(text, Path::new(".assay.toml")).expect("parses ok");
+        assert_eq!(config.ecosystems.npm.max_parallel, 2);
+        // Other ecosystems' defaults are preserved.
+        assert_eq!(config.ecosystems.cargo.max_parallel, 1);
+    }
+
+    #[test]
+    fn max_parallel_zero_in_config_means_unbounded() {
+        // `0` is the documented "unbounded" sentinel — Semaphore::new(0)
+        // returns the no-permit-accounting shape. An operator can opt
+        // cargo into unbounded parallelism this way (e.g. on a build host
+        // that has a per-job cargo home).
+        let text = r#"
+[assay]
+schema_version = 1
+
+[ecosystems.cargo]
+max_parallel = 0
+"#;
+        let config = parse(text, Path::new(".assay.toml")).expect("parses ok");
+        assert_eq!(config.ecosystems.cargo.max_parallel, 0);
     }
 
     #[test]

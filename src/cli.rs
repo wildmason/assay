@@ -388,10 +388,29 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             threads: args.threads.unwrap_or_else(WorkerPool::default_threads),
             fail_fast: args.fail_fast,
         };
-        // Build semaphores from the v1 defaults (cargo cap=1, others
-        // unbounded). Reading the EcosystemEntry's max_parallel from
-        // .assay.toml is the natural next step but isn't wired yet.
-        let semaphores = vec![("cargo", Arc::new(Semaphore::new(1)))];
+        // Build per-ecosystem semaphores from `.assay.toml`'s
+        // `[ecosystems.<eco>] max_parallel` values (each ecosystem's
+        // default lives in `config::default_<eco>_ecosystem`). `max_parallel
+        // = 0` means unbounded (the `Semaphore::new(0)` shape — no permit
+        // accounting). The worker pool looks entries up by ecosystem name
+        // and skips acquire on misses, so any ecosystem omitted here runs
+        // unbounded — every shipped ecosystem must be listed.
+        let semaphores = vec![
+            (
+                "cargo",
+                Arc::new(Semaphore::new(config.ecosystems.cargo.max_parallel)),
+            ),
+            (
+                "github-actions",
+                Arc::new(Semaphore::new(
+                    config.ecosystems.github_actions.max_parallel,
+                )),
+            ),
+            (
+                "npm",
+                Arc::new(Semaphore::new(config.ecosystems.npm.max_parallel)),
+            ),
+        ];
         let git_mutex = Mutex::new(());
         let ctx = WorkerContext {
             semaphores,
