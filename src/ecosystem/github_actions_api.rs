@@ -28,6 +28,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
@@ -42,7 +45,9 @@ pub struct ReleaseInfo {
 
 /// Shell-out wrapper around the `gh` CLI for GitHub REST calls. Caches
 /// resolved release info per `(owner, repo)` for the lifetime of the
-/// client.
+/// client, AND persists successful lookups to an optional on-disk store
+/// so subsequent `--offline` runs can re-emit proposals without
+/// re-hitting the network.
 #[derive(Debug)]
 pub struct GitHubApiClient {
     /// Path to the `gh` binary. Defaults to "gh" on PATH; tests inject
@@ -55,6 +60,14 @@ pub struct GitHubApiClient {
     /// `(owner, repo, tag) → exists?` cache for [`Self::tag_exists`]
     /// probes used by the granularity-aware target picker.
     tag_cache: RefCell<HashMap<(String, String, String), bool>>,
+    /// On-disk persistence root. When `Some(path)`, successful
+    /// `latest_release` lookups are serialized under
+    /// `<path>/<owner>--<repo>/release.json` so a later offline run
+    /// can re-emit the same proposals. `None` disables persistence.
+    cache_root: Option<PathBuf>,
+    /// In offline mode the client never invokes `gh`; it reads from
+    /// `cache_root` only. Lookups that miss the cache return `None`.
+    offline: bool,
 }
 
 impl Default for GitHubApiClient {
@@ -63,6 +76,8 @@ impl Default for GitHubApiClient {
             gh_bin: PathBuf::from("gh"),
             cache: RefCell::new(HashMap::new()),
             tag_cache: RefCell::new(HashMap::new()),
+            cache_root: None,
+            offline: false,
         }
     }
 }
@@ -76,6 +91,31 @@ impl GitHubApiClient {
     pub fn with_binary(mut self, gh_bin: PathBuf) -> Self {
         self.gh_bin = gh_bin;
         self
+    }
+
+    /// Enable on-disk persistence. Successful network lookups are
+    /// serialized under `<path>/<owner>--<repo>/release.json` and
+    /// `<path>/<owner>--<repo>/tags/<tag>.json`. Subsequent runs with
+    /// the same root re-read the cache.
+    pub fn with_cache_root(mut self, path: PathBuf) -> Self {
+        self.cache_root = Some(path);
+        self
+    }
+
+    /// Switch the client to offline mode. Lookups never shell out to
+    /// `gh`; they only read from the configured `cache_root`. Missing
+    /// cache entries return `None` (callers degrade gracefully —
+    /// proposers emit no proposal for the missing action).
+    pub fn with_offline_mode(mut self, offline: bool) -> Self {
+        self.offline = offline;
+        self
+    }
+
+    /// Whether the client is operating in offline mode. Callers use
+    /// this to set `Classification::Simulated` on the resulting
+    /// proposals so the receipt records "from cache, not live".
+    pub fn is_offline(&self) -> bool {
+        self.offline
     }
 
     /// Resolve the latest non-prerelease, non-draft release for
@@ -94,7 +134,15 @@ impl GitHubApiClient {
         if let Some(cached) = self.cache.borrow().get(&key) {
             return Ok(cached.clone());
         }
-        let resolved = self.fetch_latest_release_uncached(owner, repo);
+        let resolved = if self.offline {
+            self.read_release_cache(owner, repo)
+        } else {
+            let live = self.fetch_latest_release_uncached(owner, repo);
+            if let Some(ref info) = live {
+                let _ = self.write_release_cache(owner, repo, info);
+            }
+            live
+        };
         self.cache.borrow_mut().insert(key, resolved.clone());
         Ok(resolved)
     }
@@ -113,6 +161,45 @@ impl GitHubApiClient {
         })
     }
 
+    fn release_cache_path(&self, owner: &str, repo: &str) -> Option<PathBuf> {
+        let root = self.cache_root.as_ref()?;
+        Some(
+            root.join(sanitize_action_dir(owner, repo))
+                .join("release.json"),
+        )
+    }
+
+    fn read_release_cache(&self, owner: &str, repo: &str) -> Option<ReleaseInfo> {
+        let path = self.release_cache_path(owner, repo)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let cached: CachedReleaseEntry = serde_json::from_str(&text).ok()?;
+        Some(ReleaseInfo {
+            tag_name: cached.tag_name,
+            commit_sha: cached.commit_sha,
+        })
+    }
+
+    fn write_release_cache(
+        &self,
+        owner: &str,
+        repo: &str,
+        info: &ReleaseInfo,
+    ) -> std::io::Result<()> {
+        let Some(path) = self.release_cache_path(owner, repo) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let entry = CachedReleaseEntry {
+            tag_name: info.tag_name.clone(),
+            commit_sha: info.commit_sha.clone(),
+            fetched_at: now_iso8601(),
+        };
+        let json = serde_json::to_string_pretty(&entry).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+
     /// Verify a tag (by name) exists on `owner/repo`. Used by the
     /// granularity-aware target picker to confirm that a truncated
     /// candidate (e.g. `v6` derived from `v6.0.2`) is actually a
@@ -127,10 +214,55 @@ impl GitHubApiClient {
         if let Some(cached) = self.tag_cache.borrow().get(&key) {
             return *cached;
         }
-        let path = format!("repos/{owner}/{repo}/git/refs/tags/{tag}");
-        let exists = matches!(self.gh_api_get(&path), Ok(Some(_)));
+        let exists = if self.offline {
+            self.read_tag_cache(owner, repo, tag).unwrap_or(false)
+        } else {
+            let api_path = format!("repos/{owner}/{repo}/git/refs/tags/{tag}");
+            let live = matches!(self.gh_api_get(&api_path), Ok(Some(_)));
+            let _ = self.write_tag_cache(owner, repo, tag, live);
+            live
+        };
         self.tag_cache.borrow_mut().insert(key, exists);
         exists
+    }
+
+    fn tag_cache_path(&self, owner: &str, repo: &str, tag: &str) -> Option<PathBuf> {
+        let root = self.cache_root.as_ref()?;
+        let safe_tag = sanitize_tag_filename(tag);
+        Some(
+            root.join(sanitize_action_dir(owner, repo))
+                .join("tags")
+                .join(format!("{safe_tag}.json")),
+        )
+    }
+
+    fn read_tag_cache(&self, owner: &str, repo: &str, tag: &str) -> Option<bool> {
+        let path = self.tag_cache_path(owner, repo, tag)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let entry: CachedTagEntry = serde_json::from_str(&text).ok()?;
+        Some(entry.exists)
+    }
+
+    fn write_tag_cache(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+        exists: bool,
+    ) -> std::io::Result<()> {
+        let Some(path) = self.tag_cache_path(owner, repo, tag) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let entry = CachedTagEntry {
+            tag: tag.to_string(),
+            exists,
+            fetched_at: now_iso8601(),
+        };
+        let json = serde_json::to_string_pretty(&entry).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
     }
 
     fn resolve_commit_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Option<String> {
@@ -164,6 +296,86 @@ impl GitHubApiClient {
         }
         Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
     }
+}
+
+/// On-disk schema for a cached `releases/latest` lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedReleaseEntry {
+    tag_name: String,
+    commit_sha: String,
+    /// Best-effort ISO 8601 wall-clock when the live lookup happened.
+    /// Not used for validation today; future TTL logic can read it.
+    #[serde(default)]
+    fetched_at: String,
+}
+
+/// On-disk schema for a cached `tag_exists` probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedTagEntry {
+    tag: String,
+    exists: bool,
+    #[serde(default)]
+    fetched_at: String,
+}
+
+/// Filesystem-safe per-action directory name. `actions/checkout`
+/// becomes `actions--checkout`. The double-dash separator stays
+/// distinguishable from a literal slug-internal dash and matches
+/// neither slash nor any other path metacharacter.
+fn sanitize_action_dir(owner: &str, repo: &str) -> String {
+    format!(
+        "{}--{}",
+        sanitize_path_component(owner),
+        sanitize_path_component(repo)
+    )
+}
+
+fn sanitize_tag_filename(tag: &str) -> String {
+    sanitize_path_component(tag)
+}
+
+fn sanitize_path_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+fn now_iso8601() -> String {
+    // Best-effort: use UNIX_EPOCH seconds and format as
+    // "1970-01-01T00:00:00Z"-ish. We don't pull a chrono dep just
+    // for the audit timestamp; the field is informational.
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days_since_epoch = secs / 86_400;
+    let secs_of_day = secs % 86_400;
+    let h = secs_of_day / 3600;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    // Civil-date math via Howard Hinnant's algorithm.
+    let (y, mo, d) = civil_from_days(days_since_epoch as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Pull `tag_name` out of a `releases/latest` JSON body. Returns
@@ -227,6 +439,88 @@ mod tests {
             .with_binary(PathBuf::from("__assay_test_definitely_not_a_real_binary__"));
         let info = client.latest_release("actions", "checkout").unwrap();
         assert!(info.is_none(), "missing gh binary must yield None");
+    }
+
+    #[test]
+    fn sanitize_path_component_handles_slashes_and_specials() {
+        assert_eq!(sanitize_path_component("actions"), "actions");
+        assert_eq!(sanitize_path_component("ACTIONS"), "actions");
+        assert_eq!(sanitize_path_component("foo/bar"), "foo_bar");
+        assert_eq!(sanitize_path_component("foo:bar"), "foo_bar");
+        assert_eq!(sanitize_path_component("v1.2-rc.1"), "v1.2-rc.1");
+    }
+
+    #[test]
+    fn sanitize_action_dir_uses_double_dash_separator() {
+        assert_eq!(
+            sanitize_action_dir("actions", "checkout"),
+            "actions--checkout"
+        );
+        assert_eq!(
+            sanitize_action_dir("DTOLNAY", "rust-toolchain"),
+            "dtolnay--rust-toolchain"
+        );
+    }
+
+    #[test]
+    fn offline_mode_reads_release_from_cache() {
+        // Seed the cache, then build an offline client and verify
+        // it reads back identical info without invoking gh.
+        let tmp = tempfile::tempdir().unwrap();
+        let client = GitHubApiClient::new()
+            .with_binary(PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf());
+        let info = ReleaseInfo {
+            tag_name: "v6.0.2".into(),
+            commit_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".into(),
+        };
+        client
+            .write_release_cache("actions", "checkout", &info)
+            .unwrap();
+
+        let offline = GitHubApiClient::new()
+            .with_binary(PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        let read = offline.latest_release("actions", "checkout").unwrap();
+        assert_eq!(read, Some(info));
+    }
+
+    #[test]
+    fn offline_mode_returns_none_when_cache_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let offline = GitHubApiClient::new()
+            .with_binary(PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        assert_eq!(
+            offline.latest_release("never", "cached").unwrap(),
+            None,
+            "offline + no cache → None, not an error"
+        );
+    }
+
+    #[test]
+    fn offline_mode_reads_tag_existence_from_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = GitHubApiClient::new().with_cache_root(tmp.path().to_path_buf());
+        writer
+            .write_tag_cache("actions", "checkout", "v6", true)
+            .unwrap();
+        writer
+            .write_tag_cache("actions", "checkout", "v99", false)
+            .unwrap();
+
+        let offline = GitHubApiClient::new()
+            .with_binary(PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        assert!(offline.tag_exists("actions", "checkout", "v6"));
+        assert!(!offline.tag_exists("actions", "checkout", "v99"));
+        assert!(
+            !offline.tag_exists("actions", "checkout", "v1000"),
+            "uncached tag → false (no entry means 'we didn't probe it', not 'it exists')"
+        );
     }
 
     #[test]

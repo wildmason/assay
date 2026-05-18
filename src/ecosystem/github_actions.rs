@@ -123,13 +123,15 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
         _repo: &Path,
         ctx: &EcosystemContext,
     ) -> Result<Vec<Proposal>> {
-        if !ctx.allow_network {
-            // Offline mode: action_store-backed lookups will land in a
-            // follow-up; for v1 we just skip with a note in the receipt
-            // shape (Reporter surfaces empty proposals cleanly).
-            return Ok(Vec::new());
+        // Build the API client around the optional action_store. Online
+        // runs write resolved lookups to it; offline runs read from it.
+        // When neither network nor cache is available, no proposals emit
+        // (degrades cleanly — the rest of assay still works).
+        let mut client = GitHubApiClient::new();
+        if let Some(root) = ctx.action_store.clone() {
+            client = client.with_cache_root(root);
         }
-        let client = GitHubApiClient::new();
+        client = client.with_offline_mode(!ctx.allow_network);
         Ok(build_action_proposals(manifests, &client))
     }
 
@@ -423,7 +425,21 @@ pub(crate) fn build_action_proposals(
             sanitize_id_segment(&agg.repo),
             parts.id_segment,
         );
-        let notes = vec![format!("tag:{}", parts.target_tag)];
+        let mut notes = vec![format!("tag:{}", parts.target_tag)];
+        if client.is_offline() {
+            notes.push(
+                "source:offline-cache (latest release info read from .assay/actions/, may be stale)"
+                    .to_string(),
+            );
+        }
+        let classification = if client.is_offline() {
+            // Offline reads from the action_store cache. Mark as
+            // Simulated per the trait doc — the live registry may
+            // have moved on since the cache was written.
+            Classification::Simulated
+        } else {
+            Classification::Exact
+        };
         proposals.push(Proposal {
             id,
             ecosystem: EcosystemName::GitHubActions.as_str().to_string(),
@@ -431,7 +447,7 @@ pub(crate) fn build_action_proposals(
             subject,
             from: parts.from,
             to: parts.to,
-            initial_classification: Classification::Exact,
+            initial_classification: classification,
             manifest_paths: agg.manifest_paths,
             notes,
             bump_tier: tier,

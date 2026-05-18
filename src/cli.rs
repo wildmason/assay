@@ -270,8 +270,13 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     }
 
     let registry = default_registry();
+    // Always point the action_store at `<repo>/.assay/actions/`. Online
+    // runs write resolved GitHub Action releases there so offline reruns
+    // can re-emit proposals without network access; offline runs read
+    // from it. The directory is created lazily by the proposer on first
+    // successful write.
     let context = EcosystemContext {
-        action_store: None,
+        action_store: Some(args.repo.join(".assay").join("actions")),
         allow_network: !args.offline,
     };
     let started_at = iso8601_now();
