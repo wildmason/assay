@@ -12,6 +12,7 @@ use crate::model::{ConsumerId, Manifest, Proposal, ValidationOutcome};
 pub mod cargo;
 pub mod cargo_manifest_editor;
 pub mod github_actions;
+pub mod github_actions_api;
 pub mod npm;
 
 /// Identifies an ecosystem by short name. Matches the string stored on

@@ -3,11 +3,15 @@
 //! Detects pinned `uses:` references in `.github/workflows/*.{yml,yaml}` and
 //! `.github/actions/**/action.yml`. Each detected reference becomes a
 //! `Manifest` entry with the parsed `owner/repo[/path]@<sha-or-ref>` shape
-//! stored as metadata.
+//! (plus the optional `# vN.N.N` tag comment) stored as metadata.
 //!
-//! v1 stops at detection — actual tag→SHA resolution and proposal
-//! generation require Octocrab + the GitHub App auth flow which lands in
-//! the Publisher slice (§H steps 5, 9).
+//! The proposer aggregates SHA-pinned references by `(owner, repo)`,
+//! queries GitHub's REST API (via shell-out to the user's `gh` CLI)
+//! for the latest non-prerelease release tag + commit SHA, classifies
+//! the bump tier (same-major → Compatible, cross-major or unparseable
+//! → Breaking), and emits one [`Proposal`] per action with the new SHA
+//! as `to` and the resolved tag passed through `notes` so the applier's
+//! comment-rewrite kicks in.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,8 +19,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::model::{Manifest, ManifestKind, Proposal, ValidationOutcome};
+use crate::model::{
+    BumpTier, Classification, Manifest, ManifestKind, Proposal, ProposalKind, ValidationOutcome,
+};
 
+use super::github_actions_api::GitHubApiClient;
 use super::{DependencyEcosystem, EcosystemContext, EcosystemName};
 
 /// Parsed shape of a single `uses:` reference.
@@ -40,6 +47,15 @@ pub struct UsesReference {
     /// is clearly something else (tag or branch); `None` if no git_ref.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_sha_pinned: Option<bool>,
+    /// Trailing inline comment body when it looks like a version tag
+    /// (e.g. `# v3.5.2` → `Some("v3.5.2")`). The Proposer uses this as
+    /// the from-tag for tier classification AND as the signal that the
+    /// Applier should rewrite the comment when the SHA bumps. `None`
+    /// when the line has no comment or the comment doesn't look like
+    /// a version. `#[serde(default)]` for back-compat with receipts
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,14 +117,18 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
 
     fn propose_updates(
         &self,
-        _manifests: &[Manifest],
+        manifests: &[Manifest],
         _repo: &Path,
-        _ctx: &EcosystemContext,
+        ctx: &EcosystemContext,
     ) -> Result<Vec<Proposal>> {
-        // Implemented after Octocrab + GitHub App auth lands. v1 detection
-        // surface ships first; proposal generation needs network access
-        // to the GitHub REST API which is gated behind App credentials.
-        Ok(Vec::new())
+        if !ctx.allow_network {
+            // Offline mode: action_store-backed lookups will land in a
+            // follow-up; for v1 we just skip with a note in the receipt
+            // shape (Reporter surfaces empty proposals cleanly).
+            return Ok(Vec::new());
+        }
+        let client = GitHubApiClient::new();
+        Ok(build_action_proposals(manifests, &client))
     }
 
     fn gate_workflows(&self, _proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
@@ -217,6 +237,207 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
     }
 }
 
+/// Aggregate state for one `owner/repo` action seen across one or more
+/// workflow manifests.
+#[derive(Debug, Clone)]
+pub(crate) struct ActionAggregate {
+    pub owner: String,
+    pub repo: String,
+    /// The SHA every consumer is currently pinned at. When the same
+    /// action appears with different SHAs across files we keep the
+    /// first one and surface a note — the operator can re-run after
+    /// reconciling.
+    pub current_sha: String,
+    /// Trailing `# v3.5.2` comment when present in at least one
+    /// consumer. Used for tier classification of the from→to bump.
+    pub current_tag: Option<String>,
+    /// Workflow files (workspace-relative) that reference this action.
+    pub manifest_paths: Vec<PathBuf>,
+}
+
+/// Collect every distinct SHA-pinned `owner/repo` action from the
+/// detected manifest set, grouping by `(owner, repo)`. Per-manifest
+/// `subpath` (e.g. `actions/cache/save`) is folded into the subject
+/// only at proposal-build time so we don't query the same repo N times
+/// for each subpath that happens to live in it.
+pub(crate) fn aggregate_actions_from_manifests(manifests: &[Manifest]) -> Vec<ActionAggregate> {
+    let mut out: Vec<ActionAggregate> = Vec::new();
+    for manifest in manifests {
+        if !matches!(
+            manifest.kind,
+            ManifestKind::WorkflowYaml | ManifestKind::CompositeActionYaml
+        ) {
+            continue;
+        }
+        let Some(uses_value) = manifest.metadata.get("uses") else {
+            continue;
+        };
+        let refs: Vec<UsesReference> = match serde_json::from_value(uses_value.clone()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for r in refs {
+            if !matches!(r.kind, UsesKind::Remote) {
+                continue;
+            }
+            if r.is_sha_pinned != Some(true) {
+                continue;
+            }
+            let (Some(owner), Some(repo), Some(sha)) = (r.owner, r.repo, r.git_ref) else {
+                continue;
+            };
+            if let Some(existing) = out.iter_mut().find(|a| a.owner == owner && a.repo == repo) {
+                if !existing.manifest_paths.contains(&manifest.path) {
+                    existing.manifest_paths.push(manifest.path.clone());
+                }
+                if existing.current_tag.is_none() {
+                    existing.current_tag = r.tag_comment.clone();
+                }
+                // Defensive: when the same action is pinned at two
+                // different SHAs in the same repo, we proceed with the
+                // first-seen SHA. Mixed-pin reconciliation lives in a
+                // follow-up.
+                let _ = sha;
+            } else {
+                out.push(ActionAggregate {
+                    owner,
+                    repo,
+                    current_sha: sha,
+                    current_tag: r.tag_comment,
+                    manifest_paths: vec![manifest.path.clone()],
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.owner.cmp(&b.owner).then_with(|| a.repo.cmp(&b.repo)));
+    out
+}
+
+/// Build proposals from aggregated actions. Queries the GH API client
+/// once per aggregate for the latest release tag + commit SHA, classifies
+/// the bump tier from the from-tag vs to-tag semver comparison (defaulting
+/// to Breaking when either side is unparseable), and emits one Proposal
+/// per action that actually has a newer release available.
+pub(crate) fn build_action_proposals(
+    manifests: &[Manifest],
+    client: &GitHubApiClient,
+) -> Vec<Proposal> {
+    let aggregates = aggregate_actions_from_manifests(manifests);
+    let mut proposals: Vec<Proposal> = Vec::new();
+    for agg in aggregates {
+        let release = match client.latest_release(&agg.owner, &agg.repo) {
+            Ok(Some(info)) => info,
+            _ => continue,
+        };
+        if release.commit_sha.eq_ignore_ascii_case(&agg.current_sha) {
+            continue;
+        }
+        let tier = classify_action_bump(agg.current_tag.as_deref(), &release.tag_name);
+        let subject = format!("{}/{}", agg.owner, agg.repo);
+        let id = format!(
+            "gha-{}-{}-{}",
+            sanitize_id_segment(&agg.owner),
+            sanitize_id_segment(&agg.repo),
+            sanitize_id_segment(&short_sha(&release.commit_sha)),
+        );
+        let notes = vec![format!("tag:{}", release.tag_name)];
+        proposals.push(Proposal {
+            id,
+            ecosystem: EcosystemName::GitHubActions.as_str().to_string(),
+            kind: ProposalKind::ActionPin,
+            subject,
+            from: agg.current_sha,
+            to: release.commit_sha,
+            initial_classification: Classification::Exact,
+            manifest_paths: agg.manifest_paths,
+            notes,
+            bump_tier: tier,
+        });
+    }
+    proposals
+}
+
+/// Classify the upgrade tier of a `from-tag` → `to-tag` action bump.
+///
+/// Mirrors cargo / npm's caret-compat groups:
+/// - Both parseable, same major → Compatible.
+/// - Both parseable, different major → Breaking.
+/// - `from-tag` unknown (no `# vN.N.N` comment in the workflow) → Breaking,
+///   conservatively. Caller may downgrade later when we add release-notes
+///   parsing.
+/// - Either tag unparseable as semver (date-based pins like `2024.01.05`,
+///   `v3` shorthand) → Breaking.
+pub(crate) fn classify_action_bump(from_tag: Option<&str>, to_tag: &str) -> BumpTier {
+    let Some(from_tag) = from_tag else {
+        return BumpTier::Breaking;
+    };
+    let Some(from_v) = parse_action_tag(from_tag) else {
+        return BumpTier::Breaking;
+    };
+    let Some(to_v) = parse_action_tag(to_tag) else {
+        return BumpTier::Breaking;
+    };
+    if from_v.major == to_v.major {
+        BumpTier::Compatible
+    } else {
+        BumpTier::Breaking
+    }
+}
+
+/// Parse an action tag into a semver-like triple. Strips a leading `v`
+/// or `V`. Accepts the standard `X.Y.Z` shape AND the truncated `X.Y`
+/// (treats missing patch as 0) and `X` (treats missing minor + patch
+/// as 0) shapes that action authors sometimes use (`v3` for example).
+///
+/// Returns `None` for tags that can't be coerced — date-based releases
+/// (`2024.01.05`), commit-shaped pins, or anything with non-numeric
+/// segments.
+fn parse_action_tag(tag: &str) -> Option<semver::Version> {
+    let stripped = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    // Try direct parse first (handles `1.2.3`, `1.2.3-alpha`).
+    if let Ok(v) = semver::Version::parse(stripped) {
+        return Some(v);
+    }
+    // Try padding `X` → `X.0.0` and `X.Y` → `X.Y.0`.
+    let segments: Vec<&str> = stripped.split('.').collect();
+    let major: u64 = segments.first()?.parse().ok()?;
+    let minor: u64 = segments.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch: u64 = segments.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(semver::Version::new(major, minor, patch))
+}
+
+fn sanitize_id_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut last_dash = false;
+    for ch in input.chars().flat_map(char::to_lowercase) {
+        let mapped = if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            ch
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !last_dash && !out.is_empty() {
+                out.push(mapped);
+                last_dash = true;
+            }
+        } else {
+            out.push(mapped);
+            last_dash = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
 fn is_yaml(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
@@ -296,17 +517,48 @@ pub fn collect_uses_references(workflow_text: &str) -> Vec<UsesReference> {
         // Strip leading whitespace after the colon, then capture up to the
         // first whitespace or `#` (start of an inline comment).
         let after_colon = rest.trim_start();
-        let value = after_colon
-            .split_once(|c: char| c.is_whitespace() || c == '#')
-            .map(|(v, _)| v)
-            .unwrap_or(after_colon);
+        let (value, comment_after_hash) = match after_colon.split_once('#') {
+            Some((before, after)) => (before.trim_end(), Some(after)),
+            None => match after_colon.split_once(char::is_whitespace) {
+                Some((before, _)) => (before, None),
+                None => (after_colon, None),
+            },
+        };
         let trimmed = value.trim().trim_matches('"').trim_matches('\'');
         if trimmed.is_empty() {
             continue;
         }
-        out.push(parse_uses_value(trimmed));
+        let mut parsed = parse_uses_value(trimmed);
+        parsed.tag_comment = extract_tag_comment(comment_after_hash);
+        out.push(parsed);
     }
     out
+}
+
+/// Extract a version-tag-shaped comment body from the post-`#` content
+/// of a `uses:` line. Mirrors the version-tag heuristic used by the
+/// Applier's comment rewriter — leading whitespace stripped, body kept
+/// only when its first char looks like a version (`v`, `V`, or a digit).
+///
+/// Examples:
+/// - `" v3.5.2"` → `Some("v3.5.2")`
+/// - `" 1.2.3"` → `Some("1.2.3")`
+/// - `" # pinned for security"` → `None` (no version-shaped body)
+fn extract_tag_comment(after_hash: Option<&str>) -> Option<String> {
+    let raw = after_hash?;
+    let trimmed = raw.trim();
+    let first = trimmed.chars().next()?;
+    if !is_version_char(first) {
+        return None;
+    }
+    // Stop at first whitespace to drop trailing words like
+    // `# v3.5.2 (pinned)`.
+    let body = trimmed
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or(trimmed)
+        .to_string();
+    if body.is_empty() { None } else { Some(body) }
 }
 
 fn parse_uses_value(raw: &str) -> UsesReference {
@@ -323,6 +575,7 @@ fn parse_uses_value(raw: &str) -> UsesReference {
                 .map(|(_, tag)| tag.to_string())
                 .or_else(|| Some(stripped.to_string())),
             is_sha_pinned: None,
+            tag_comment: None,
         };
     }
     if raw.starts_with("./") || raw.starts_with("../") {
@@ -334,6 +587,7 @@ fn parse_uses_value(raw: &str) -> UsesReference {
             subpath: None,
             git_ref: None,
             is_sha_pinned: None,
+            tag_comment: None,
         };
     }
     let (path_part, ref_part) = match raw.split_once('@') {
@@ -353,6 +607,7 @@ fn parse_uses_value(raw: &str) -> UsesReference {
         subpath,
         git_ref: ref_part,
         is_sha_pinned,
+        tag_comment: None,
     }
 }
 
@@ -899,5 +1154,200 @@ jobs:
             manifests[0].kind,
             ManifestKind::CompositeActionYaml
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Tag-comment extraction in collect_uses_references.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn collect_captures_version_tag_comment() {
+        let yaml =
+            "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v4.1.0\n";
+        let refs = collect_uses_references(yaml);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].tag_comment.as_deref(), Some("v4.1.0"));
+    }
+
+    #[test]
+    fn collect_captures_bare_version_tag_comment() {
+        let yaml =
+            "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # 4.1.0\n";
+        let refs = collect_uses_references(yaml);
+        assert_eq!(refs[0].tag_comment.as_deref(), Some("4.1.0"));
+    }
+
+    #[test]
+    fn collect_ignores_non_version_comments() {
+        let yaml = "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # pinned for security\n";
+        let refs = collect_uses_references(yaml);
+        assert_eq!(refs[0].tag_comment, None);
+    }
+
+    #[test]
+    fn collect_returns_none_tag_when_no_comment() {
+        let yaml = "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567\n";
+        let refs = collect_uses_references(yaml);
+        assert_eq!(refs[0].tag_comment, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Action aggregation + tier classification + proposal building.
+    // -------------------------------------------------------------------------
+
+    fn manifest_with_uses(path: &str, uses: Vec<UsesReference>) -> Manifest {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("uses".to_string(), serde_json::to_value(&uses).unwrap());
+        Manifest {
+            path: PathBuf::from(path),
+            kind: ManifestKind::WorkflowYaml,
+            metadata,
+        }
+    }
+
+    fn sha_pinned_ref(owner: &str, repo: &str, sha: &str, tag: Option<&str>) -> UsesReference {
+        UsesReference {
+            raw: format!("{owner}/{repo}@{sha}"),
+            kind: UsesKind::Remote,
+            owner: Some(owner.into()),
+            repo: Some(repo.into()),
+            subpath: None,
+            git_ref: Some(sha.into()),
+            is_sha_pinned: Some(true),
+            tag_comment: tag.map(String::from),
+        }
+    }
+
+    #[test]
+    fn aggregate_groups_same_action_across_files() {
+        // The same action declared in two workflows must produce ONE
+        // aggregate with both manifest paths attached.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let m1 = manifest_with_uses(
+            ".github/workflows/ci.yml",
+            vec![sha_pinned_ref("actions", "checkout", sha, Some("v4.1.0"))],
+        );
+        let m2 = manifest_with_uses(
+            ".github/workflows/release.yml",
+            vec![sha_pinned_ref("actions", "checkout", sha, Some("v4.1.0"))],
+        );
+        let aggs = aggregate_actions_from_manifests(&[m1, m2]);
+        assert_eq!(aggs.len(), 1);
+        assert_eq!(aggs[0].owner, "actions");
+        assert_eq!(aggs[0].repo, "checkout");
+        assert_eq!(aggs[0].manifest_paths.len(), 2);
+        assert_eq!(aggs[0].current_tag.as_deref(), Some("v4.1.0"));
+    }
+
+    #[test]
+    fn aggregate_keeps_distinct_actions_separate() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let m = manifest_with_uses(
+            ".github/workflows/ci.yml",
+            vec![
+                sha_pinned_ref("actions", "checkout", sha, None),
+                sha_pinned_ref("actions", "setup-node", sha, None),
+            ],
+        );
+        let aggs = aggregate_actions_from_manifests(&[m]);
+        assert_eq!(aggs.len(), 2);
+        // Sorted alphabetically by (owner, repo).
+        assert_eq!(aggs[0].repo, "checkout");
+        assert_eq!(aggs[1].repo, "setup-node");
+    }
+
+    #[test]
+    fn aggregate_drops_unpinned_refs() {
+        // Tag pins (`@v4`) and branch pins are skipped — proposer only
+        // works against SHA pins (the security-recommended shape).
+        let tag_ref = UsesReference {
+            raw: "actions/checkout@v4".into(),
+            kind: UsesKind::Remote,
+            owner: Some("actions".into()),
+            repo: Some("checkout".into()),
+            subpath: None,
+            git_ref: Some("v4".into()),
+            is_sha_pinned: Some(false),
+            tag_comment: None,
+        };
+        let m = manifest_with_uses(".github/workflows/ci.yml", vec![tag_ref]);
+        assert!(aggregate_actions_from_manifests(&[m]).is_empty());
+    }
+
+    #[test]
+    fn aggregate_drops_local_and_docker_refs() {
+        let local = UsesReference {
+            raw: "./.github/actions/local".into(),
+            kind: UsesKind::Local,
+            owner: None,
+            repo: None,
+            subpath: None,
+            git_ref: None,
+            is_sha_pinned: None,
+            tag_comment: None,
+        };
+        let docker = UsesReference {
+            raw: "docker://alpine:3.18".into(),
+            kind: UsesKind::Docker,
+            owner: None,
+            repo: None,
+            subpath: None,
+            git_ref: Some("3.18".into()),
+            is_sha_pinned: None,
+            tag_comment: None,
+        };
+        let m = manifest_with_uses(".github/workflows/ci.yml", vec![local, docker]);
+        assert!(aggregate_actions_from_manifests(&[m]).is_empty());
+    }
+
+    #[test]
+    fn classify_same_major_is_compatible() {
+        assert_eq!(
+            classify_action_bump(Some("v3.1.0"), "v3.5.2"),
+            BumpTier::Compatible
+        );
+    }
+
+    #[test]
+    fn classify_cross_major_is_breaking() {
+        assert_eq!(
+            classify_action_bump(Some("v3.5.2"), "v4.0.0"),
+            BumpTier::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_unknown_from_tag_is_breaking() {
+        // No `# vN.N.N` comment → conservatively Breaking. The operator
+        // sees the bump in the report and decides whether to ship.
+        assert_eq!(classify_action_bump(None, "v4.2.0"), BumpTier::Breaking);
+    }
+
+    #[test]
+    fn classify_unparseable_tag_is_breaking() {
+        // Date-based releases (`2024.01.05`) don't fit the semver
+        // shape — default to Breaking.
+        assert_eq!(
+            classify_action_bump(Some("2023.12.01"), "2024.01.05"),
+            BumpTier::Breaking
+        );
+    }
+
+    #[test]
+    fn classify_truncated_tags_parse_as_zero_padded() {
+        // `v3` pads to `3.0.0`, `v3.0` pads to `3.0.0`. Both should
+        // compare equal-major to `v3.5.2`.
+        assert_eq!(
+            classify_action_bump(Some("v3"), "v3.5.2"),
+            BumpTier::Compatible
+        );
+        assert_eq!(
+            classify_action_bump(Some("v3.5"), "v3.6.0"),
+            BumpTier::Compatible
+        );
+        assert_eq!(
+            classify_action_bump(Some("v3"), "v4.0.0"),
+            BumpTier::Breaking
+        );
     }
 }

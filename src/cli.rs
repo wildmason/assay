@@ -146,6 +146,14 @@ pub struct AnalyzeArgs {
     /// In-flight proposals run to completion. Default is run-all-and-report.
     #[arg(long)]
     pub fail_fast: bool,
+
+    /// Disable network calls during proposer phase. With this flag set,
+    /// ecosystems that need network access (currently: GitHub Actions
+    /// — to resolve `uses:@SHA` against the latest release on github.com)
+    /// emit no proposals. Local-only ecosystems (Cargo, npm) are
+    /// unaffected. Defaults to network-enabled.
+    #[arg(long)]
+    pub offline: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -264,7 +272,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let registry = default_registry();
     let context = EcosystemContext {
         action_store: None,
-        allow_network: false,
+        allow_network: !args.offline,
     };
     let started_at = iso8601_now();
     let run_id = generate_run_id();
@@ -1957,6 +1965,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -2027,6 +2036,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -2201,6 +2211,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         }
     }
 
@@ -2294,6 +2305,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
         // CustomBackend reports `needs_workflow_file() == false`, so the
@@ -2357,6 +2369,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         // Just needs to not error during construction.
         build_validator(&args).expect("gate-file should always build");
@@ -2386,6 +2399,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -2429,6 +2443,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -3035,6 +3050,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -3062,6 +3078,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -3087,6 +3104,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -3114,6 +3132,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            offline: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
