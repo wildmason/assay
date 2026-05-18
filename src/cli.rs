@@ -1384,15 +1384,18 @@ fn perform_apply_pr(
             source,
         })?;
     }
+    // Same sub-dir support as `prepare_apply_local_tree`: walk up to
+    // the real git root so `git worktree add` finds the shared .git.
+    let git_root = git_top_level(repo)?;
     let output = std::process::Command::new("git")
         .args(["worktree", "add", "-b"])
         .arg(&branch)
         .arg(&worktree)
         .arg("HEAD")
-        .current_dir(repo)
+        .current_dir(&git_root)
         .output()
         .map_err(|source| Error::Io {
-            path: repo.to_path_buf(),
+            path: git_root.clone(),
             source,
         })?;
     if !output.status.success() {
@@ -1641,11 +1644,19 @@ fn prepare_apply_local_tree(
     run_id: &str,
     proposal_id: &str,
 ) -> Result<PathBuf> {
-    if !repo.join(".git").exists() {
-        return Err(Error::other(
-            "--apply-local requires a git checkout so assay can retain an isolated worktree",
-        ));
-    }
+    // `repo` may point at a sub-directory of a git repo (e.g. helm's
+    // `src-tauri/` under helm root). `git rev-parse --show-toplevel`
+    // walks up to the real repo root; `git worktree add` must run
+    // there to access the shared .git dir. The worktree target still
+    // lives under `repo` so the operator's `.assay/runs/` audit trail
+    // is co-located with their working tree.
+    let git_root = git_top_level(repo)?;
+    let rel_sub_dir = repo.canonicalize().ok().and_then(|c| {
+        git_root
+            .canonicalize()
+            .ok()
+            .and_then(|g| c.strip_prefix(&g).ok().map(Path::to_path_buf))
+    });
     let work_root = repo.join(".assay").join("runs").join(run_id).join("work");
     std::fs::create_dir_all(&work_root).map_err(|source| Error::Io {
         path: work_root.clone(),
@@ -1658,16 +1669,22 @@ fn prepare_apply_local_tree(
         target = work_root.join(format!("{base}-{suffix}"));
         suffix += 1;
     }
+    // Convert target to absolute. `git worktree add` resolves a
+    // relative target against its `current_dir` (which we set to
+    // git_root), not against where assay was invoked — without this
+    // canonicalization the worktree lands in the wrong place when
+    // `--repo` is a sub-dir.
+    let target_abs = std::path::absolute(&target).unwrap_or(target.clone());
     let output = std::process::Command::new("git")
         .arg("worktree")
         .arg("add")
         .arg("--detach")
-        .arg(&target)
+        .arg(&target_abs)
         .arg("HEAD")
-        .current_dir(repo)
+        .current_dir(&git_root)
         .output()
         .map_err(|source| Error::Io {
-            path: repo.to_path_buf(),
+            path: git_root.clone(),
             source,
         })?;
     if !output.status.success() {
@@ -1676,7 +1693,40 @@ fn prepare_apply_local_tree(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(target)
+    // When `repo` is a sub-directory, the applier/validator expect to
+    // run inside the same sub-dir of the worktree. Otherwise they
+    // wouldn't find Cargo.toml / package.json relative to the operator-
+    // facing repo argument.
+    let final_target = match rel_sub_dir {
+        Some(rel) if !rel.as_os_str().is_empty() => target_abs.join(rel),
+        _ => target_abs,
+    };
+    Ok(final_target)
+}
+
+/// Resolve the top-level git repo root for `path` via
+/// `git rev-parse --show-toplevel`. Errors with a clear message when
+/// `path` isn't under any git checkout (the operator can't use
+/// `--apply-local` without git for the sandbox machinery).
+fn git_top_level(path: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::other(format!(
+            "--apply-local requires a git checkout so assay can retain an isolated worktree, \
+             but `{}` is not under one (git rev-parse said: {})",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(PathBuf::from(stdout.trim()))
 }
 
 fn safe_apply_tree_name(proposal_id: &str) -> String {

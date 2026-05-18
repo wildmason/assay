@@ -368,11 +368,16 @@ fn short_hash_of_proposals(proposals: &[&Proposal]) -> String {
 /// `merge-<ecosystem>-<short-hash>`, not a proposal id). Public so cli.rs
 /// can share the implementation if it wants.
 pub fn prepare_isolated_worktree(repo: &Path, run_id: &str, label: &str) -> Result<PathBuf> {
-    if !repo.join(".git").exists() {
-        return Err(Error::other(
-            "merge applier requires a git checkout so assay can retain an isolated worktree",
-        ));
-    }
+    // Walk up to the git top-level via `git rev-parse --show-toplevel`
+    // — supports running assay against a sub-directory (helm's
+    // `src-tauri/` under helm root, for example).
+    let git_root = resolve_git_top_level(repo)?;
+    let rel_sub_dir = repo.canonicalize().ok().and_then(|c| {
+        git_root
+            .canonicalize()
+            .ok()
+            .and_then(|g| c.strip_prefix(&g).ok().map(Path::to_path_buf))
+    });
     let work_root = repo.join(".assay").join("runs").join(run_id).join("work");
     std::fs::create_dir_all(&work_root).map_err(|source| Error::Io {
         path: work_root.clone(),
@@ -385,16 +390,17 @@ pub fn prepare_isolated_worktree(repo: &Path, run_id: &str, label: &str) -> Resu
         target = work_root.join(format!("{base}-{suffix}"));
         suffix += 1;
     }
+    let target_abs = std::path::absolute(&target).unwrap_or(target.clone());
     let output = std::process::Command::new("git")
         .arg("worktree")
         .arg("add")
         .arg("--detach")
-        .arg(&target)
+        .arg(&target_abs)
         .arg("HEAD")
-        .current_dir(repo)
+        .current_dir(&git_root)
         .output()
         .map_err(|source| Error::Io {
-            path: repo.to_path_buf(),
+            path: git_root.clone(),
             source,
         })?;
     if !output.status.success() {
@@ -403,7 +409,32 @@ pub fn prepare_isolated_worktree(repo: &Path, run_id: &str, label: &str) -> Resu
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(target)
+    let final_target = match rel_sub_dir {
+        Some(rel) if !rel.as_os_str().is_empty() => target_abs.join(rel),
+        _ => target_abs,
+    };
+    Ok(final_target)
+}
+
+fn resolve_git_top_level(path: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::other(format!(
+            "merge applier requires a git checkout so assay can retain an isolated worktree, \
+             but `{}` is not under one (git rev-parse said: {})",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(PathBuf::from(stdout.trim()))
 }
 
 fn safe_tree_label(label: &str) -> String {
