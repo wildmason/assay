@@ -146,6 +146,15 @@ pub struct Proposal {
     /// still deserialize cleanly with `LockfileOnly`.
     #[serde(default)]
     pub bump_tier: BumpTier,
+    /// Workspace members that directly declare the proposal's subject
+    /// as a dependency. For a 47-member monorepo where only 3 crates
+    /// consume the upgraded dep, this captures the "blast radius" the
+    /// operator needs to know — a bump's impact is bounded to its
+    /// consumers, not the whole workspace. Populated by the proposer
+    /// pipeline via `DependencyEcosystem::affected_consumers`.
+    /// `#[serde(default)]` for receipt back-compat with older runs.
+    #[serde(default)]
+    pub affected_consumers: Vec<ConsumerId>,
 }
 
 /// Diagnostic detail captured when a validator backend fails on a

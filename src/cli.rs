@@ -161,6 +161,14 @@ pub struct AnalyzeArgs {
     /// fresh (< 7 days old) and re-fetched when stale.
     #[arg(long = "refresh-cache")]
     pub refresh_cache: bool,
+
+    /// Suppress a specific proposal subject for this run, in addition to
+    /// any `[ecosystems.<eco>] ignore = [...]` lists in `.assay.toml`.
+    /// Format: `<ecosystem>:<subject>` (e.g. `cargo:reqwest` or
+    /// `github-actions:actions/checkout`). Repeatable. CLI ignores are
+    /// merged with — and never override — config-file ignores.
+    #[arg(long = "ignore", value_name = "ECO:SUBJECT")]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -315,10 +323,22 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             let context = EcosystemContext {
                 action_store: Some(args.repo.join(".assay").join("actions")),
                 allow_network: !args.offline,
-                ignored_subjects: resolve_ignore_list(&config, ecosystem.name()),
+                ignored_subjects: resolve_ignore_list(&config, &args.ignore, ecosystem.name()),
                 refresh_cache: args.refresh_cache,
             };
-            let proposals = ecosystem.propose_updates(&manifests, &args.repo, &context)?;
+            let mut proposals = ecosystem.propose_updates(&manifests, &args.repo, &context)?;
+            // Enrich each proposal with the list of workspace members
+            // that directly declare the subject as a dependency. This
+            // is the "blast radius" signal — for a 47-member monorepo
+            // where only 3 crates consume this dep, the operator sees
+            // exactly which 3. Best-effort: an ecosystem that can't
+            // resolve consumers (network failure, malformed manifest)
+            // leaves the field empty and we continue with the proposal.
+            for proposal in &mut proposals {
+                if let Ok(consumers) = ecosystem.affected_consumers(proposal, &args.repo) {
+                    proposal.affected_consumers = consumers;
+                }
+            }
             for proposal in &proposals {
                 provenance.records.push(ProvenanceRecord {
                     tool: "assay".into(),
@@ -770,11 +790,41 @@ fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal
             if !p.notes.is_empty() {
                 line.push_str(&format!("  [{}]", p.notes.join(", ")));
             }
+            line.push_str(&format_consumers_suffix(&p.affected_consumers));
             println!("{line}");
         }
     };
     print_group("compatible", compatible);
     print_group("breaking", breaking);
+}
+
+/// Render a parenthesized "(N consumer(s): a, b, c)" suffix for the
+/// reporter line. Returns an empty string when no consumers were
+/// recorded — that's the GHA case (no workspace-member axis) and the
+/// "the proposed dep isn't declared in any other member" case. Long
+/// lists are truncated to the first 4 names with a trailing `, …+N`
+/// marker so the line stays scannable.
+fn format_consumers_suffix(consumers: &[crate::model::ConsumerId]) -> String {
+    if consumers.is_empty() {
+        return String::new();
+    }
+    const MAX_NAMES: usize = 4;
+    let mut sorted: Vec<&crate::model::ConsumerId> = consumers.iter().collect();
+    sorted.sort();
+    let n = sorted.len();
+    let label = if n == 1 { "consumer" } else { "consumers" };
+    let head_count = sorted.len().min(MAX_NAMES);
+    let head: Vec<String> = sorted
+        .iter()
+        .take(head_count)
+        .map(|s| s.to_string())
+        .collect();
+    let tail = if n > MAX_NAMES {
+        format!(", …+{}", n - MAX_NAMES)
+    } else {
+        String::new()
+    };
+    format!("  ({n} {label}: {}{tail})", head.join(", "))
 }
 
 /// Worker body: prepare sandbox → apply proposal → gate workflows → validate.
@@ -971,8 +1021,13 @@ fn format_red_proposal_section(
             .map(|d| d.flavor.as_str())
             .unwrap_or("FAILURE");
         out.push_str(&format!(
-            "  {} {} {} → {} [{}]\n",
-            run.proposal.id, run.proposal.subject, run.proposal.from, run.proposal.to, flavor,
+            "  {} {} {} → {} [{}]{}\n",
+            run.proposal.id,
+            run.proposal.subject,
+            run.proposal.from,
+            run.proposal.to,
+            flavor,
+            format_consumers_suffix(&run.proposal.affected_consumers),
         ));
         for detail in &run.outcome.failure_details {
             if detail.stderr_tail.trim().is_empty() {
@@ -998,8 +1053,13 @@ fn format_red_proposal_section(
 
     for row in &pv_sorted {
         out.push_str(&format!(
-            "  {} {} {} → {} [APPLY-FAILURE]\n    {}\n",
-            row.proposal.id, row.proposal.subject, row.proposal.from, row.proposal.to, row.summary,
+            "  {} {} {} → {} [APPLY-FAILURE]{}\n    {}\n",
+            row.proposal.id,
+            row.proposal.subject,
+            row.proposal.from,
+            row.proposal.to,
+            format_consumers_suffix(&row.proposal.affected_consumers),
+            row.summary,
         ));
     }
 
@@ -2069,15 +2129,42 @@ fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
 /// npm and yarn1 share the npm ecosystem entry (both use the
 /// `NpmEcosystem` impl). Other ecosystems get their own section in
 /// the config.
-fn resolve_ignore_list(config: &crate::config::AssayConfig, ecosystem_name: &str) -> Vec<String> {
-    match ecosystem_name {
+fn resolve_ignore_list(
+    config: &crate::config::AssayConfig,
+    cli_ignores: &[String],
+    ecosystem_name: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = match ecosystem_name {
         "cargo" => config.ecosystems.cargo.ignore.clone(),
         "github-actions" => config.ecosystems.github_actions.ignore.clone(),
         // npm/yarn1/pnpm aren't represented in the .assay.toml today;
         // a future config rev can add an `npm` section. For now return
         // an empty list (no ignores), matching the no-config default.
         _ => Vec::new(),
+    };
+    for entry in cli_ignores {
+        if let Some((eco, subject)) = parse_cli_ignore(entry)
+            && eco == ecosystem_name
+            && !out.iter().any(|s| s == subject)
+        {
+            out.push(subject.to_string());
+        }
     }
+    out
+}
+
+/// Parse a `--ignore <eco>:<subject>` argument into its two halves.
+/// Returns `None` for malformed input (no colon, empty halves), which
+/// the caller silently drops — clap's value parsing handled the
+/// repeat-and-collect, and a typo'd entry shouldn't crash the run.
+fn parse_cli_ignore(raw: &str) -> Option<(&str, &str)> {
+    let (eco, subject) = raw.split_once(':')?;
+    let eco = eco.trim();
+    let subject = subject.trim();
+    if eco.is_empty() || subject.is_empty() {
+        return None;
+    }
+    Some((eco, subject))
 }
 
 fn ecosystem_enabled(args: &AnalyzeArgs, ecosystem: &dyn DependencyEcosystem) -> bool {
@@ -2140,6 +2227,7 @@ mod tests {
                 manifest_paths: vec![],
                 notes: vec![],
                 bump_tier: BumpTier::Breaking,
+                affected_consumers: Vec::new(),
             },
             sandbox: PathBuf::from("/tmp/sandbox"),
             outcome: crate::model::ValidationOutcome {
@@ -2175,6 +2263,7 @@ mod tests {
                 manifest_paths: vec![],
                 notes: vec![],
                 bump_tier: BumpTier::LockfileOnly,
+                affected_consumers: Vec::new(),
             },
             sandbox: PathBuf::from("/tmp/sb"),
             outcome: crate::model::ValidationOutcome {
@@ -2210,9 +2299,173 @@ mod tests {
                 manifest_paths: vec![],
                 notes: vec![],
                 bump_tier: BumpTier::Breaking,
+                affected_consumers: Vec::new(),
             },
             summary: summary.into(),
         }
+    }
+
+    // ----- format_consumers_suffix ---------------------------------------
+
+    #[test]
+    fn consumers_suffix_empty_for_zero_consumers() {
+        assert_eq!(format_consumers_suffix(&[]), "");
+    }
+
+    #[test]
+    fn consumers_suffix_singular_label_for_one() {
+        let s = format_consumers_suffix(&["alpha".to_string()]);
+        assert_eq!(s, "  (1 consumer: alpha)");
+    }
+
+    #[test]
+    fn consumers_suffix_plural_label_and_sorted_alphabetical() {
+        let s = format_consumers_suffix(&["c".into(), "a".into(), "b".into()]);
+        // Sorted ascending, no truncation.
+        assert_eq!(s, "  (3 consumers: a, b, c)");
+    }
+
+    #[test]
+    fn consumers_suffix_truncates_to_first_four_with_overflow_marker() {
+        let consumers: Vec<String> = (1..=7).map(|i| format!("crate-{i:02}")).collect();
+        let s = format_consumers_suffix(&consumers);
+        // First four alphabetically + "…+3" overflow marker.
+        assert_eq!(
+            s,
+            "  (7 consumers: crate-01, crate-02, crate-03, crate-04, …+3)"
+        );
+    }
+
+    // ----- parse_cli_ignore + resolve_ignore_list ------------------------
+
+    #[test]
+    fn parse_cli_ignore_happy_path() {
+        assert_eq!(
+            parse_cli_ignore("cargo:reqwest"),
+            Some(("cargo", "reqwest"))
+        );
+        assert_eq!(
+            parse_cli_ignore("github-actions:actions/checkout"),
+            Some(("github-actions", "actions/checkout"))
+        );
+    }
+
+    #[test]
+    fn parse_cli_ignore_trims_whitespace_around_halves() {
+        assert_eq!(
+            parse_cli_ignore("  cargo  :  reqwest  "),
+            Some(("cargo", "reqwest"))
+        );
+    }
+
+    #[test]
+    fn parse_cli_ignore_rejects_malformed_input() {
+        // No colon.
+        assert!(parse_cli_ignore("cargo-reqwest").is_none());
+        // Empty halves.
+        assert!(parse_cli_ignore(":reqwest").is_none());
+        assert!(parse_cli_ignore("cargo:").is_none());
+        assert!(parse_cli_ignore("  :  ").is_none());
+    }
+
+    #[test]
+    fn resolve_ignore_list_merges_config_and_cli_for_matching_ecosystem() {
+        // Config has reqwest; CLI adds tokio.
+        let mut cfg = crate::config::AssayConfig::default();
+        cfg.ecosystems.cargo.ignore = vec!["reqwest".into()];
+        let cli = vec!["cargo:tokio".to_string()];
+        let merged = resolve_ignore_list(&cfg, &cli, "cargo");
+        assert_eq!(merged, vec!["reqwest".to_string(), "tokio".to_string()]);
+    }
+
+    #[test]
+    fn resolve_ignore_list_dedupes_when_cli_repeats_config_entry() {
+        let mut cfg = crate::config::AssayConfig::default();
+        cfg.ecosystems.cargo.ignore = vec!["reqwest".into()];
+        let cli = vec!["cargo:reqwest".to_string()];
+        let merged = resolve_ignore_list(&cfg, &cli, "cargo");
+        assert_eq!(merged, vec!["reqwest".to_string()]);
+    }
+
+    #[test]
+    fn resolve_ignore_list_scopes_cli_entries_to_named_ecosystem() {
+        // A `--ignore cargo:reqwest` must NOT leak into github-actions.
+        let cfg = crate::config::AssayConfig::default();
+        let cli = vec!["cargo:reqwest".to_string()];
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "github-actions"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "cargo"),
+            vec!["reqwest".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_ignore_list_silently_drops_malformed_cli_entries() {
+        let cfg = crate::config::AssayConfig::default();
+        // No-colon entry, empty-half entry, plus one valid — only the
+        // valid one survives. The malformed ones don't crash the run.
+        let cli = vec![
+            "cargo-reqwest".to_string(),
+            ":reqwest".to_string(),
+            "cargo:tokio".to_string(),
+        ];
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "cargo"),
+            vec!["tokio".to_string()]
+        );
+    }
+
+    // ----- consumer suffix integration in red section --------------------
+
+    #[test]
+    fn red_section_includes_consumer_suffix_when_proposal_has_consumers() {
+        let mut run = red_run("cargo-sha2", "sha2", "0.10", "0.11", "REGRESSION", "boom");
+        run.proposal.affected_consumers = vec!["helm-core".into(), "helm-cli".into()];
+        let out = format_red_proposal_section(&[run], &[]).unwrap();
+        assert!(
+            out.contains("(2 consumers: helm-cli, helm-core)"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn red_section_omits_consumer_suffix_when_consumers_empty() {
+        // GHA proposals or single-crate projects produce no consumers —
+        // the suffix must not render an empty "(0 consumers)" or trailing
+        // whitespace.
+        let run = red_run("cargo-sha2", "sha2", "0.10", "0.11", "REGRESSION", "boom");
+        // affected_consumers stays at Vec::new() per red_run().
+        let out = format_red_proposal_section(&[run], &[]).unwrap();
+        assert!(
+            !out.contains("consumer"),
+            "no consumer text expected: {out}"
+        );
+    }
+
+    // ----- Proposal back-compat without affected_consumers ---------------
+
+    #[test]
+    fn proposal_back_compat_legacy_receipt_without_affected_consumers() {
+        // A receipt written before the affected_consumers field existed
+        // must still deserialize cleanly with `#[serde(default)]`.
+        let legacy_json = r#"{
+            "id": "cargo-x",
+            "ecosystem": "cargo",
+            "kind": "version",
+            "subject": "x",
+            "from": "1.0.0",
+            "to": "1.0.1",
+            "initial_classification": "exact",
+            "manifest_paths": [],
+            "notes": [],
+            "bump_tier": "lockfile-only"
+        }"#;
+        let proposal: Proposal =
+            serde_json::from_str(legacy_json).expect("legacy receipt deserializes");
+        assert!(proposal.affected_consumers.is_empty());
     }
 
     #[test]
@@ -2346,6 +2599,7 @@ mod tests {
                 manifest_paths: vec![],
                 notes: vec![],
                 bump_tier: BumpTier::LockfileOnly,
+                affected_consumers: Vec::new(),
             },
             sandbox: PathBuf::from("/tmp/sb"),
             outcome: crate::model::ValidationOutcome {
@@ -2423,6 +2677,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -2495,6 +2750,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -2671,6 +2927,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         }
     }
 
@@ -2766,6 +3023,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         let validator = build_validator(&args).expect("gate-cmd should always build");
         // CustomBackend reports `needs_workflow_file() == false`, so the
@@ -2789,6 +3047,7 @@ mod tests {
                     manifest_paths: vec![],
                     notes: vec![],
                     bump_tier: crate::model::BumpTier::LockfileOnly,
+                    affected_consumers: Vec::new(),
                 },
                 tmp.path(),
                 &[],
@@ -2831,6 +3090,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         // Just needs to not error during construction.
         build_validator(&args).expect("gate-file should always build");
@@ -2862,6 +3122,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -2907,6 +3168,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -2952,6 +3214,7 @@ mod tests {
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         }
     }
 
@@ -3516,6 +3779,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -3545,6 +3809,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -3572,6 +3837,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -3601,6 +3867,7 @@ mod tests {
             fail_fast: false,
             offline: false,
             refresh_cache: false,
+            ignore: Vec::new(),
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;

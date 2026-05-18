@@ -124,6 +124,7 @@ mod tests {
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         }
     }
 

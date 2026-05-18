@@ -415,6 +415,7 @@ pub fn propose_from_cargo_dry_run(
             manifest_paths: manifest_paths.to_vec(),
             notes: Vec::new(),
             bump_tier: BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         });
     }
     Ok(proposals)
@@ -874,6 +875,7 @@ pub fn propose_unchanged_from_cargo_stdout(
             manifest_paths: manifest_paths.to_vec(),
             notes,
             bump_tier: tier,
+            affected_consumers: Vec::new(),
         });
     }
     proposals
@@ -905,6 +907,7 @@ pub fn propose_from_cargo_stdout(
             manifest_paths: manifest_paths.to_vec(),
             notes: Vec::new(),
             bump_tier: BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         });
     }
     Ok(proposals)
@@ -1387,6 +1390,7 @@ warning: not updating lockfile due to dry run
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::Compatible,
+            affected_consumers: Vec::new(),
         }
     }
 
@@ -1593,6 +1597,7 @@ warning: not updating lockfile due to dry run
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         }
     }
 
@@ -1616,6 +1621,7 @@ warning: not updating lockfile due to dry run
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         };
         let mut workflows = eco.gate_workflows(&stub_proposal, tmp.path()).unwrap();
         workflows.sort();
@@ -1669,6 +1675,7 @@ warning: not updating lockfile due to dry run
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         }
     }
 
@@ -1745,6 +1752,7 @@ warning: not updating lockfile due to dry run
     fn proposal_with_tier(subject: &str, tier: BumpTier) -> Proposal {
         Proposal {
             bump_tier: tier,
+            affected_consumers: Vec::new(),
             subject: subject.into(),
             id: format!("cargo-{subject}-1-2-3"),
             ..sample_cargo_proposal()

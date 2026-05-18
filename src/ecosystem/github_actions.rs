@@ -453,6 +453,7 @@ pub(crate) fn build_action_proposals(
             manifest_paths: agg.manifest_paths,
             notes,
             bump_tier: tier,
+            affected_consumers: Vec::new(),
         });
     }
     proposals
@@ -1305,6 +1306,7 @@ jobs:
             manifest_paths: vec![manifest.path.clone()],
             notes: vec!["tag:v4.1.0".into()],
             bump_tier: crate::model::BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         };
 
         // 3. Apply.
@@ -1353,6 +1355,7 @@ jobs:
             manifest_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         };
         let eco = GitHubActionsEcosystem;
         let modified = eco
@@ -1390,6 +1393,7 @@ jobs:
             manifest_paths: vec![PathBuf::from(".github/workflows/ci.yml")],
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
+            affected_consumers: Vec::new(),
         };
         let eco = GitHubActionsEcosystem;
         let err = eco
@@ -1790,6 +1794,7 @@ jobs:
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::Compatible,
+            affected_consumers: Vec::new(),
         };
         let proposals = vec![
             make("actions/checkout"),
@@ -1818,6 +1823,7 @@ jobs:
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::Compatible,
+            affected_consumers: Vec::new(),
         };
         let proposals = vec![make("actions/checkout"), make("actions/checkout-fork")];
         let kept = filter_ignored_actions(proposals, &["actions/checkout".to_string()]);
@@ -1838,6 +1844,7 @@ jobs:
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::Compatible,
+            affected_consumers: Vec::new(),
         };
         let original = vec![make("a/b"), make("c/d")];
         let kept = filter_ignored_actions(original.clone(), &[]);

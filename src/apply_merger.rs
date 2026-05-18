@@ -329,6 +329,7 @@ fn synthesize_merged_proposal(
         manifest_paths,
         notes: proposals.iter().map(|p| p.id.clone()).collect(),
         bump_tier: Default::default(),
+        affected_consumers: Vec::new(),
     }
 }
 
@@ -521,6 +522,7 @@ mod tests {
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: Default::default(),
+            affected_consumers: Vec::new(),
         }
     }
 

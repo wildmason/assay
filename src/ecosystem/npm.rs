@@ -453,6 +453,7 @@ pub(crate) fn build_npm_proposals(
             manifest_paths: manifest_paths.to_vec(),
             notes: Vec::new(),
             bump_tier: tier,
+            affected_consumers: Vec::new(),
         });
     }
     proposals
@@ -1538,6 +1539,7 @@ mod tests {
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::Compatible,
+            affected_consumers: Vec::new(),
         }
     }
 
@@ -1558,6 +1560,7 @@ mod tests {
             manifest_paths: vec![],
             notes: vec![],
             bump_tier: BumpTier::Compatible,
+            affected_consumers: Vec::new(),
         }
     }
 
