@@ -822,14 +822,14 @@ pub(crate) fn detect_workspace_members(tree_path: &Path) -> Result<Vec<Workspace
         }
     }
 
+    // Split positive patterns from negation patterns. pnpm honors
+    // `!packages/private` as an exclusion against the resolved member
+    // set. Negations apply AFTER positive expansion; subtraction matches
+    // by exact path or glob.
+    let (positive_patterns, negation_patterns): (Vec<&String>, Vec<&String>) =
+        patterns.iter().partition(|p| !p.starts_with('!'));
     let mut resolved_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-    for pattern in &patterns {
-        // Negation patterns (lead with `!`) are pnpm-specific; v1
-        // doesn't honor them — flagged for a follow-up if real projects
-        // surface them.
-        if pattern.starts_with('!') {
-            continue;
-        }
+    for pattern in &positive_patterns {
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             let absolute_pattern = tree_path.join(pattern);
             let pattern_str = match absolute_pattern.to_str() {
@@ -855,8 +855,31 @@ pub(crate) fn detect_workspace_members(tree_path: &Path) -> Result<Vec<Workspace
         } else {
             let candidate = tree_path.join(pattern);
             if candidate.is_dir() && candidate.join("package.json").is_file() {
-                resolved_dirs.insert(PathBuf::from(pattern));
+                resolved_dirs.insert(PathBuf::from(pattern.as_str()));
             }
+        }
+    }
+
+    // Apply negation: drop any resolved dir that matches a `!<pattern>`
+    // entry (literal path or glob). pnpm's spec says negations win
+    // regardless of declaration order.
+    for negation in &negation_patterns {
+        let pattern_body = &negation[1..]; // strip the leading `!`
+        if pattern_body.contains('*') || pattern_body.contains('?') || pattern_body.contains('[') {
+            let absolute_pattern = tree_path.join(pattern_body);
+            let Some(pattern_str) = absolute_pattern.to_str() else {
+                continue;
+            };
+            let normalized = pattern_str.replace('\\', "/");
+            if let Ok(walker) = glob::glob(&normalized) {
+                for entry in walker.flatten() {
+                    if let Ok(rel) = entry.strip_prefix(tree_path) {
+                        resolved_dirs.remove(rel);
+                    }
+                }
+            }
+        } else {
+            resolved_dirs.remove(Path::new(pattern_body));
         }
     }
 
@@ -1542,9 +1565,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_workspace_members_ignores_negation_patterns() {
-        // pnpm supports `!packages/foo` to exclude — v1 doesn't honor
-        // these; the inclusion list wins. Just confirm we don't crash.
+    fn detect_workspace_members_honors_negation_patterns() {
+        // pnpm supports `!packages/private` to exclude from a positive
+        // glob match. After positive expansion + negation subtraction,
+        // only the non-negated members should remain.
         let tmp = tempfile::tempdir().unwrap();
         write_pkg(&tmp.path().join("package.json"), r#"{"name":"root"}"#);
         std::fs::write(
@@ -1560,8 +1584,30 @@ mod tests {
         }
         let members = detect_workspace_members(tmp.path()).unwrap();
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
-        // Both pass for v1; documenting current behavior.
-        assert_eq!(names, vec!["private", "public"]);
+        assert_eq!(names, vec!["public"], "negation should exclude private");
+    }
+
+    #[test]
+    fn detect_workspace_members_honors_glob_negation_patterns() {
+        // Negation works with globs too: `!packages/private-*` should
+        // drop every match of that glob even though the positive
+        // `packages/*` would otherwise include them.
+        let tmp = tempfile::tempdir().unwrap();
+        write_pkg(&tmp.path().join("package.json"), r#"{"name":"root"}"#);
+        std::fs::write(
+            tmp.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/private-*'\n",
+        )
+        .unwrap();
+        for name in ["public", "private-foo", "private-bar", "shared"] {
+            write_pkg(
+                &tmp.path().join("packages").join(name).join("package.json"),
+                &format!(r#"{{"name":"{name}"}}"#),
+            );
+        }
+        let members = detect_workspace_members(tmp.path()).unwrap();
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["public", "shared"]);
     }
 
     #[test]
