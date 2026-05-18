@@ -54,7 +54,7 @@ impl DependencyEcosystem for CargoEcosystem {
         &self,
         manifests: &[Manifest],
         repo: &Path,
-        _ctx: &EcosystemContext,
+        ctx: &EcosystemContext,
     ) -> Result<Vec<Proposal>> {
         // A Cargo workspace produces one resolver invocation per scan, not
         // per-manifest. If no lockfile was detected, there's nothing to bump.
@@ -64,7 +64,8 @@ impl DependencyEcosystem for CargoEcosystem {
         if !has_lock {
             return Ok(Vec::new());
         }
-        run_cargo_proposer(repo, manifests)
+        let proposals = run_cargo_proposer(repo, manifests)?;
+        Ok(filter_ignored_crates(proposals, &ctx.ignored_subjects))
     }
 
     fn gate_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
@@ -778,6 +779,20 @@ fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposa
 }
 
 /// Returns the set of *direct* (declared in some workspace member's
+/// Filter out proposals whose `subject` (crate name) appears in the
+/// per-ecosystem ignore list from `.assay.toml`'s
+/// `[ecosystems.cargo] ignore = [...]`. Exact-match, mirroring the
+/// GHA filter.
+pub(crate) fn filter_ignored_crates(proposals: Vec<Proposal>, ignored: &[String]) -> Vec<Proposal> {
+    if ignored.is_empty() {
+        return proposals;
+    }
+    proposals
+        .into_iter()
+        .filter(|p| !ignored.iter().any(|i| i == &p.subject))
+        .collect()
+}
+
 /// Cargo.toml) dependency names. Used to drop transitive-only entries
 /// from the Unchanged-line tier proposals — the constraint editor can
 /// only widen entries that actually appear in a manifest.
