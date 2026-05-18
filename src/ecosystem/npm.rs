@@ -676,7 +676,12 @@ fn extend_dep_names(pkg: &serde_json::Value, names: &mut BTreeSet<String>) {
 ///   lockfile picks up the new constraint.
 fn apply_npm_proposal(flavor: NpmFlavor, proposal: &Proposal, tree_path: &Path) -> Result<()> {
     if matches!(proposal.bump_tier, BumpTier::LockfileOnly) {
-        return run_install_pinned(flavor, &proposal.subject, &proposal.to, tree_path);
+        // Aliased deps (`"my-lodash": "npm:lodash@4.17.21"`) need the
+        // alias spec re-emitted on the install command — otherwise npm
+        // tries to fetch a registry package named after the local alias
+        // key (`my-lodash`) and fails.
+        let install_version = resolve_install_version(tree_path, &proposal.subject, &proposal.to)?;
+        return run_install_pinned(flavor, &proposal.subject, &install_version, tree_path);
     }
     let modified = update_package_json_constraint(tree_path, &proposal.subject, &proposal.to)?;
     if modified.is_empty() {
@@ -1073,7 +1078,72 @@ fn try_edit_package_json(path: &Path, name: &str, new_version: &str) -> Result<b
     Ok(true)
 }
 
+/// Resolve the install version string to pass to npm/pnpm/yarn for a
+/// LockfileOnly bump. Aliased entries (`npm:<target>@...`) require the
+/// alias prefix to be re-emitted on the install spec so npm targets the
+/// real registry package — passing a bare version would make npm look
+/// for a registry package literally named after the local alias key.
+///
+/// Returns `new_version` verbatim for non-aliased entries (the common
+/// case) and for entries the resolver can't classify.
+fn resolve_install_version(tree_path: &Path, name: &str, new_version: &str) -> Result<String> {
+    let pkg_path = tree_path.join("package.json");
+    let text = std::fs::read_to_string(&pkg_path).map_err(|source| Error::Io {
+        path: pkg_path.clone(),
+        source,
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::other(format!("{}: {e}", pkg_path.display())))?;
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(existing) = value
+            .get(field)
+            .and_then(|v| v.as_object())
+            .and_then(|obj| obj.get(name))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if let Some((target, _)) = split_alias_spec(existing) {
+            return Ok(format!("npm:{target}@{new_version}"));
+        }
+        return Ok(new_version.to_string());
+    }
+    Ok(new_version.to_string())
+}
+
+/// Parse an `npm:<target-pkg>@<version-spec>` alias specifier into its
+/// two parts. Returns `None` for non-alias specs.
+///
+/// The target package may be scoped (`@scope/pkg`); its leading `@` is
+/// at index 0 of `rest` and is NOT the version separator. The version
+/// separator is the rightmost `@` at index > 0.
+fn split_alias_spec(spec: &str) -> Option<(&str, &str)> {
+    let rest = spec.strip_prefix("npm:")?;
+    let idx = rest
+        .char_indices()
+        .filter(|(i, c)| *c == '@' && *i > 0)
+        .map(|(i, _)| i)
+        .next_back()?;
+    Some((&rest[..idx], &rest[idx + 1..]))
+}
+
 fn preserve_constraint_prefix(existing: &str, new_version: &str) -> String {
+    // npm alias: `"<local-key>": "npm:<target-pkg>@<version-spec>"`. The
+    // inner version-spec follows the same prefix conventions as a normal
+    // npm dep; recurse to apply them, then reassemble with the alias
+    // target intact. Without this, the catch-all "replace verbatim"
+    // branch at the bottom would wipe the `npm:<target>@` prefix and
+    // silently break package resolution (npm would then try to fetch a
+    // registry package literally named after the local key).
+    if let Some((target, inner)) = split_alias_spec(existing) {
+        let new_inner = preserve_constraint_prefix(inner, new_version);
+        return format!("npm:{target}@{new_inner}");
+    }
     if let Some(rest) = existing.strip_prefix('^') {
         if rest.contains(|c: char| c.is_ascii_digit()) {
             return format!("^{new_version}");
@@ -1373,6 +1443,60 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // npm alias syntax: `<local-key>: "npm:<target-pkg>@<version-spec>"`.
+    // npm's `outdated --json` keys by the LOCAL alias name, so the proposer
+    // emits proposal.subject = local key (e.g. "my-lodash"). The editor
+    // finds the entry correctly, but `preserve_constraint_prefix` pre-fix
+    // fell into the catch-all "replace verbatim" branch and wiped the
+    // entire `npm:lodash@` alias prefix — turning
+    //   "my-lodash": "npm:lodash@4.17.21"
+    // into
+    //   "my-lodash": "4.17.22"
+    // which breaks package resolution (npm would now try to fetch a
+    // registry package literally named `my-lodash`).
+    //
+    // Surfaces post-cargo-renamed-dep dogfood (2026-05-18): same class of
+    // aliased-dep bug as cargo's `package = "..."` syntax, different shape
+    // (cargo missed the lookup; npm finds it but corrupts the value).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn preserve_prefix_handles_npm_alias_bare_inner_version() {
+        // Bare inner version follows npm's --save convention: gain a caret
+        // on update. Same rule the top-level bare-version path applies.
+        assert_eq!(
+            preserve_constraint_prefix("npm:lodash@4.17.21", "4.17.22"),
+            "npm:lodash@^4.17.22",
+        );
+    }
+
+    #[test]
+    fn preserve_prefix_handles_npm_alias_caret_inner() {
+        assert_eq!(
+            preserve_constraint_prefix("npm:lodash@^4.17.21", "4.17.22"),
+            "npm:lodash@^4.17.22",
+        );
+    }
+
+    #[test]
+    fn preserve_prefix_handles_npm_alias_tilde_inner() {
+        assert_eq!(
+            preserve_constraint_prefix("npm:lodash@~4.17.21", "4.17.22"),
+            "npm:lodash@~4.17.22",
+        );
+    }
+
+    #[test]
+    fn preserve_prefix_handles_npm_alias_with_scoped_target() {
+        // `@scope/pkg` introduces a leading `@` that is NOT the version
+        // separator; the version `@` is the LAST one.
+        assert_eq!(
+            preserve_constraint_prefix("npm:@types/lodash@^4.17.21", "4.17.22"),
+            "npm:@types/lodash@^4.17.22",
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // try_edit_package_json
     // -------------------------------------------------------------------------
 
@@ -1426,6 +1550,102 @@ mod tests {
         .unwrap();
         let edited = try_edit_package_json(&pkg, "missing-pkg", "1.0.0").unwrap();
         assert!(!edited);
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve_install_version — alias-aware LockfileOnly install spec.
+    //
+    // Same npm-alias root cause as the editor bug, different code path.
+    // `run_install_pinned` builds `<name>@<version>` and shells out to
+    // `npm install`. For a LockfileOnly bump on an aliased dep, passing
+    // bare `name="my-lodash" version="4.17.22"` produces
+    //   npm install my-lodash@4.17.22
+    // which fails because `my-lodash` isn't a registry package — it's a
+    // local alias for `lodash`. The resolver re-emits the alias so the
+    // install spec becomes `my-lodash@npm:lodash@4.17.22`.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_install_passes_through_bare_version_for_unaliased_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"sample","dependencies":{"lodash":"^4.17.20"}}"#,
+        )
+        .unwrap();
+        let v = resolve_install_version(tmp.path(), "lodash", "4.17.22").unwrap();
+        assert_eq!(v, "4.17.22");
+    }
+
+    #[test]
+    fn resolve_install_reconstructs_alias_spec_for_aliased_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"sample","dependencies":{"my-lodash":"npm:lodash@^4.17.21"}}"#,
+        )
+        .unwrap();
+        let v = resolve_install_version(tmp.path(), "my-lodash", "4.17.22").unwrap();
+        assert_eq!(v, "npm:lodash@4.17.22");
+    }
+
+    #[test]
+    fn resolve_install_handles_scoped_alias_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"sample","dependencies":{"local":"npm:@scope/pkg@^1.0.0"}}"#,
+        )
+        .unwrap();
+        let v = resolve_install_version(tmp.path(), "local", "1.0.1").unwrap();
+        assert_eq!(v, "npm:@scope/pkg@1.0.1");
+    }
+
+    #[test]
+    fn resolve_install_finds_alias_under_dev_dependencies() {
+        // The resolver scans all four dep-name fields, not just `dependencies`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"sample","devDependencies":{"my-jest":"npm:jest@^29.0.0"}}"#,
+        )
+        .unwrap();
+        let v = resolve_install_version(tmp.path(), "my-jest", "29.7.0").unwrap();
+        assert_eq!(v, "npm:jest@29.7.0");
+    }
+
+    #[test]
+    fn editor_preserves_npm_alias_prefix_on_widen() {
+        // End-to-end: package.json has an aliased entry; editor must bump
+        // the inner version and preserve the `npm:<target>@` prefix
+        // verbatim. Pre-fix the value was rewritten to a bare version,
+        // silently breaking npm's package resolution.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("package.json");
+        std::fs::write(
+            &pkg,
+            r#"{
+  "name": "sample",
+  "dependencies": {
+    "my-lodash": "npm:lodash@^4.17.21"
+  }
+}
+"#,
+        )
+        .unwrap();
+        let edited = try_edit_package_json(&pkg, "my-lodash", "4.17.22").unwrap();
+        assert!(edited);
+        let after = std::fs::read_to_string(&pkg).unwrap();
+        assert!(
+            after.contains(r#""my-lodash": "npm:lodash@^4.17.22""#),
+            "alias prefix must be preserved, inner version bumped; got:\n{after}",
+        );
+        // Negative check: a bare-version write would have looked like
+        // `"my-lodash": "^4.17.22"`. Make sure that didn't happen.
+        assert!(
+            !after.contains(r#""my-lodash": "^4.17.22""#),
+            "alias prefix was wiped — bug regression; got:\n{after}",
+        );
     }
 
     // -------------------------------------------------------------------------
