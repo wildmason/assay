@@ -148,6 +148,35 @@ pub struct Proposal {
     pub bump_tier: BumpTier,
 }
 
+/// Diagnostic detail captured when a validator backend fails on a
+/// workflow (or tree-mode invocation). Persisted on
+/// [`ValidationOutcome::failure_details`] so the run.json receipt + the
+/// human reporter can both show *why* validation failed without making
+/// the operator dig into sandbox logs.
+///
+/// Mirrors `WorkflowOutcome` (in `crate::validator`) at the persistent
+/// boundary — the in-memory shape carries a `FailureFlavor` enum + a
+/// `log_path` to a tempdir; this serde-stable shape carries the flavor
+/// as a plain string and drops `log_path` since the validator's
+/// per-workflow tempdir is cleaned up before the receipt is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureDetail {
+    /// Workflow path (or sentinel `<tree:<backend>>` for tree-mode
+    /// backends like BuildTest and Custom).
+    pub workflow: PathBuf,
+    /// Backend that produced this detail (`forge-run`, `build-test`,
+    /// `custom`).
+    pub backend: String,
+    /// Short flavor label — one of `REGRESSION`, `SETUP-FAILURE`,
+    /// `TIMEOUT`. Plain string for receipt forward-compat.
+    pub flavor: String,
+    /// Last bytes of captured stderr (UTF-8-boundary-safe truncation at
+    /// 4 KB by the existing `stderr_tail` helper in the validator).
+    pub stderr_tail: String,
+    /// Subprocess wall-clock duration in milliseconds.
+    pub duration_ms: u128,
+}
+
 /// Outcome of validating a proposal by running its affected workflows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationOutcome {
@@ -165,6 +194,11 @@ pub struct ValidationOutcome {
     pub classification: Classification,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Per-failed-workflow detail — populated when `conclusion` is
+    /// anything other than `"success"`. `#[serde(default)]` so receipts
+    /// written before this field existed still deserialize cleanly.
+    #[serde(default)]
+    pub failure_details: Vec<FailureDetail>,
 }
 
 /// Top-level run receipt written to `.assay/runs/<run-id>/run.json`.

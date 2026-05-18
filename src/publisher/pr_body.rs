@@ -135,6 +135,7 @@ mod tests {
             validated_workflows: vec![PathBuf::from(".github/workflows/ci.yml")],
             classification,
             notes: vec![],
+            failure_details: vec![],
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
             validated_workflows: vec![],
             classification: Classification::Stubbed,
             notes: vec!["no affected workflow identified".into()],
+            failure_details: vec![],
         };
         let body = render_pr_body(&sample_proposal(), &outcome, &sample_ctx());
         assert!(body.contains("No ci-forge run was recorded"));

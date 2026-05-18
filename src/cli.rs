@@ -346,6 +346,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
 
     let mut proposals_passed = 0usize;
     let mut proposals_failed = 0usize;
+    let mut pre_validation_failure_rows: Vec<PreValidationFailureRow> = Vec::new();
     let mut proposals_unvalidated = 0usize;
     let mut completed_runs: Vec<ProposalRun> = Vec::new();
     let mut pre_validation_failures = 0usize;
@@ -404,18 +405,25 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         for outcome in outcomes {
             match outcome {
                 WorkerOutcome::PreValidationFailure {
-                    eco_idx: _,
-                    proposal: _,
+                    eco_idx,
+                    proposal,
                     provenance: pr_records,
+                    summary,
                 } => {
                     provenance.records.extend(pr_records);
                     proposals_failed += 1;
                     pre_validation_failures += 1;
+                    pre_validation_failure_rows.push(PreValidationFailureRow {
+                        eco_idx,
+                        proposal,
+                        summary,
+                    });
                 }
                 WorkerOutcome::ValidatorErrored {
                     eco_idx: _,
                     proposal: _,
                     provenance: pr_records,
+                    summary: _,
                 } => {
                     provenance.records.extend(pr_records);
                     proposals_unvalidated += 1;
@@ -539,6 +547,11 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 "assay: validated {} green / {} red / {} unvalidated",
                 proposals_passed, proposals_failed, proposals_unvalidated,
             );
+            if let Some(red_section) =
+                format_red_proposal_section(&completed_runs, &pre_validation_failure_rows)
+            {
+                print!("{red_section}");
+            }
             match &commit_summary {
                 Some(CommitSummary::Committed {
                     bump_count,
@@ -604,6 +617,11 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 "assay: validated {} green / {} red / {} unvalidated",
                 proposals_passed, proposals_failed, proposals_unvalidated,
             );
+            if let Some(red_section) =
+                format_red_proposal_section(&completed_runs, &pre_validation_failure_rows)
+            {
+                print!("{red_section}");
+            }
             match &pr_summary {
                 Some(ApplyPrSummary::Published {
                     url,
@@ -674,6 +692,10 @@ enum WorkerOutcome {
         eco_idx: usize,
         proposal: Proposal,
         provenance: Vec<ProvenanceRecord>,
+        /// One-line reason carried separately from the provenance
+        /// records so the reporter can render per-failed-proposal
+        /// detail without scanning the provenance trail.
+        summary: String,
     },
     /// Validator couldn't run at all (e.g. forge not on PATH AND no
     /// recognized manifest).
@@ -681,6 +703,7 @@ enum WorkerOutcome {
         eco_idx: usize,
         proposal: Proposal,
         provenance: Vec<ProvenanceRecord>,
+        summary: String,
     },
     /// Pipeline completed with a real validation outcome.
     Completed {
@@ -785,13 +808,14 @@ fn process_proposal_unit(
     let apply_tree = match apply_tree {
         Ok(path) => path,
         Err(err) => {
+            let summary = format!("apply tree preparation failed: {err}");
             records.push(ProvenanceRecord {
                 tool: "assay".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 stage: format!("applier.{}", ecosystem.name()),
                 subject: unit.proposal.id.clone(),
                 status: Classification::Unsupported,
-                summary: format!("apply tree preparation failed: {err}"),
+                summary: summary.clone(),
                 artifact_path: None,
                 details: None,
             });
@@ -799,18 +823,20 @@ fn process_proposal_unit(
                 eco_idx: unit.eco_idx,
                 proposal: unit.proposal,
                 provenance: records,
+                summary,
             };
         }
     };
 
     if let Err(err) = ecosystem.apply_proposal(&unit.proposal, &apply_tree) {
+        let summary = format!("apply failed: {err}");
         records.push(ProvenanceRecord {
             tool: "assay".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             stage: format!("applier.{}", ecosystem.name()),
             subject: unit.proposal.id.clone(),
             status: Classification::Unsupported,
-            summary: format!("apply failed: {err}"),
+            summary: summary.clone(),
             artifact_path: None,
             details: None,
         });
@@ -818,6 +844,7 @@ fn process_proposal_unit(
             eco_idx: unit.eco_idx,
             proposal: unit.proposal,
             provenance: records,
+            summary,
         };
     }
     records.push(ProvenanceRecord {
@@ -837,13 +864,14 @@ fn process_proposal_unit(
     let outcome = match validator.validate(&unit.proposal, &apply_tree, &workflow_paths) {
         Ok(outcome) => outcome,
         Err(err) => {
+            let summary = format!("validator could not run: {err}");
             records.push(ProvenanceRecord {
                 tool: "assay".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 stage: format!("validator.{}", ecosystem.name()),
                 subject: unit.proposal.id.clone(),
                 status: Classification::Stubbed,
-                summary: format!("validator could not run: {err}"),
+                summary: summary.clone(),
                 artifact_path: None,
                 details: None,
             });
@@ -851,6 +879,7 @@ fn process_proposal_unit(
                 eco_idx: unit.eco_idx,
                 proposal: unit.proposal,
                 provenance: records,
+                summary,
             };
         }
     };
@@ -880,11 +909,101 @@ fn process_proposal_unit(
 /// One proposal's full lifecycle through the apply-local pipeline:
 /// applier produced a sandbox tree, validator scored it. Held in memory
 /// until the post-loop commit phase decides whether to copy-back.
+#[derive(Clone)]
 struct ProposalRun {
     eco_idx: usize,
     proposal: Proposal,
     sandbox: PathBuf,
     outcome: crate::model::ValidationOutcome,
+}
+
+/// Per-proposal apply-stage failure row, surfaced alongside
+/// [`ProposalRun`]-tracked validation failures so the reporter can
+/// render "why" details for both.
+#[derive(Debug)]
+struct PreValidationFailureRow {
+    #[allow(dead_code)]
+    eco_idx: usize,
+    proposal: Proposal,
+    summary: String,
+}
+
+/// Maximum lines of captured stderr to render per failed proposal in
+/// the human reporter. Anything past this gets a one-line truncation
+/// marker so the operator knows there's more in the receipt.
+const REPORTER_STDERR_LINE_LIMIT: usize = 12;
+
+/// Render the "why did these proposals fail" block for the human
+/// reporter. Returns `None` when no proposals failed — caller skips
+/// the section entirely (no empty header).
+///
+/// The block lists every red proposal once, with its
+/// `subject from → to` line, a flavor tag (`[REGRESSION]`,
+/// `[SETUP-FAILURE]`, `[TIMEOUT]`, or `[APPLY-FAILURE]` for pre-
+/// validation failures), and either the last N lines of captured
+/// stderr (validator failures) or the apply-stage summary string
+/// (pre-validation failures). Ordering is alphabetical by proposal
+/// id so successive runs produce byte-identical output.
+fn format_red_proposal_section(
+    completed_runs: &[ProposalRun],
+    pre_val_failures: &[PreValidationFailureRow],
+) -> Option<String> {
+    let mut validation_failures: Vec<&ProposalRun> = completed_runs
+        .iter()
+        .filter(|r| r.outcome.conclusion != "success" && r.outcome.conclusion != "unvalidated")
+        .collect();
+    let mut pv_sorted: Vec<&PreValidationFailureRow> = pre_val_failures.iter().collect();
+    if validation_failures.is_empty() && pv_sorted.is_empty() {
+        return None;
+    }
+    validation_failures.sort_by(|a, b| a.proposal.id.cmp(&b.proposal.id));
+    pv_sorted.sort_by(|a, b| a.proposal.id.cmp(&b.proposal.id));
+
+    let total = validation_failures.len() + pv_sorted.len();
+    let mut out = String::new();
+    out.push_str(&format!("assay: red proposals ({total}):\n"));
+
+    for run in &validation_failures {
+        let flavor = run
+            .outcome
+            .failure_details
+            .first()
+            .map(|d| d.flavor.as_str())
+            .unwrap_or("FAILURE");
+        out.push_str(&format!(
+            "  {} {} {} → {} [{}]\n",
+            run.proposal.id, run.proposal.subject, run.proposal.from, run.proposal.to, flavor,
+        ));
+        for detail in &run.outcome.failure_details {
+            if detail.stderr_tail.trim().is_empty() {
+                continue;
+            }
+            out.push_str(&format!("    last stderr ({}):\n", detail.backend));
+            let lines: Vec<&str> = detail.stderr_tail.lines().collect();
+            let total_lines = lines.len();
+            let start = total_lines.saturating_sub(REPORTER_STDERR_LINE_LIMIT);
+            if start > 0 {
+                out.push_str(&format!(
+                    "      [... {} earlier line(s) elided; see receipt for full tail ...]\n",
+                    start
+                ));
+            }
+            for line in &lines[start..] {
+                out.push_str("      ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+
+    for row in &pv_sorted {
+        out.push_str(&format!(
+            "  {} {} {} → {} [APPLY-FAILURE]\n    {}\n",
+            row.proposal.id, row.proposal.subject, row.proposal.from, row.proposal.to, row.summary,
+        ));
+    }
+
+    Some(out)
 }
 
 /// What happened during the post-validation `--apply-local` commit phase.
@@ -1997,6 +2116,252 @@ fn report_json(name: &str, manifests: &[Manifest]) -> Result<()> {
 mod tests {
     use super::*;
 
+    // ----- format_red_proposal_section ------------------------------------
+
+    fn red_run(
+        id: &str,
+        subject: &str,
+        from: &str,
+        to: &str,
+        flavor: &str,
+        stderr: &str,
+    ) -> ProposalRun {
+        use crate::model::{BumpTier, FailureDetail, ProposalKind};
+        ProposalRun {
+            eco_idx: 0,
+            proposal: Proposal {
+                id: id.into(),
+                ecosystem: "cargo".into(),
+                kind: ProposalKind::Version,
+                subject: subject.into(),
+                from: from.into(),
+                to: to.into(),
+                initial_classification: Classification::Exact,
+                manifest_paths: vec![],
+                notes: vec![],
+                bump_tier: BumpTier::Breaking,
+            },
+            sandbox: PathBuf::from("/tmp/sandbox"),
+            outcome: crate::model::ValidationOutcome {
+                proposal_id: id.into(),
+                conclusion: "failure".into(),
+                ci_forge_run_ids: vec![],
+                validated_workflows: vec![],
+                classification: Classification::Unsupported,
+                notes: vec![],
+                failure_details: vec![FailureDetail {
+                    workflow: PathBuf::from("<tree:custom>"),
+                    backend: "custom".into(),
+                    flavor: flavor.into(),
+                    stderr_tail: stderr.into(),
+                    duration_ms: 1234,
+                }],
+            },
+        }
+    }
+
+    fn green_run(id: &str) -> ProposalRun {
+        use crate::model::{BumpTier, ProposalKind};
+        ProposalRun {
+            eco_idx: 0,
+            proposal: Proposal {
+                id: id.into(),
+                ecosystem: "cargo".into(),
+                kind: ProposalKind::Version,
+                subject: id.into(),
+                from: "1.0.0".into(),
+                to: "1.0.1".into(),
+                initial_classification: Classification::Exact,
+                manifest_paths: vec![],
+                notes: vec![],
+                bump_tier: BumpTier::LockfileOnly,
+            },
+            sandbox: PathBuf::from("/tmp/sb"),
+            outcome: crate::model::ValidationOutcome {
+                proposal_id: id.into(),
+                conclusion: "success".into(),
+                ci_forge_run_ids: vec![],
+                validated_workflows: vec![],
+                classification: Classification::Exact,
+                notes: vec![],
+                failure_details: vec![],
+            },
+        }
+    }
+
+    fn apply_failure_row(
+        id: &str,
+        subject: &str,
+        from: &str,
+        to: &str,
+        summary: &str,
+    ) -> PreValidationFailureRow {
+        use crate::model::{BumpTier, ProposalKind};
+        PreValidationFailureRow {
+            eco_idx: 0,
+            proposal: Proposal {
+                id: id.into(),
+                ecosystem: "cargo".into(),
+                kind: ProposalKind::Version,
+                subject: subject.into(),
+                from: from.into(),
+                to: to.into(),
+                initial_classification: Classification::Exact,
+                manifest_paths: vec![],
+                notes: vec![],
+                bump_tier: BumpTier::Breaking,
+            },
+            summary: summary.into(),
+        }
+    }
+
+    #[test]
+    fn red_section_returns_none_when_no_failures() {
+        let greens = vec![green_run("a"), green_run("b")];
+        let pre_val: Vec<PreValidationFailureRow> = Vec::new();
+        assert!(format_red_proposal_section(&greens, &pre_val).is_none());
+    }
+
+    #[test]
+    fn red_section_renders_validation_failure_with_flavor_and_stderr() {
+        let runs = vec![red_run(
+            "cargo-sha2-0-11-0",
+            "sha2",
+            "0.10.9",
+            "0.11.0",
+            "REGRESSION",
+            "error[E0599]: no method named `result` found for struct `Sha2_256`\n   --> src/main.rs:42:18",
+        )];
+        let pre_val: Vec<PreValidationFailureRow> = Vec::new();
+        let out = format_red_proposal_section(&runs, &pre_val).expect("non-empty");
+        assert!(out.contains("red proposals (1)"));
+        assert!(out.contains("cargo-sha2-0-11-0 sha2 0.10.9 → 0.11.0 [REGRESSION]"));
+        assert!(out.contains("last stderr (custom):"));
+        assert!(out.contains("E0599"));
+    }
+
+    #[test]
+    fn red_section_renders_pre_validation_failure_with_apply_tag() {
+        let runs: Vec<ProposalRun> = Vec::new();
+        let pre_val = vec![apply_failure_row(
+            "cargo-reqwest-0-13-3",
+            "reqwest",
+            "0.12.28",
+            "0.13.3",
+            "apply failed: cargo update failed: failed to select a version",
+        )];
+        let out = format_red_proposal_section(&runs, &pre_val).expect("non-empty");
+        assert!(out.contains("red proposals (1)"));
+        assert!(out.contains("cargo-reqwest-0-13-3 reqwest 0.12.28 → 0.13.3 [APPLY-FAILURE]"));
+        assert!(out.contains("failed to select a version"));
+    }
+
+    #[test]
+    fn red_section_renders_both_validation_and_apply_failures() {
+        let runs = vec![red_run(
+            "cargo-sha2",
+            "sha2",
+            "0.10",
+            "0.11",
+            "REGRESSION",
+            "compile error",
+        )];
+        let pre_val = vec![apply_failure_row(
+            "cargo-reqwest",
+            "reqwest",
+            "0.12",
+            "0.13",
+            "apply failed",
+        )];
+        let out = format_red_proposal_section(&runs, &pre_val).expect("non-empty");
+        assert!(out.contains("red proposals (2)"), "got: {out}");
+        assert!(out.contains("[REGRESSION]"));
+        assert!(out.contains("[APPLY-FAILURE]"));
+    }
+
+    #[test]
+    fn red_section_is_deterministic_alphabetical_by_proposal_id() {
+        // Same inputs in two orders should produce byte-identical output.
+        let a = red_run("a-id", "a", "1", "2", "REGRESSION", "a stderr");
+        let b = red_run("b-id", "b", "1", "2", "REGRESSION", "b stderr");
+        let one = format_red_proposal_section(&[a.clone(), b.clone()], &[]).unwrap();
+        let two = format_red_proposal_section(&[b, a], &[]).unwrap();
+        assert_eq!(one, two);
+        // And the alphabetical order should be observable.
+        let a_pos = one.find("a-id").unwrap();
+        let b_pos = one.find("b-id").unwrap();
+        assert!(a_pos < b_pos, "alphabetical order violated: {one}");
+    }
+
+    #[test]
+    fn red_section_truncates_long_stderr_with_elision_marker() {
+        // 25-line stderr → only last 12 lines should appear, with a
+        // marker noting 13 earlier lines were elided.
+        let mut stderr = String::new();
+        for i in 0..25 {
+            stderr.push_str(&format!("stderr line {i}\n"));
+        }
+        let runs = vec![red_run("cargo-x", "x", "1", "2", "REGRESSION", &stderr)];
+        let out = format_red_proposal_section(&runs, &[]).unwrap();
+        // First 13 lines must be elided.
+        assert!(out.contains("[... 13 earlier line(s) elided"));
+        // First line that should appear is line 13.
+        assert!(out.contains("stderr line 13"));
+        // First line that must NOT appear inline (just in the marker) is line 0.
+        assert!(
+            !out.contains("      stderr line 0\n"),
+            "early lines should be elided: {out}"
+        );
+    }
+
+    #[test]
+    fn red_section_skips_stderr_block_when_tail_is_empty_or_whitespace() {
+        // No stderr captured at all → the flavor line still renders,
+        // but no "last stderr" block.
+        let runs = vec![red_run("cargo-y", "y", "1", "2", "TIMEOUT", "   \n\n\t  ")];
+        let out = format_red_proposal_section(&runs, &[]).unwrap();
+        assert!(out.contains("[TIMEOUT]"));
+        assert!(
+            !out.contains("last stderr"),
+            "whitespace-only stderr should not produce a header: {out}"
+        );
+    }
+
+    #[test]
+    fn red_section_ignores_green_and_unvalidated_runs() {
+        use crate::model::{BumpTier, ProposalKind};
+        // A run with "unvalidated" conclusion isn't a failure for
+        // reporting purposes — it's a no-validator-available case,
+        // separately surfaced in the counts line.
+        let unvalidated = ProposalRun {
+            eco_idx: 0,
+            proposal: Proposal {
+                id: "cargo-z".into(),
+                ecosystem: "cargo".into(),
+                kind: ProposalKind::Version,
+                subject: "z".into(),
+                from: "1".into(),
+                to: "2".into(),
+                initial_classification: Classification::Exact,
+                manifest_paths: vec![],
+                notes: vec![],
+                bump_tier: BumpTier::LockfileOnly,
+            },
+            sandbox: PathBuf::from("/tmp/sb"),
+            outcome: crate::model::ValidationOutcome {
+                proposal_id: "cargo-z".into(),
+                conclusion: "unvalidated".into(),
+                ci_forge_run_ids: vec![],
+                validated_workflows: vec![],
+                classification: Classification::Stubbed,
+                notes: vec![],
+                failure_details: vec![],
+            },
+        };
+        let runs = vec![green_run("a"), unvalidated];
+        assert!(format_red_proposal_section(&runs, &[]).is_none());
+    }
+
     #[test]
     fn parse_cli_accepts_analyze_with_defaults() {
         let cli = parse_cli(["assay", "analyze"]);
@@ -2598,6 +2963,7 @@ mod tests {
             validated_workflows: Vec::new(),
             classification: crate::model::Classification::Exact,
             notes: Vec::new(),
+            failure_details: Vec::new(),
         }
     }
 

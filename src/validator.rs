@@ -1000,6 +1000,7 @@ impl Validator {
                     "no affected workflow was identified; bump cannot be validated by execution"
                         .to_string(),
                 ],
+                failure_details: Vec::new(),
             });
         }
 
@@ -1021,6 +1022,7 @@ impl Validator {
                      Pass --include-workflow <glob> or --no-workflow-filter to override.",
                     dropped.join(", ")
                 )],
+                failure_details: Vec::new(),
             });
         }
         let mut filter_notes = Vec::new();
@@ -1054,6 +1056,7 @@ impl Validator {
         let mut any_failure = false;
         let mut notes = filter_notes;
         let mut validated = Vec::new();
+        let mut failure_details: Vec<crate::model::FailureDetail> = Vec::new();
 
         for workflow in workflow_paths {
             let stem = workflow_log_stem(workflow);
@@ -1072,17 +1075,27 @@ impl Validator {
                 WorkflowResult::Pass => {}
                 WorkflowResult::Fail(flavor) => {
                     any_failure = true;
-                    let flavor_label = match flavor {
-                        FailureFlavor::Regression { details } => format!("REGRESSION ({details})"),
-                        FailureFlavor::SetupFailure { reason } => {
-                            format!("SETUP-FAILURE ({reason})")
+                    let (flavor_label, flavor_short) = match flavor {
+                        FailureFlavor::Regression { details } => {
+                            (format!("REGRESSION ({details})"), "REGRESSION".to_string())
                         }
-                        FailureFlavor::Timeout => "TIMEOUT".to_string(),
+                        FailureFlavor::SetupFailure { reason } => (
+                            format!("SETUP-FAILURE ({reason})"),
+                            "SETUP-FAILURE".to_string(),
+                        ),
+                        FailureFlavor::Timeout => ("TIMEOUT".to_string(), "TIMEOUT".to_string()),
                     };
                     notes.push(format!(
                         "workflow {} concluded {flavor_label}",
                         workflow.display(),
                     ));
+                    failure_details.push(crate::model::FailureDetail {
+                        workflow: outcome.workflow.clone(),
+                        backend: outcome.backend.to_string(),
+                        flavor: flavor_short,
+                        stderr_tail: outcome.stderr_tail.clone(),
+                        duration_ms: outcome.duration_ms,
+                    });
                 }
             }
         }
@@ -1100,6 +1113,7 @@ impl Validator {
             validated_workflows: validated,
             classification,
             notes,
+            failure_details,
         })
     }
 
@@ -1129,15 +1143,28 @@ impl Validator {
             &log_path,
         )?;
         let mut notes = Vec::new();
+        let mut failure_details: Vec<crate::model::FailureDetail> = Vec::new();
         let (classification, conclusion) = match &outcome.result {
             WorkflowResult::Pass => (Classification::Exact, "success".to_string()),
             WorkflowResult::Fail(flavor) => {
-                let flavor_label = match flavor {
-                    FailureFlavor::Regression { details } => format!("REGRESSION ({details})"),
-                    FailureFlavor::SetupFailure { reason } => format!("SETUP-FAILURE ({reason})"),
-                    FailureFlavor::Timeout => "TIMEOUT".to_string(),
+                let (flavor_label, flavor_short) = match flavor {
+                    FailureFlavor::Regression { details } => {
+                        (format!("REGRESSION ({details})"), "REGRESSION".to_string())
+                    }
+                    FailureFlavor::SetupFailure { reason } => (
+                        format!("SETUP-FAILURE ({reason})"),
+                        "SETUP-FAILURE".to_string(),
+                    ),
+                    FailureFlavor::Timeout => ("TIMEOUT".to_string(), "TIMEOUT".to_string()),
                 };
                 notes.push(format!("tree-mode validation concluded {flavor_label}"));
+                failure_details.push(crate::model::FailureDetail {
+                    workflow: outcome.workflow.clone(),
+                    backend: outcome.backend.to_string(),
+                    flavor: flavor_short,
+                    stderr_tail: outcome.stderr_tail.clone(),
+                    duration_ms: outcome.duration_ms,
+                });
                 (Classification::Unsupported, "failure".to_string())
             }
         };
@@ -1148,6 +1175,7 @@ impl Validator {
             validated_workflows: vec![synthetic],
             classification,
             notes,
+            failure_details,
         })
     }
 }
@@ -1482,6 +1510,28 @@ mod tests {
 
     struct MockBackend {
         result: WorkflowResult,
+        stderr_tail: String,
+        duration_ms: u128,
+    }
+
+    impl MockBackend {
+        fn new(result: WorkflowResult) -> Self {
+            Self {
+                result,
+                stderr_tail: String::new(),
+                duration_ms: 1,
+            }
+        }
+
+        fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
+            self.stderr_tail = stderr.into();
+            self
+        }
+
+        fn with_duration_ms(mut self, ms: u128) -> Self {
+            self.duration_ms = ms;
+            self
+        }
     }
 
     impl ValidatorBackend for MockBackend {
@@ -1500,8 +1550,8 @@ mod tests {
                 backend: self.name(),
                 result: self.result.clone(),
                 forge_run_id: None,
-                duration_ms: 1,
-                stderr_tail: String::new(),
+                duration_ms: self.duration_ms,
+                stderr_tail: self.stderr_tail.clone(),
                 log_path: log_path.to_path_buf(),
             })
         }
@@ -1511,11 +1561,9 @@ mod tests {
     fn validate_aggregates_workflow_outcomes_via_backend_trait() {
         // Two workflows: one passes, one is a regression. Aggregation
         // must collapse to failure, with a note describing the regression.
-        let mock = MockBackend {
-            result: WorkflowResult::Fail(FailureFlavor::Regression {
-                details: "conclusion: failure".into(),
-            }),
-        };
+        let mock = MockBackend::new(WorkflowResult::Fail(FailureFlavor::Regression {
+            details: "conclusion: failure".into(),
+        }));
         let validator = Validator::with_backend(Box::new(mock));
         let tmp = tempfile::tempdir().unwrap();
         let workflows = vec![PathBuf::from("a.yml"), PathBuf::from("b.yml")];
@@ -1541,9 +1589,7 @@ mod tests {
 
     #[test]
     fn validate_returns_success_when_all_workflows_pass() {
-        let mock = MockBackend {
-            result: WorkflowResult::Pass,
-        };
+        let mock = MockBackend::new(WorkflowResult::Pass);
         let validator = Validator::with_backend(Box::new(mock));
         let tmp = tempfile::tempdir().unwrap();
         let workflows = vec![PathBuf::from("a.yml")];
@@ -1553,6 +1599,218 @@ mod tests {
         assert_eq!(outcome.conclusion, "success");
         assert!(matches!(outcome.classification, Classification::Exact));
         assert!(outcome.notes.is_empty(), "passing run should have no notes");
+        assert!(
+            outcome.failure_details.is_empty(),
+            "passing run must not carry failure details"
+        );
+    }
+
+    #[test]
+    fn validate_populates_failure_details_with_stderr_tail_on_regression() {
+        // The whole point of failure_details: when a workflow fails,
+        // the operator should see *why* without digging into sandbox
+        // logs. Validator must copy the backend's stderr_tail +
+        // duration_ms + flavor into ValidationOutcome.failure_details
+        // so the reporter and the receipt can both render it.
+        let stderr = "error[E0599]: no method named `result` found for struct `Sha2_256`\n   --> src/main.rs:42:18\n";
+        let mock = MockBackend::new(WorkflowResult::Fail(FailureFlavor::Regression {
+            details: "conclusion: failure".into(),
+        }))
+        .with_stderr(stderr)
+        .with_duration_ms(12_345);
+        let validator = Validator::with_backend(Box::new(mock));
+        let tmp = tempfile::tempdir().unwrap();
+        let workflows = vec![PathBuf::from(".github/workflows/ci.yml")];
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &workflows)
+            .unwrap();
+        assert_eq!(outcome.failure_details.len(), 1);
+        let detail = &outcome.failure_details[0];
+        assert_eq!(detail.flavor, "REGRESSION");
+        assert_eq!(detail.backend, "mock");
+        assert_eq!(detail.workflow, PathBuf::from(".github/workflows/ci.yml"));
+        assert_eq!(detail.stderr_tail, stderr);
+        assert_eq!(detail.duration_ms, 12_345);
+    }
+
+    #[test]
+    fn validate_populates_failure_details_for_setup_failure_and_timeout_flavors() {
+        // SETUP-FAILURE flavor surfaces with the reason embedded.
+        let mock = MockBackend::new(WorkflowResult::Fail(FailureFlavor::SetupFailure {
+            reason: "forge exited unparseably".into(),
+        }))
+        .with_stderr("forge: command not found")
+        .with_duration_ms(100);
+        let validator = Validator::with_backend(Box::new(mock));
+        let tmp = tempfile::tempdir().unwrap();
+        let workflows = vec![PathBuf::from("ci.yml")];
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &workflows)
+            .unwrap();
+        assert_eq!(outcome.failure_details.len(), 1);
+        assert_eq!(outcome.failure_details[0].flavor, "SETUP-FAILURE");
+
+        // TIMEOUT flavor preserved.
+        let mock_timeout = MockBackend::new(WorkflowResult::Fail(FailureFlavor::Timeout))
+            .with_stderr("[no output captured before timeout]");
+        let validator = Validator::with_backend(Box::new(mock_timeout));
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &workflows)
+            .unwrap();
+        assert_eq!(outcome.failure_details[0].flavor, "TIMEOUT");
+    }
+
+    #[test]
+    fn validate_only_captures_failure_details_for_failed_workflows() {
+        // Two failed and one passing workflow — only the two failed
+        // entries should produce FailureDetails.
+        struct AlternatingBackend(std::sync::Mutex<usize>);
+        impl ValidatorBackend for AlternatingBackend {
+            fn name(&self) -> &'static str {
+                "alt"
+            }
+            fn validate_workflow(
+                &self,
+                workflow: &Path,
+                _tree: &Path,
+                _timeout: Duration,
+                log_path: &Path,
+            ) -> Result<WorkflowOutcome> {
+                let mut counter = self.0.lock().unwrap();
+                let i = *counter;
+                *counter += 1;
+                let result = if i == 1 {
+                    WorkflowResult::Pass
+                } else {
+                    WorkflowResult::Fail(FailureFlavor::Regression {
+                        details: format!("workflow #{i} regressed"),
+                    })
+                };
+                Ok(WorkflowOutcome {
+                    workflow: workflow.to_path_buf(),
+                    backend: self.name(),
+                    result,
+                    forge_run_id: None,
+                    duration_ms: 1,
+                    stderr_tail: format!("stderr for workflow #{i}"),
+                    log_path: log_path.to_path_buf(),
+                })
+            }
+        }
+        let validator =
+            Validator::with_backend(Box::new(AlternatingBackend(std::sync::Mutex::new(0))));
+        let tmp = tempfile::tempdir().unwrap();
+        let workflows = vec![
+            PathBuf::from("a.yml"),
+            PathBuf::from("b.yml"),
+            PathBuf::from("c.yml"),
+        ];
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &workflows)
+            .unwrap();
+        assert_eq!(outcome.conclusion, "failure");
+        assert_eq!(
+            outcome.failure_details.len(),
+            2,
+            "exactly two failed workflows should be captured: {:?}",
+            outcome.failure_details
+        );
+        let workflows_in_details: Vec<&PathBuf> = outcome
+            .failure_details
+            .iter()
+            .map(|d| &d.workflow)
+            .collect();
+        assert!(workflows_in_details.contains(&&PathBuf::from("a.yml")));
+        assert!(workflows_in_details.contains(&&PathBuf::from("c.yml")));
+    }
+
+    #[test]
+    fn validate_unvalidated_paths_emit_empty_failure_details() {
+        // The two early-return paths (no workflows + filter excluded all)
+        // mean validation didn't actually run — failure_details must
+        // remain empty so the reporter doesn't show a phantom "why".
+        let mock = MockBackend::new(WorkflowResult::Pass);
+        let validator = Validator::with_backend(Box::new(mock));
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &[])
+            .unwrap();
+        assert_eq!(outcome.conclusion, "unvalidated");
+        assert!(outcome.failure_details.is_empty());
+    }
+
+    #[test]
+    fn tree_mode_validate_populates_failure_details_on_red() {
+        // Tree-mode dispatch (BuildTest / Custom) takes a different
+        // code path. Confirm it also populates failure_details.
+        struct TreeFailBackend;
+        impl ValidatorBackend for TreeFailBackend {
+            fn name(&self) -> &'static str {
+                "tree-fail"
+            }
+            fn validate_workflow(
+                &self,
+                workflow: &Path,
+                _tree: &Path,
+                _timeout: Duration,
+                log_path: &Path,
+            ) -> Result<WorkflowOutcome> {
+                Ok(WorkflowOutcome {
+                    workflow: workflow.to_path_buf(),
+                    backend: self.name(),
+                    result: WorkflowResult::Fail(FailureFlavor::Regression {
+                        details: "tree mode red".into(),
+                    }),
+                    forge_run_id: None,
+                    duration_ms: 999,
+                    stderr_tail: "tree-mode cargo check failed".into(),
+                    log_path: log_path.to_path_buf(),
+                })
+            }
+            fn needs_workflow_file(&self) -> bool {
+                false
+            }
+        }
+        let validator = Validator::with_backend(Box::new(TreeFailBackend));
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty workflow list triggers tree-mode dispatch because
+        // needs_workflow_file() is false.
+        let outcome = validator
+            .validate(&sample_proposal(), tmp.path(), &[])
+            .unwrap();
+        assert_eq!(outcome.conclusion, "failure");
+        assert_eq!(outcome.failure_details.len(), 1);
+        let d = &outcome.failure_details[0];
+        assert_eq!(d.backend, "tree-fail");
+        assert_eq!(d.stderr_tail, "tree-mode cargo check failed");
+        assert_eq!(d.duration_ms, 999);
+        // Sentinel synthetic workflow shape preserved.
+        assert!(
+            d.workflow.display().to_string().starts_with("<tree:"),
+            "tree-mode workflow path should be a sentinel: `{}`",
+            d.workflow.display()
+        );
+    }
+
+    #[test]
+    fn validation_outcome_back_compat_default_failure_details_when_field_absent() {
+        // A receipt written before the failure_details field existed
+        // (e.g. by an earlier assay version) must still deserialize.
+        // The `#[serde(default)]` attribute ensures the missing field
+        // populates as an empty Vec.
+        let legacy_json = r#"{
+            "proposal_id": "cargo-x",
+            "conclusion": "failure",
+            "ci_forge_run_ids": [],
+            "validated_workflows": [],
+            "classification": "unsupported",
+            "notes": ["workflow ci.yml concluded REGRESSION (legacy)"]
+        }"#;
+        let outcome: crate::model::ValidationOutcome =
+            serde_json::from_str(legacy_json).expect("legacy receipt deserializes");
+        assert_eq!(outcome.proposal_id, "cargo-x");
+        assert_eq!(outcome.conclusion, "failure");
+        assert!(outcome.failure_details.is_empty());
     }
 
     // -------------------------------------------------------------------------
@@ -1888,9 +2146,7 @@ mod tests {
             "deploy.yml",
             "name: deploy\non: push\njobs: {}\n",
         );
-        let validator = Validator::with_backend(Box::new(MockBackend {
-            result: WorkflowResult::Pass,
-        }));
+        let validator = Validator::with_backend(Box::new(MockBackend::new(WorkflowResult::Pass)));
         let outcome = validator
             .validate(&sample_proposal(), tmp.path(), &[push_only])
             .unwrap();
@@ -1920,9 +2176,7 @@ mod tests {
             "deploy.yml",
             "name: deploy\non: push\njobs: {}\n",
         );
-        let validator = Validator::with_backend(Box::new(MockBackend {
-            result: WorkflowResult::Pass,
-        }));
+        let validator = Validator::with_backend(Box::new(MockBackend::new(WorkflowResult::Pass)));
         let outcome = validator
             .validate(
                 &sample_proposal(),
@@ -1951,10 +2205,8 @@ mod tests {
             "deploy.yml",
             "name: deploy\non: push\njobs: {}\n",
         );
-        let validator = Validator::with_backend(Box::new(MockBackend {
-            result: WorkflowResult::Pass,
-        }))
-        .with_workflow_filter(WorkflowFilter::accept_all());
+        let validator = Validator::with_backend(Box::new(MockBackend::new(WorkflowResult::Pass)))
+            .with_workflow_filter(WorkflowFilter::accept_all());
         let outcome = validator
             .validate(
                 &sample_proposal(),

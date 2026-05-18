@@ -532,6 +532,7 @@ mod tests {
             validated_workflows: vec![],
             classification: Classification::Exact,
             notes: vec![],
+            failure_details: vec![],
         }
     }
 
