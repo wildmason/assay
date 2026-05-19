@@ -33,18 +33,32 @@ pub struct RunRef<'a> {
     pub proposal: &'a Proposal,
     pub sandbox: &'a Path,
     pub outcome: &'a ValidationOutcome,
+    /// Where the manifest this proposal came from lives. For polyglot
+    /// Tauri layouts proposals from cargo and npm have different
+    /// scan_roots; the merge planner groups by (eco_idx, scan_root)
+    /// so each sub-project's merge sandbox is set up against the
+    /// right directory.
+    pub scan_root: &'a Path,
 }
 
-/// Per-ecosystem outcome of the merge pass.
+/// Per-ecosystem outcome of the merge pass. With polyglot layouts the
+/// effective grouping is (eco_idx, scan_root) — each `scan_root` field
+/// pairs with the ecosystem to identify the sub-project this outcome
+/// targets, so copy-back lands in the right host directory.
 #[derive(Debug)]
 pub struct EcosystemMergeOutcome {
     pub eco_idx: usize,
-    /// Sandbox to copy back from. For ecosystems with one green this is
-    /// the per-proposal sandbox passed in via `runs`. For ecosystems with
-    /// two or more greens whose merged set went green, this is the merge
-    /// worktree created here. When bisect kept a size-(N-1) subset, this
-    /// is the worktree of that subset's attempt. When the ecosystem
-    /// ships nothing, this path is empty.
+    /// The host-side directory the shipped proposals modify. Copy-back
+    /// runs `ecosystem.copy_back_merged(..., scan_root)` so manifests
+    /// land back in the originating sub-project, not the artifact
+    /// root.
+    pub scan_root: PathBuf,
+    /// Sandbox to copy back from. For groups with one green this is
+    /// the per-proposal sandbox passed in via `runs`. For groups with
+    /// two or more greens whose merged set went green, this is the
+    /// merge worktree created here. When bisect kept a size-(N-1)
+    /// subset, this is the worktree of that subset's attempt. When
+    /// the group ships nothing, this path is empty.
     pub sandbox: PathBuf,
     /// Indices into the input `runs` slice — which proposals will be
     /// shipped from `sandbox`.
@@ -71,25 +85,34 @@ pub struct MergedDrop {
 /// strategy drops the highest-ID proposal at a time until a green
 /// subset is found or the search is exhausted.
 pub fn build_ship_plan(
-    repo: &Path,
+    artifact_root: &Path,
     run_id: &str,
     registry: &[Box<dyn DependencyEcosystem>],
     validator: &Validator,
     runs: &[RunRef<'_>],
     provenance: &mut Provenance,
 ) -> Result<Vec<EcosystemMergeOutcome>> {
-    let mut by_eco: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    // Group by (eco_idx, scan_root) so each sub-project's proposals
+    // merge in their own sandbox. Two cargo workspaces in different
+    // scan_roots would never share a merge sandbox (different
+    // Cargo.lock files); same logic for any other ecosystem with
+    // per-root state.
+    let mut by_group: BTreeMap<(usize, PathBuf), Vec<usize>> = BTreeMap::new();
     for (i, run) in runs.iter().enumerate() {
         if run.outcome.conclusion == "success" {
-            by_eco.entry(run.eco_idx).or_default().push(i);
+            by_group
+                .entry((run.eco_idx, run.scan_root.to_path_buf()))
+                .or_default()
+                .push(i);
         }
     }
     let mut outcomes: Vec<EcosystemMergeOutcome> = Vec::new();
-    for (eco_idx, green_indices) in by_eco {
+    for ((eco_idx, scan_root), green_indices) in by_group {
         let ecosystem = registry[eco_idx].as_ref();
         if green_indices.len() == 1 {
             outcomes.push(EcosystemMergeOutcome {
                 eco_idx,
+                scan_root: scan_root.clone(),
                 sandbox: runs[green_indices[0]].sandbox.to_path_buf(),
                 shipped: green_indices,
                 dropped: Vec::new(),
@@ -121,6 +144,7 @@ pub fn build_ship_plan(
             });
             outcomes.push(EcosystemMergeOutcome {
                 eco_idx,
+                scan_root: scan_root.clone(),
                 sandbox: runs[green_indices[0]].sandbox.to_path_buf(),
                 shipped: green_indices,
                 dropped: Vec::new(),
@@ -128,7 +152,8 @@ pub fn build_ship_plan(
             continue;
         }
         let merge = merge_with_bisect(
-            repo,
+            artifact_root,
+            &scan_root,
             run_id,
             eco_idx,
             ecosystem,
@@ -144,7 +169,8 @@ pub fn build_ship_plan(
 
 #[allow(clippy::too_many_arguments)]
 fn merge_with_bisect(
-    repo: &Path,
+    artifact_root: &Path,
+    scan_root: &Path,
     run_id: &str,
     eco_idx: usize,
     ecosystem: &dyn DependencyEcosystem,
@@ -154,7 +180,8 @@ fn merge_with_bisect(
     provenance: &mut Provenance,
 ) -> Result<EcosystemMergeOutcome> {
     let attempt = try_merged_apply_and_validate(
-        repo,
+        artifact_root,
+        scan_root,
         run_id,
         eco_idx,
         ecosystem,
@@ -166,6 +193,7 @@ fn merge_with_bisect(
     if let MergedAttempt::Green { sandbox } = attempt {
         return Ok(EcosystemMergeOutcome {
             eco_idx,
+            scan_root: scan_root.to_path_buf(),
             sandbox,
             shipped: green_indices.to_vec(),
             dropped: Vec::new(),
@@ -188,7 +216,15 @@ fn merge_with_bisect(
             .filter(|i| i != drop_idx)
             .collect();
         let attempt2 = try_merged_apply_and_validate(
-            repo, run_id, eco_idx, ecosystem, validator, runs, &subset, provenance,
+            artifact_root,
+            scan_root,
+            run_id,
+            eco_idx,
+            ecosystem,
+            validator,
+            runs,
+            &subset,
+            provenance,
         )?;
         match attempt2 {
             MergedAttempt::Green { sandbox } => {
@@ -198,6 +234,7 @@ fn merge_with_bisect(
                 }];
                 return Ok(EcosystemMergeOutcome {
                     eco_idx,
+                    scan_root: scan_root.to_path_buf(),
                     sandbox,
                     shipped: subset,
                     dropped,
@@ -208,7 +245,7 @@ fn merge_with_bisect(
             }
         }
     }
-    // No size-(N-1) subset greened — ship nothing for this ecosystem.
+    // No size-(N-1) subset greened — ship nothing for this group.
     let dropped: Vec<MergedDrop> = green_indices
         .iter()
         .copied()
@@ -221,6 +258,7 @@ fn merge_with_bisect(
         .collect();
     Ok(EcosystemMergeOutcome {
         eco_idx,
+        scan_root: scan_root.to_path_buf(),
         sandbox: PathBuf::new(),
         shipped: Vec::new(),
         dropped,
@@ -242,7 +280,8 @@ enum MergedAttempt {
 
 #[allow(clippy::too_many_arguments)]
 fn try_merged_apply_and_validate(
-    repo: &Path,
+    artifact_root: &Path,
+    scan_root: &Path,
     run_id: &str,
     eco_idx: usize,
     ecosystem: &dyn DependencyEcosystem,
@@ -257,7 +296,7 @@ fn try_merged_apply_and_validate(
         ecosystem.name(),
         short_hash_of_proposals(&proposals)
     );
-    let merge_tree = prepare_isolated_worktree(repo, run_id, &label)?;
+    let merge_tree = prepare_isolated_worktree(artifact_root, scan_root, run_id, &label)?;
     ecosystem.apply_merged(&proposals, &merge_tree)?;
     let synth = synthesize_merged_proposal(eco_idx, ecosystem, &proposals);
     let workflows = collect_gate_workflows(ecosystem, &proposals, &merge_tree);
@@ -362,24 +401,36 @@ fn short_hash_of_proposals(proposals: &[&Proposal]) -> String {
     digest[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Create an isolated git worktree under `.assay/runs/<run-id>/work/<label>`.
+/// Create an isolated git worktree under
+/// `<artifact_root>/.assay/runs/<run-id>/work/<label>`.
 ///
-/// Same shape as cli.rs's `prepare_apply_local_tree` but parameterized
-/// on a free-form label (the merge sandbox uses
-/// `merge-<ecosystem>-<short-hash>`, not a proposal id). Public so cli.rs
-/// can share the implementation if it wants.
-pub fn prepare_isolated_worktree(repo: &Path, run_id: &str, label: &str) -> Result<PathBuf> {
+/// `artifact_root` is the assay run's anchor (where `.assay/` lives).
+/// `scan_root` is the ecosystem's project root inside the repo (may be
+/// a subdirectory like `src-tauri/`); the returned `final_target`
+/// descends into that subdir of the worktree so the ecosystem applier
+/// finds manifests at the expected relative locations. Single-root
+/// callers pass `artifact_root == scan_root`.
+pub fn prepare_isolated_worktree(
+    artifact_root: &Path,
+    scan_root: &Path,
+    run_id: &str,
+    label: &str,
+) -> Result<PathBuf> {
     // Walk up to the git top-level via `git rev-parse --show-toplevel`
-    // — supports running assay against a sub-directory (helm's
-    // `src-tauri/` under helm root, for example).
-    let git_root = resolve_git_top_level(repo)?;
-    let rel_sub_dir = repo.canonicalize().ok().and_then(|c| {
+    // — supports running assay against a sub-directory (Tauri layouts
+    // place Cargo.toml under `src-tauri/`, for example).
+    let git_root = resolve_git_top_level(scan_root)?;
+    let rel_sub_dir = scan_root.canonicalize().ok().and_then(|c| {
         git_root
             .canonicalize()
             .ok()
             .and_then(|g| c.strip_prefix(&g).ok().map(Path::to_path_buf))
     });
-    let work_root = repo.join(".assay").join("runs").join(run_id).join("work");
+    let work_root = artifact_root
+        .join(".assay")
+        .join("runs")
+        .join(run_id)
+        .join("work");
     std::fs::create_dir_all(&work_root).map_err(|source| Error::Io {
         path: work_root.clone(),
         source,
@@ -415,8 +466,12 @@ pub fn prepare_isolated_worktree(repo: &Path, run_id: &str, label: &str) -> Resu
     // the merge worktree shares the same run-id-scoped directory so
     // the materialization is shared across per-proposal and merge
     // sandboxes within a run.
-    let run_root = repo.join(".assay").join("runs").join(run_id);
-    crate::external_deps::materialize_external_deps_into_sandbox(repo, &target_abs, &run_root)?;
+    let run_root = artifact_root.join(".assay").join("runs").join(run_id);
+    crate::external_deps::materialize_external_deps_into_sandbox(
+        scan_root,
+        &target_abs,
+        &run_root,
+    )?;
 
     let final_target = match rel_sub_dir {
         Some(rel) if !rel.as_os_str().is_empty() => target_abs.join(rel),
@@ -666,6 +721,7 @@ mod tests {
             proposal: &proposal,
             sandbox: &sandbox,
             outcome: &outcome,
+            scan_root: std::path::Path::new("."),
         }];
         let validator = make_test_validator();
         // Repo path isn't accessed for the single-green path — any
@@ -714,18 +770,21 @@ mod tests {
                 proposal: &p_a,
                 sandbox: &sandbox_a,
                 outcome: &outcome,
+                scan_root: std::path::Path::new("."),
             },
             RunRef {
                 eco_idx: 0,
                 proposal: &p_b,
                 sandbox: &sandbox_b,
                 outcome: &outcome,
+                scan_root: std::path::Path::new("."),
             },
             RunRef {
                 eco_idx: 0,
                 proposal: &p_c,
                 sandbox: &sandbox_c,
                 outcome: &outcome,
+                scan_root: std::path::Path::new("."),
             },
         ];
         let validator = make_test_validator();
@@ -773,12 +832,14 @@ mod tests {
                 proposal: &p_green,
                 sandbox: &sb1,
                 outcome: &green_outcome,
+                scan_root: std::path::Path::new("."),
             },
             RunRef {
                 eco_idx: 0,
                 proposal: &p_red,
                 sandbox: &sb2,
                 outcome: &red_outcome,
+                scan_root: std::path::Path::new("."),
             },
         ];
         let validator = make_test_validator();

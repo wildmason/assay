@@ -21,12 +21,35 @@ pub struct AssayConfig {
     pub meta: MetaSection,
     #[serde(default)]
     pub ecosystems: EcosystemsSection,
+    #[serde(default)]
+    pub project: ProjectSection,
     #[serde(default, rename = "pull-request")]
     pub pull_request: PullRequestSection,
     #[serde(default)]
     pub validation: ValidationSection,
     #[serde(default)]
     pub safety: SafetySection,
+}
+
+/// Project-layout declaration. For Tauri-style polyglot repos where
+/// each ecosystem's manifest lives in a subdirectory (`src-tauri/`,
+/// `ui/`, `frontend/`, etc.), the operator declares the scan roots
+/// here so assay can discover all manifests in a single invocation.
+///
+/// When `roots` is empty, only the repo root is scanned (the v1
+/// single-root behavior). When `roots` is non-empty, EACH listed path
+/// is scanned in addition to the repo root, and proposals carry their
+/// originating scan-root through apply and merge so each sub-project's
+/// sandbox is set up correctly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSection {
+    /// Repo-relative paths to scan as additional project roots. Each
+    /// entry should be a directory under the repo root that contains
+    /// at least one ecosystem manifest (`Cargo.toml`, `package.json`,
+    /// or `.github/workflows/`). Order is preserved in output.
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +223,7 @@ impl Default for AssayConfig {
                 github_actions: default_github_actions_ecosystem(),
                 npm: default_npm_ecosystem(),
             },
+            project: ProjectSection::default(),
             pull_request: PullRequestSection {
                 labels: vec!["assay".into(), "dependencies".into()],
                 reviewers: Vec::new(),
@@ -354,6 +378,56 @@ max_parallel = 2
         assert_eq!(config.ecosystems.npm.max_parallel, 2);
         // Other ecosystems' defaults are preserved.
         assert_eq!(config.ecosystems.cargo.max_parallel, 1);
+    }
+
+    #[test]
+    fn project_roots_default_to_empty_meaning_repo_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = load(tmp.path()).expect("falls back to defaults");
+        assert!(
+            config.project.roots.is_empty(),
+            "default roots must be empty (single-root mode): {:?}",
+            config.project.roots,
+        );
+    }
+
+    #[test]
+    fn project_roots_parse_for_tauri_polyglot_layout() {
+        // Canonical Tauri layout: Rust backend at `src-tauri`, JS frontend
+        // at `ui`. With both listed, assay discovers all ecosystems in
+        // a single invocation.
+        let text = r#"
+[assay]
+schema_version = 1
+
+[project]
+roots = ["src-tauri", "ui"]
+"#;
+        let config = parse(text, Path::new(".assay.toml")).expect("parses ok");
+        assert_eq!(
+            config.project.roots,
+            vec![PathBuf::from("src-tauri"), PathBuf::from("ui")],
+        );
+    }
+
+    #[test]
+    fn project_roots_rejects_unknown_fields_in_section() {
+        // `deny_unknown_fields` guards against typos.
+        let text = r#"
+[assay]
+schema_version = 1
+
+[project]
+roots = ["src-tauri"]
+typo_field = "x"
+"#;
+        let err =
+            parse(text, Path::new(".assay.toml")).expect_err("unknown field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo_field") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
     }
 
     #[test]

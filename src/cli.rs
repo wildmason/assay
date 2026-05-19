@@ -235,15 +235,25 @@ impl ApplyMode {
 }
 
 fn analyze_command(args: AnalyzeArgs) -> Result<()> {
-    let project_scope = ProjectScope::resolve(&args)?;
     let mut args = args;
-    // Override --repo / --ecosystem with whatever --project resolved to.
-    args.repo = project_scope.repo_root.clone();
+    // Load config first — ProjectScope::resolve needs `[project] roots`
+    // for the polyglot multi-scan-root case.
+    let config = crate::config::load(&args.repo)?;
+    let project_scope = ProjectScope::resolve(&args, &config)?;
+    // Override --repo / --ecosystem with whatever --project / config
+    // resolved to. `args.repo` is what assay treats as the artifact
+    // root (where `.assay/` lives + where the git checks anchor).
+    args.repo = project_scope.artifact_root.clone();
     if let Some(eco) = project_scope.ecosystem_restriction {
         args.ecosystem = Some(eco);
     }
     if !args.repo.is_dir() {
         return Err(Error::RepoNotFound(args.repo));
+    }
+    for root in &project_scope.scan_roots {
+        if !root.is_dir() {
+            return Err(Error::RepoNotFound(root.clone()));
+        }
     }
     let mode = ApplyMode::from_args(&args);
     // The host-executor safety check only matters when forge runs the
@@ -285,83 +295,99 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     }
 
     let registry = default_registry();
-    // Load .assay.toml if present (falls back to documented defaults
-    // when absent). The ignore list per ecosystem flows from the
-    // config into per-ecosystem `EcosystemContext` instances.
-    let config = crate::config::load(&args.repo)?;
     let started_at = iso8601_now();
     let run_id = generate_run_id();
     let mut total_manifests = 0usize;
-    let mut all_proposals: Vec<(usize, Proposal)> = Vec::new();
+    let mut all_proposals: Vec<(usize, PathBuf, Proposal)> = Vec::new();
     let mut provenance = Provenance::default();
 
-    for (idx, ecosystem) in registry.iter().enumerate() {
-        if !ecosystem_enabled(&args, ecosystem.as_ref()) {
-            continue;
-        }
-        let manifests = ecosystem.detect_manifests(&args.repo)?;
-        match args.format {
-            OutputFormat::Text => report_text(ecosystem.name(), &manifests),
-            OutputFormat::Json => report_json(ecosystem.name(), &manifests)?,
-        }
-        for manifest in &manifests {
-            provenance.records.push(ProvenanceRecord {
-                tool: "assay".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                stage: format!("scanner.{}", ecosystem.name()),
-                subject: manifest.path.display().to_string(),
-                status: Classification::Exact,
-                summary: format!("detected {:?}", manifest.kind),
-                artifact_path: None,
-                details: None,
-            });
-        }
-        if !manifests.is_empty() {
-            // Build a per-ecosystem context with the matching ignore
-            // list from .assay.toml. Other fields (action_store,
-            // allow_network) are run-wide.
-            let context = EcosystemContext {
-                action_store: Some(args.repo.join(".assay").join("actions")),
-                allow_network: !args.offline,
-                ignored_subjects: resolve_ignore_list(&config, &args.ignore, ecosystem.name()),
-                refresh_cache: args.refresh_cache,
-            };
-            let mut proposals = ecosystem.propose_updates(&manifests, &args.repo, &context)?;
-            // Enrich each proposal with the list of workspace members
-            // that directly declare the subject as a dependency. This
-            // is the "blast radius" signal — for a 47-member monorepo
-            // where only 3 crates consume this dep, the operator sees
-            // exactly which 3. Best-effort: an ecosystem that can't
-            // resolve consumers (network failure, malformed manifest)
-            // leaves the field empty and we continue with the proposal.
-            for proposal in &mut proposals {
-                if let Ok(consumers) = ecosystem.affected_consumers(proposal, &args.repo) {
-                    proposal.affected_consumers = consumers;
+    // Polyglot scan loop: every scan_root × every enabled ecosystem.
+    // Each ecosystem's `detect_manifests` is scoped to one scan_root
+    // at a time, so manifests at sibling roots (e.g. Tauri's
+    // `src-tauri/Cargo.toml` and `ui/package.json`) are discovered
+    // independently in the same run. Proposals carry their originating
+    // scan_root forward so apply + merge land in the right sandbox.
+    for scan_root in &project_scope.scan_roots {
+        for (idx, ecosystem) in registry.iter().enumerate() {
+            if !ecosystem_enabled(&args, ecosystem.as_ref()) {
+                continue;
+            }
+            let manifests = ecosystem.detect_manifests(scan_root)?;
+            // For multi-root reporting we want the scan_root's path
+            // RELATIVE to the artifact root so the reporter prints
+            // `src-tauri` / `ui` instead of full absolute paths. None
+            // → repo root case (no prefix needed).
+            let scan_root_rel = relative_prefix(&args.repo, scan_root);
+            match args.format {
+                OutputFormat::Text => {
+                    report_text(ecosystem.name(), scan_root_rel.as_deref(), &manifests)
+                }
+                OutputFormat::Json => {
+                    report_json(ecosystem.name(), scan_root_rel.as_deref(), &manifests)?
                 }
             }
-            for proposal in &proposals {
+            for manifest in &manifests {
                 provenance.records.push(ProvenanceRecord {
                     tool: "assay".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
-                    stage: format!("proposer.{}", ecosystem.name()),
-                    subject: proposal.id.clone(),
-                    status: proposal.initial_classification,
-                    summary: format!("{} {} -> {}", proposal.subject, proposal.from, proposal.to),
+                    stage: format!("scanner.{}", ecosystem.name()),
+                    subject: manifest.path.display().to_string(),
+                    status: Classification::Exact,
+                    summary: format!("detected {:?}", manifest.kind),
                     artifact_path: None,
-                    details: Some(serde_json::to_value(proposal).map_err(Error::Json)?),
+                    details: None,
                 });
-                if matches!(args.format, OutputFormat::Text) {
-                    println!(
-                        "    proposal {}: {} {} -> {}",
-                        proposal.id, proposal.subject, proposal.from, proposal.to,
-                    );
+            }
+            if !manifests.is_empty() {
+                // Build a per-ecosystem context with the matching ignore
+                // list from .assay.toml. The action_store still lives at
+                // the artifact root (one cache per repo, shared across
+                // scan_roots) — only the manifest-discovery scope changes
+                // per scan_root.
+                let context = EcosystemContext {
+                    action_store: Some(args.repo.join(".assay").join("actions")),
+                    allow_network: !args.offline,
+                    ignored_subjects: resolve_ignore_list(&config, &args.ignore, ecosystem.name()),
+                    refresh_cache: args.refresh_cache,
+                };
+                let mut proposals = ecosystem.propose_updates(&manifests, scan_root, &context)?;
+                // Enrich each proposal with the list of workspace members
+                // that directly declare the subject as a dependency. Scoped
+                // to scan_root so per-sub-project consumer lists are
+                // correct (e.g. Tauri `src-tauri` cargo consumers stay
+                // distinct from `ui` npm consumers).
+                for proposal in &mut proposals {
+                    if let Ok(consumers) = ecosystem.affected_consumers(proposal, scan_root) {
+                        proposal.affected_consumers = consumers;
+                    }
+                }
+                for proposal in &proposals {
+                    provenance.records.push(ProvenanceRecord {
+                        tool: "assay".into(),
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        stage: format!("proposer.{}", ecosystem.name()),
+                        subject: proposal.id.clone(),
+                        status: proposal.initial_classification,
+                        summary: format!(
+                            "{} {} -> {}",
+                            proposal.subject, proposal.from, proposal.to
+                        ),
+                        artifact_path: None,
+                        details: Some(serde_json::to_value(proposal).map_err(Error::Json)?),
+                    });
+                    if matches!(args.format, OutputFormat::Text) {
+                        println!(
+                            "    proposal {}: {} {} -> {}",
+                            proposal.id, proposal.subject, proposal.from, proposal.to,
+                        );
+                    }
+                }
+                for proposal in proposals {
+                    all_proposals.push((idx, scan_root.clone(), proposal));
                 }
             }
-            for proposal in proposals {
-                all_proposals.push((idx, proposal));
-            }
+            total_manifests += manifests.len();
         }
-        total_manifests += manifests.len();
     }
 
     let mut proposals_passed = 0usize;
@@ -377,10 +403,11 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
 
         let units: Vec<WorkUnit> = all_proposals
             .iter()
-            .map(|(eco_idx, proposal)| WorkUnit {
+            .map(|(eco_idx, scan_root, proposal)| WorkUnit {
                 eco_idx: *eco_idx,
                 ecosystem_name: registry[*eco_idx].name(),
                 proposal: proposal.clone(),
+                scan_root: scan_root.clone(),
             })
             .collect();
 
@@ -473,6 +500,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     sandbox,
                     outcome,
                     provenance: pr_records,
+                    scan_root,
                 } => {
                     provenance.records.extend(pr_records);
                     match outcome.conclusion.as_str() {
@@ -485,6 +513,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         proposal,
                         sandbox,
                         outcome,
+                        scan_root,
                     });
                 }
             }
@@ -566,7 +595,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         // latest but constraint-pinned" gap that plain `cargo update`
         // hides. Walks all_proposals directly — the source of truth.
         let (lockfile_only, compatible, breaking) =
-            tier_counts(all_proposals.iter().map(|(_, p)| p));
+            tier_counts(all_proposals.iter().map(|(_, _, p)| p));
         println!(
             "assay: scanned {} manifest(s) across {} ecosystem(s); {} proposal(s) (mode={:?})",
             total_manifests,
@@ -579,7 +608,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             lockfile_only, compatible, breaking,
         );
         if (compatible + breaking) > 0 {
-            print_discovered_section(all_proposals.iter().map(|(_, p)| p));
+            print_discovered_section(all_proposals.iter().map(|(_, _, p)| p));
         }
         if matches!(mode, ApplyMode::ApplyLocal) {
             println!(
@@ -714,6 +743,11 @@ struct WorkUnit {
     /// Cached for the worker pool's per-ecosystem semaphore lookup.
     ecosystem_name: &'static str,
     proposal: Proposal,
+    /// The scan_root this proposal originated from. For Tauri-style
+    /// polyglot layouts, sibling ecosystems live in different
+    /// subdirectories under the artifact root — apply/validate must
+    /// run inside the scan_root, not against the artifact root.
+    scan_root: PathBuf,
 }
 
 /// What a worker thread produces for one [`WorkUnit`].
@@ -751,6 +785,10 @@ enum WorkerOutcome {
         sandbox: PathBuf,
         outcome: crate::model::ValidationOutcome,
         provenance: Vec<ProvenanceRecord>,
+        /// Forwarded from the input `WorkUnit` so the merge planner can
+        /// group by (eco_idx, scan_root) when proposals come from
+        /// multiple sub-projects (Tauri polyglot).
+        scan_root: PathBuf,
     },
 }
 
@@ -861,7 +899,7 @@ fn process_proposal_unit(
     unit: WorkUnit,
     validator: &Validator,
     registry: &[Box<dyn DependencyEcosystem>],
-    repo: &Path,
+    artifact_root: &Path,
     run_id: &str,
     ctx: &WorkerContext<'_>,
 ) -> WorkerOutcome {
@@ -869,10 +907,13 @@ fn process_proposal_unit(
     let ecosystem = registry[unit.eco_idx].as_ref();
 
     // Conc-2: `git worktree add` is serialized across workers to avoid
-    // .git/index.lock races.
+    // .git/index.lock races. The sandbox is set up against the unit's
+    // scan_root (Tauri sub-project) while `.assay/` is anchored at the
+    // shared artifact_root.
+    let scan_root = unit.scan_root.clone();
     let apply_tree = {
         let _git_guard = ctx.git_mutex.lock().unwrap();
-        prepare_apply_local_tree(repo, run_id, &unit.proposal.id)
+        prepare_apply_local_tree(artifact_root, &scan_root, run_id, &unit.proposal.id)
     };
     let apply_tree = match apply_tree {
         Ok(path) => path,
@@ -972,6 +1013,7 @@ fn process_proposal_unit(
         sandbox: apply_tree,
         outcome,
         provenance: records,
+        scan_root,
     }
 }
 
@@ -984,6 +1026,11 @@ struct ProposalRun {
     proposal: Proposal,
     sandbox: PathBuf,
     outcome: crate::model::ValidationOutcome,
+    /// Where this proposal's manifest lived on the host. Threaded
+    /// into the merge planner so copy-back lands in the right
+    /// sub-project tree (Tauri polyglot: cargo proposals go back to
+    /// `src-tauri`, npm proposals to `ui`).
+    scan_root: PathBuf,
 }
 
 /// Per-proposal apply-stage failure row, surfaced alongside
@@ -1271,17 +1318,31 @@ fn perform_apply_local_commit(
             .iter()
             .map(|i| &completed_runs[*i].proposal)
             .collect();
+        // Copy back into the originating scan_root's host tree — for
+        // Tauri polyglot that means cargo proposals land in
+        // `src-tauri/` and npm proposals in `ui/`, not at the
+        // artifact root.
         let modified = ecosystem
-            .copy_back_merged(&shipped_proposals, &outcome.sandbox, repo)
+            .copy_back_merged(&shipped_proposals, &outcome.sandbox, &outcome.scan_root)
             .map_err(|err| {
                 Error::other(format!(
                     "merged copy-back failed for `{}` ecosystem: {err}",
                     ecosystem.name()
                 ))
             })?;
+        // copy_back_merged returns paths relative to `outcome.scan_root`.
+        // For `git add` from the artifact_root, prefix each with the
+        // scan_root's relative-to-artifact-root path so multi-root
+        // (Tauri polyglot) commits include `src-tauri/Cargo.toml` and
+        // `ui/package.json`, not bare `Cargo.toml` / `package.json`.
+        let prefix = relative_prefix(repo, &outcome.scan_root);
         for path in &modified {
-            if !modified_paths.contains(path) {
-                modified_paths.push(path.clone());
+            let joined = match &prefix {
+                Some(p) if !p.as_os_str().is_empty() => p.join(path),
+                _ => path.clone(),
+            };
+            if !modified_paths.contains(&joined) {
+                modified_paths.push(joined);
             }
         }
         provenance.records.push(ProvenanceRecord {
@@ -1299,6 +1360,7 @@ fn perform_apply_local_commit(
             details: Some(serde_json::json!({
                 "ecosystem": ecosystem.name(),
                 "proposals": shipped_proposals.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+                "scan_root": outcome.scan_root.display().to_string(),
                 "modified": modified.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             })),
         });
@@ -1416,6 +1478,7 @@ fn build_ship_plan_from_runs(
             proposal: &r.proposal,
             sandbox: r.sandbox.as_path(),
             outcome: &r.outcome,
+            scan_root: r.scan_root.as_path(),
         })
         .collect();
     crate::apply_merger::build_ship_plan(repo, run_id, registry, validator, &run_refs, provenance)
@@ -1615,8 +1678,17 @@ fn perform_apply_pr(
             .iter()
             .map(|i| &completed_runs[*i].proposal)
             .collect();
+        // Locate the worktree's mirror of this outcome's scan_root. For
+        // single-root, this IS the worktree. For Tauri polyglot, this
+        // is `<worktree>/<scan_root-relative-to-artifact-root>` (e.g.
+        // `<worktree>/src-tauri`).
+        let prefix = relative_prefix(repo, &outcome.scan_root);
+        let host_target = match &prefix {
+            Some(p) if !p.as_os_str().is_empty() => worktree.join(p),
+            _ => worktree.clone(),
+        };
         let modified = ecosystem
-            .copy_back_merged(&shipped_proposals, &outcome.sandbox, &worktree)
+            .copy_back_merged(&shipped_proposals, &outcome.sandbox, &host_target)
             .map_err(|err| {
                 Error::other(format!(
                     "merged copy-back failed for `{}` ecosystem: {err}",
@@ -1624,8 +1696,12 @@ fn perform_apply_pr(
                 ))
             })?;
         for path in &modified {
-            if !modified_paths.contains(path) {
-                modified_paths.push(path.clone());
+            let joined = match &prefix {
+                Some(p) if !p.as_os_str().is_empty() => p.join(path),
+                _ => path.clone(),
+            };
+            if !modified_paths.contains(&joined) {
+                modified_paths.push(joined);
             }
         }
         provenance.records.push(ProvenanceRecord {
@@ -1643,6 +1719,7 @@ fn perform_apply_pr(
             details: Some(serde_json::json!({
                 "ecosystem": ecosystem.name(),
                 "proposals": shipped_proposals.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+                "scan_root": outcome.scan_root.display().to_string(),
             })),
         });
     }
@@ -1838,24 +1915,33 @@ fn working_tree_dirty_path(repo: &std::path::Path) -> Result<Option<String>> {
 }
 
 fn prepare_apply_local_tree(
-    repo: &std::path::Path,
+    artifact_root: &std::path::Path,
+    scan_root: &std::path::Path,
     run_id: &str,
     proposal_id: &str,
 ) -> Result<PathBuf> {
-    // `repo` may point at a sub-directory of a git repo (e.g. helm's
-    // `src-tauri/` under helm root). `git rev-parse --show-toplevel`
-    // walks up to the real repo root; `git worktree add` must run
-    // there to access the shared .git dir. The worktree target still
-    // lives under `repo` so the operator's `.assay/runs/` audit trail
-    // is co-located with their working tree.
-    let git_root = git_top_level(repo)?;
-    let rel_sub_dir = repo.canonicalize().ok().and_then(|c| {
+    // `scan_root` may point at a sub-directory of a git repo (e.g.
+    // helm's `src-tauri/` under helm root, or one of several config-
+    // declared roots in a Tauri polyglot layout). `git rev-parse
+    // --show-toplevel` walks up to the real repo root; `git worktree
+    // add` must run there to access the shared .git dir.
+    //
+    // `.assay/runs/<id>/work/` is anchored at `artifact_root` so all
+    // sandboxes for one run live in one tree, even when proposals
+    // come from multiple scan_roots. Single-root callers pass
+    // artifact_root == scan_root.
+    let git_root = git_top_level(scan_root)?;
+    let rel_sub_dir = scan_root.canonicalize().ok().and_then(|c| {
         git_root
             .canonicalize()
             .ok()
             .and_then(|g| c.strip_prefix(&g).ok().map(Path::to_path_buf))
     });
-    let work_root = repo.join(".assay").join("runs").join(run_id).join("work");
+    let work_root = artifact_root
+        .join(".assay")
+        .join("runs")
+        .join(run_id)
+        .join("work");
     std::fs::create_dir_all(&work_root).map_err(|source| Error::Io {
         path: work_root.clone(),
         source,
@@ -1896,8 +1982,12 @@ fn prepare_apply_local_tree(
     // the sandbox so cargo's path resolution from inside the worktree
     // lands on real directories. No-op when the repo declares no
     // external path deps.
-    let run_root = repo.join(".assay").join("runs").join(run_id);
-    crate::external_deps::materialize_external_deps_into_sandbox(repo, &target_abs, &run_root)?;
+    let run_root = artifact_root.join(".assay").join("runs").join(run_id);
+    crate::external_deps::materialize_external_deps_into_sandbox(
+        scan_root,
+        &target_abs,
+        &run_root,
+    )?;
 
     // When `repo` is a sub-directory, the applier/validator expect to
     // run inside the same sub-dir of the worktree. Otherwise they
@@ -2014,48 +2104,121 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
-/// Resolved scope for `--project`. When set, narrows the repo root
-/// AND restricts the run to a single ecosystem (inferred from the
-/// manifest filename).
+/// Resolved scope for one `analyze` invocation. Carries the artifact
+/// root (where `.assay/` lives + where git operations anchor) plus the
+/// list of scan roots (directories where ecosystems detect manifests).
+///
+/// **Single-root case** (no `--project`, no `[project] roots` in config):
+/// `artifact_root` = `scan_roots[0]` = `args.repo`. Single element.
+///
+/// **`--project <path>`**: `artifact_root` and the sole scan root are
+/// derived from the path. May restrict to one ecosystem when path is
+/// a manifest file. Config `[project] roots` is ignored in this mode —
+/// `--project` is the explicit "single sub-project" entry point.
+///
+/// **`[project] roots = [...]` in `.assay.toml`** (polyglot Tauri / mixed
+/// repos): `artifact_root` = `args.repo`; `scan_roots` = `args.repo`
+/// plus each config-declared root (deduplicated). The repo root stays
+/// in scan_roots so root-level manifests (`.github/workflows/`) are
+/// still discovered.
 #[derive(Debug, Clone)]
 struct ProjectScope {
-    repo_root: PathBuf,
+    /// Where `.assay/` is written and where git operations anchor.
+    artifact_root: PathBuf,
+    /// Every directory to scan for ecosystem manifests. Always
+    /// non-empty.
+    scan_roots: Vec<PathBuf>,
     ecosystem_restriction: Option<EcosystemSelector>,
 }
 
 impl ProjectScope {
-    fn resolve(args: &AnalyzeArgs) -> Result<Self> {
-        let Some(path) = args.project.as_deref() else {
+    fn resolve(args: &AnalyzeArgs, config: &crate::config::AssayConfig) -> Result<Self> {
+        if let Some(path) = args.project.as_deref() {
+            if !path.exists() {
+                return Err(Error::other(format!(
+                    "--project path `{}` does not exist",
+                    path.display()
+                )));
+            }
+            if path.is_dir() {
+                let root = path.to_path_buf();
+                return Ok(ProjectScope {
+                    artifact_root: root.clone(),
+                    scan_roots: vec![root],
+                    ecosystem_restriction: None,
+                });
+            }
+            let (eco, repo_root) = infer_project_scope_from_manifest(path).ok_or_else(|| {
+                Error::other(format!(
+                    "--project file `{}` is not a recognized manifest. \
+                     Supported: Cargo.toml (cargo), .github/workflows/*.yml (github-actions).",
+                    path.display()
+                ))
+            })?;
             return Ok(ProjectScope {
-                repo_root: args.repo.clone(),
-                ecosystem_restriction: None,
-            });
-        };
-        if !path.exists() {
-            return Err(Error::other(format!(
-                "--project path `{}` does not exist",
-                path.display()
-            )));
-        }
-        if path.is_dir() {
-            return Ok(ProjectScope {
-                repo_root: path.to_path_buf(),
-                ecosystem_restriction: None,
+                artifact_root: repo_root.clone(),
+                scan_roots: vec![repo_root],
+                ecosystem_restriction: Some(eco),
             });
         }
-        // path is a file — infer ecosystem and repo root.
-        let (eco, repo_root) = infer_project_scope_from_manifest(path).ok_or_else(|| {
-            Error::other(format!(
-                "--project file `{}` is not a recognized manifest. \
-                 Supported: Cargo.toml (cargo), .github/workflows/*.yml (github-actions).",
-                path.display()
-            ))
-        })?;
+        // No --project: artifact root = --repo. scan_roots = repo + any
+        // config-declared roots (resolved relative to repo). Repo root
+        // is ALWAYS scanned so root-level manifests like
+        // `.github/workflows/` aren't missed when the config lists
+        // subdirectory roots.
+        let artifact_root = args.repo.clone();
+        let mut scan_roots: Vec<PathBuf> = vec![artifact_root.clone()];
+        for cfg_root in &config.project.roots {
+            let resolved = if cfg_root.is_absolute() {
+                cfg_root.clone()
+            } else {
+                artifact_root.join(cfg_root)
+            };
+            if !scan_roots.iter().any(|p| same_path(p, &resolved)) {
+                scan_roots.push(resolved);
+            }
+        }
         Ok(ProjectScope {
-            repo_root,
-            ecosystem_restriction: Some(eco),
+            artifact_root,
+            scan_roots,
+            ecosystem_restriction: None,
         })
     }
+}
+
+/// Lexical-or-canonical path equivalence. Used by scan_roots dedupe
+/// where two entries might refer to the same directory by different
+/// strings (`.` vs absolute, `./src-tauri` vs `src-tauri`, etc.).
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Path from `base` to `target` when target lives under base. Returns
+/// `None` when they're equivalent (no prefix needed) or when target
+/// isn't under base. Used by the apply-local commit path to convert
+/// scan_root-relative modified paths into artifact_root-relative paths
+/// for `git add`.
+fn relative_prefix(base: &Path, target: &Path) -> Option<PathBuf> {
+    if same_path(base, target) {
+        return None;
+    }
+    // Try lexical first (cheap, handles the common `--repo .` shape).
+    if let Ok(stripped) = target.strip_prefix(base) {
+        return Some(stripped.to_path_buf());
+    }
+    // Canonicalize and retry — handles `./src-tauri` vs absolute, etc.
+    let base_canon = base.canonicalize().ok()?;
+    let target_canon = target.canonicalize().ok()?;
+    target_canon
+        .strip_prefix(&base_canon)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 /// Infer (ecosystem, repo_root) from a manifest file path.
@@ -2199,16 +2362,35 @@ fn ecosystem_enabled(args: &AnalyzeArgs, ecosystem: &dyn DependencyEcosystem) ->
     )
 }
 
-fn report_text(name: &str, manifests: &[Manifest]) {
-    println!("[{name}] manifests detected: {}", manifests.len());
+fn report_text(name: &str, scan_root_rel: Option<&Path>, manifests: &[Manifest]) {
+    // Suppress (ecosystem, scan_root) pairs with no manifests — they're
+    // dominant in multi-root layouts (cargo in `ui`, npm in `src-tauri`,
+    // etc.) and add noise without signal.
+    if manifests.is_empty() {
+        return;
+    }
+    match scan_root_rel {
+        Some(rel) if !rel.as_os_str().is_empty() => {
+            println!(
+                "[{name}] {}: {} manifest(s)",
+                rel.display(),
+                manifests.len()
+            );
+        }
+        _ => println!("[{name}] manifests detected: {}", manifests.len()),
+    }
     for manifest in manifests {
         println!("  - {}", manifest.path.display());
     }
 }
 
-fn report_json(name: &str, manifests: &[Manifest]) -> Result<()> {
+fn report_json(name: &str, scan_root_rel: Option<&Path>, manifests: &[Manifest]) -> Result<()> {
+    if manifests.is_empty() {
+        return Ok(());
+    }
     let payload = serde_json::json!({
         "ecosystem": name,
+        "scan_root": scan_root_rel.map(|p| p.display().to_string()),
         "manifests": manifests,
     });
     println!(
@@ -2264,6 +2446,7 @@ mod tests {
                     duration_ms: 1234,
                 }],
             },
+            scan_root: std::path::PathBuf::new(),
         }
     }
 
@@ -2294,6 +2477,7 @@ mod tests {
                 notes: vec![],
                 failure_details: vec![],
             },
+            scan_root: std::path::PathBuf::new(),
         }
     }
 
@@ -2630,6 +2814,7 @@ mod tests {
                 notes: vec![],
                 failure_details: vec![],
             },
+            scan_root: std::path::PathBuf::new(),
         };
         let runs = vec![green_run("a"), unvalidated];
         assert!(format_red_proposal_section(&runs, &[]).is_none());
@@ -2722,7 +2907,8 @@ mod tests {
             ],
         );
 
-        let tree = prepare_apply_local_tree(repo, "assay-test-run", "Cargo Serde/1.0.215").unwrap();
+        let tree =
+            prepare_apply_local_tree(repo, repo, "assay-test-run", "Cargo Serde/1.0.215").unwrap();
 
         assert!(tree.starts_with(repo.join(".assay").join("runs")));
         assert_ne!(tree, repo);
@@ -2830,8 +3016,10 @@ mod tests {
             project: Some(tmp.path().to_path_buf()),
             ..default_test_args()
         };
-        let scope = ProjectScope::resolve(&args).expect("directory project resolves");
-        assert_eq!(scope.repo_root, tmp.path());
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("directory project resolves");
+        assert_eq!(scope.artifact_root, tmp.path());
+        assert_eq!(scope.scan_roots, vec![tmp.path().to_path_buf()]);
         assert!(scope.ecosystem_restriction.is_none());
     }
 
@@ -2845,8 +3033,10 @@ mod tests {
             project: Some(manifest.clone()),
             ..default_test_args()
         };
-        let scope = ProjectScope::resolve(&args).expect("Cargo.toml resolves");
-        assert_eq!(scope.repo_root, tmp.path());
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("Cargo.toml resolves");
+        assert_eq!(scope.artifact_root, tmp.path());
+        assert_eq!(scope.scan_roots, vec![tmp.path().to_path_buf()]);
         assert_eq!(scope.ecosystem_restriction, Some(EcosystemSelector::Cargo));
     }
 
@@ -2862,8 +3052,9 @@ mod tests {
             project: Some(workflow),
             ..default_test_args()
         };
-        let scope = ProjectScope::resolve(&args).expect("workflow yaml resolves");
-        assert_eq!(scope.repo_root, tmp.path());
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("workflow yaml resolves");
+        assert_eq!(scope.artifact_root, tmp.path());
         assert_eq!(
             scope.ecosystem_restriction,
             Some(EcosystemSelector::GithubActions)
@@ -2886,8 +3077,9 @@ mod tests {
             project: Some(action_file),
             ..default_test_args()
         };
-        let scope = ProjectScope::resolve(&args).expect("composite action resolves");
-        assert_eq!(scope.repo_root, tmp.path());
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("composite action resolves");
+        assert_eq!(scope.artifact_root, tmp.path());
         assert_eq!(
             scope.ecosystem_restriction,
             Some(EcosystemSelector::GithubActions)
@@ -2904,7 +3096,9 @@ mod tests {
             project: Some(weird),
             ..default_test_args()
         };
-        let err = ProjectScope::resolve(&args).expect_err("unrecognized manifest must fail");
+        let config = crate::config::AssayConfig::default();
+        let err =
+            ProjectScope::resolve(&args, &config).expect_err("unrecognized manifest must fail");
         assert!(
             err.to_string().contains("not a recognized manifest"),
             "error should explain: {err}"
@@ -2920,8 +3114,87 @@ mod tests {
             )),
             ..default_test_args()
         };
-        let err = ProjectScope::resolve(&args).expect_err("missing path must fail");
+        let config = crate::config::AssayConfig::default();
+        let err = ProjectScope::resolve(&args, &config).expect_err("missing path must fail");
         assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn project_scope_defaults_to_single_repo_root_when_no_project_and_no_config_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = AnalyzeArgs {
+            repo: tmp.path().to_path_buf(),
+            project: None,
+            ..default_test_args()
+        };
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("default resolves");
+        assert_eq!(scope.artifact_root, tmp.path());
+        assert_eq!(scope.scan_roots, vec![tmp.path().to_path_buf()]);
+        assert!(scope.ecosystem_restriction.is_none());
+    }
+
+    #[test]
+    fn project_scope_appends_config_roots_resolved_against_repo() {
+        // Tauri-style polyglot: config declares two sub-project roots.
+        // Repo root stays in scan_roots so `.github/workflows/` is
+        // still discovered alongside the per-sub-project manifests.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src-tauri")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ui")).unwrap();
+        let args = AnalyzeArgs {
+            repo: tmp.path().to_path_buf(),
+            project: None,
+            ..default_test_args()
+        };
+        let mut config = crate::config::AssayConfig::default();
+        config.project.roots = vec![PathBuf::from("src-tauri"), PathBuf::from("ui")];
+        let scope = ProjectScope::resolve(&args, &config).expect("multi-root resolves");
+        assert_eq!(scope.artifact_root, tmp.path());
+        assert_eq!(
+            scope.scan_roots,
+            vec![
+                tmp.path().to_path_buf(),
+                tmp.path().join("src-tauri"),
+                tmp.path().join("ui"),
+            ],
+        );
+        assert!(scope.ecosystem_restriction.is_none());
+    }
+
+    #[test]
+    fn project_scope_dedupes_config_roots_that_match_repo() {
+        // Operator declares `.` as a root — same as repo root. Dedupe.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = AnalyzeArgs {
+            repo: tmp.path().to_path_buf(),
+            project: None,
+            ..default_test_args()
+        };
+        let mut config = crate::config::AssayConfig::default();
+        config.project.roots = vec![PathBuf::from(".")];
+        let scope = ProjectScope::resolve(&args, &config).expect("dedupe resolves");
+        assert_eq!(scope.scan_roots.len(), 1, "got: {:?}", scope.scan_roots);
+    }
+
+    #[test]
+    fn project_scope_project_flag_overrides_config_roots() {
+        // `--project` is the explicit "single sub-project" mode. Config
+        // roots are NOT applied — operator gave a precise scope.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("only-this");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src-tauri")).unwrap();
+        let args = AnalyzeArgs {
+            repo: tmp.path().to_path_buf(),
+            project: Some(target.clone()),
+            ..default_test_args()
+        };
+        let mut config = crate::config::AssayConfig::default();
+        config.project.roots = vec![PathBuf::from("src-tauri")];
+        let scope = ProjectScope::resolve(&args, &config).expect("project flag wins");
+        assert_eq!(scope.artifact_root, target);
+        assert_eq!(scope.scan_roots, vec![target]);
     }
 
     /// Default AnalyzeArgs for tests that only care about a few fields.
@@ -3274,6 +3547,7 @@ mod tests {
             proposal: sample_cargo_proposal_for_apply(),
             sandbox: sandbox.to_path_buf(),
             outcome: sample_outcome("success"),
+            scan_root: repo.to_path_buf(),
         }];
         let mut provenance = crate::model::Provenance::default();
 
@@ -3353,6 +3627,7 @@ mod tests {
                 proposal: sample_cargo_proposal_for_apply(),
                 sandbox: sandbox_tmp.path().to_path_buf(),
                 outcome: sample_outcome("success"),
+                scan_root: std::path::PathBuf::new(),
             },
             ProposalRun {
                 eco_idx: 0,
@@ -3362,6 +3637,7 @@ mod tests {
                 },
                 sandbox: sandbox_tmp.path().to_path_buf(),
                 outcome: sample_outcome("failure"),
+                scan_root: std::path::PathBuf::new(),
             },
         ];
         let mut provenance = crate::model::Provenance::default();
@@ -3514,6 +3790,7 @@ mod tests {
             proposal: sample_cargo_proposal_for_apply(),
             sandbox: sandbox.path().to_path_buf(),
             outcome: sample_outcome("success"),
+            scan_root: std::path::PathBuf::new(),
         }];
         let mut provenance = crate::model::Provenance::default();
         let backend = MockPrBackend {
@@ -3575,6 +3852,7 @@ mod tests {
             proposal: sample_cargo_proposal_for_apply(),
             sandbox: sandbox.path().to_path_buf(),
             outcome: sample_outcome("failure"),
+            scan_root: std::path::PathBuf::new(),
         }];
         let mut provenance = crate::model::Provenance::default();
         let backend = MockPrBackend {
@@ -3643,6 +3921,7 @@ mod tests {
             proposal: sample_cargo_proposal_for_apply(),
             sandbox: sandbox.path().to_path_buf(),
             outcome: sample_outcome("success"),
+            scan_root: std::path::PathBuf::new(),
         }];
         let mut provenance = crate::model::Provenance::default();
         let backend = MockPrBackend {
@@ -3715,6 +3994,7 @@ mod tests {
                     },
                     sandbox: sandbox.to_path_buf(),
                     outcome: sample_outcome("success"),
+                    scan_root: repo.to_path_buf(),
                 },
                 ProposalRun {
                     eco_idx: 0,
@@ -3727,6 +4007,7 @@ mod tests {
                     },
                     sandbox: sandbox.to_path_buf(),
                     outcome: sample_outcome("success"),
+                    scan_root: repo.to_path_buf(),
                 },
                 ProposalRun {
                     eco_idx: 0,
@@ -3739,6 +4020,7 @@ mod tests {
                     },
                     sandbox: sandbox.to_path_buf(),
                     outcome: sample_outcome("success"),
+                    scan_root: repo.to_path_buf(),
                 },
             ];
             let mut provenance = crate::model::Provenance::default();
