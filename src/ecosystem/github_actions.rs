@@ -618,7 +618,13 @@ fn truncate_tag(tag: &str, target_segments: usize) -> Option<String> {
 /// Classify the upgrade tier of a `from-tag` → `to-tag` action bump.
 ///
 /// Mirrors cargo / npm's caret-compat groups:
-/// - Both parseable, same major → Compatible.
+/// - Both parseable, same major, target's pin shape is at least as
+///   specific as the source → Compatible.
+/// - Both parseable, target's pin shape LOOSER than source (full
+///   `X.Y.Z` → major-only `X` etc.) → Breaking. The pin loosening
+///   gives up supply-chain immutability and the operator should
+///   review even when the major matches (dogfood-tour-2026-05-19
+///   finding C).
 /// - Both parseable, different major → Breaking.
 /// - `from-tag` unknown (no `# vN.N.N` comment in the workflow) → Breaking,
 ///   conservatively. Caller may downgrade later when we add release-notes
@@ -635,11 +641,42 @@ pub(crate) fn classify_action_bump(from_tag: Option<&str>, to_tag: &str) -> Bump
     let Some(to_v) = parse_action_tag(to_tag) else {
         return BumpTier::Breaking;
     };
-    if from_v.major == to_v.major {
-        BumpTier::Compatible
-    } else {
-        BumpTier::Breaking
+    if from_v.major != to_v.major {
+        return BumpTier::Breaking;
     }
+    // Same major, both parseable. Detect ref-shape loosening — moving
+    // from a fully-specified `X.Y.Z` (immutable) to a major-only `X`
+    // (floating; whoever owns the action can rebase the tag at any
+    // time). Loosening a pin is a supply-chain regression even when
+    // the version line matches, so we surface it as Breaking.
+    if tag_specificity(from_tag) > tag_specificity(to_tag) {
+        return BumpTier::Breaking;
+    }
+    BumpTier::Compatible
+}
+
+/// Returns 1 for major-only tags (`v1`), 2 for `vX.Y`, 3 for `vX.Y.Z`.
+/// Falls back to 0 for anything else — those route to the `parse_action_tag`
+/// caller's None/error path before reaching this function.
+fn tag_specificity(tag: &str) -> u8 {
+    let stripped = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    let core = stripped
+        .split(|c: char| c == '-' || c == '+')
+        .next()
+        .unwrap_or(stripped);
+    let segments: Vec<&str> = core.split('.').collect();
+    let mut count = 0u8;
+    for seg in segments {
+        if seg.parse::<u64>().is_ok() {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 /// Known shortcut refs that aren't version tags. Used by the proposer
@@ -1604,6 +1641,45 @@ jobs:
         // No `# vN.N.N` comment → conservatively Breaking. The operator
         // sees the bump in the report and decides whether to ship.
         assert_eq!(classify_action_bump(None, "v4.2.0"), BumpTier::Breaking);
+    }
+
+    #[test]
+    fn classify_pin_loosening_is_breaking() {
+        // Moving from immutable `1.85.0` to floating `v1` is the
+        // supply-chain regression observed in the
+        // dogfood-tour-2026-05-19 finding C. Same major, but the
+        // target is broader — surface as Breaking so the operator
+        // reviews instead of silently accepting it.
+        assert_eq!(
+            classify_action_bump(Some("1.85.0"), "v1"),
+            BumpTier::Breaking
+        );
+        assert_eq!(
+            classify_action_bump(Some("v3.4.2"), "v3"),
+            BumpTier::Breaking
+        );
+        // Tighter pin shapes (X.Y.Z → X.Y.W same major) stay
+        // Compatible — only LOOSENING is flagged.
+        assert_eq!(
+            classify_action_bump(Some("v1.0.0"), "v1.0.1"),
+            BumpTier::Compatible
+        );
+        // Tightening (rare) stays Compatible.
+        assert_eq!(
+            classify_action_bump(Some("v1"), "v1.2.0"),
+            BumpTier::Compatible
+        );
+    }
+
+    #[test]
+    fn tag_specificity_counts_numeric_segments() {
+        assert_eq!(tag_specificity("v1.2.3"), 3);
+        assert_eq!(tag_specificity("1.2.3"), 3);
+        assert_eq!(tag_specificity("v1.2"), 2);
+        assert_eq!(tag_specificity("v1"), 1);
+        assert_eq!(tag_specificity("V1"), 1);
+        assert_eq!(tag_specificity("v1.2.3-alpha"), 3);
+        assert_eq!(tag_specificity("v1.2.3+spec"), 3);
     }
 
     #[test]
