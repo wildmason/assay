@@ -718,10 +718,13 @@ pub fn apply_cargo_update_to_tree(tree_path: &Path) -> Result<()> {
 /// keeps the cross-check available for callers that *do* have an
 /// after-lockfile to compare.
 fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<Vec<Proposal>> {
-    let manifest_path = repo.join("Cargo.toml");
-    let manifest_str = manifest_path
-        .to_str()
-        .ok_or_else(|| Error::other("Cargo.toml path is not valid UTF-8"))?;
+    // `--manifest-path Cargo.toml` is resolved against the subprocess
+    // CWD (which we set to `repo` below). Passing `repo.join("Cargo.toml")`
+    // here would double up the path when `repo` is itself relative —
+    // e.g. polyglot Tauri scan_root `src-tauri/` + manifest-path
+    // `src-tauri/Cargo.toml` = `src-tauri/src-tauri/Cargo.toml`, which
+    // cargo correctly reports as nonexistent.
+    let manifest_str = "Cargo.toml";
     // `--verbose` is what surfaces the `Unchanged X v$OLD (available: v$NEW)`
     // lines we need for the Compatible / Breaking tiers. Without it, cargo
     // prints only a `note: pass --verbose to see N unchanged…` hint and the
