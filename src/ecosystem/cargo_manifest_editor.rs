@@ -197,7 +197,8 @@ fn edit_entry(
             let Value::String(s) = v else { unreachable!() };
             let previous = s.value().to_string();
             let decor = s.decor().clone();
-            let mut new_val = Value::from(new_version);
+            let replacement = preserve_constraint_prefix(&previous, new_version);
+            let mut new_val = Value::from(replacement);
             *new_val.decor_mut() = decor;
             *v = new_val;
             Ok(Some(EditOutcome {
@@ -227,7 +228,8 @@ fn edit_entry(
             };
             let previous = s.value().to_string();
             let decor = s.decor().clone();
-            let mut new_val = Value::from(new_version);
+            let replacement = preserve_constraint_prefix(&previous, new_version);
+            let mut new_val = Value::from(replacement);
             *new_val.decor_mut() = decor;
             *version_entry = new_val;
             Ok(Some(EditOutcome {
@@ -268,7 +270,8 @@ fn edit_full_table_entry(
     };
     let previous = s.value().to_string();
     let decor = s.decor().clone();
-    let mut new_val = Value::from(new_version);
+    let replacement = preserve_constraint_prefix(&previous, new_version);
+    let mut new_val = Value::from(replacement);
     *new_val.decor_mut() = decor;
     *val = new_val;
     Ok(Some(EditOutcome {
@@ -276,6 +279,40 @@ fn edit_full_table_entry(
         previous,
         changed: true,
     }))
+}
+
+/// Re-apply the original constraint operator (if any) onto `new_version`.
+///
+/// Cargo accepts these operator prefixes on a SemVer requirement:
+/// `=`, `^`, `~`, `>`, `<`, `>=`, `<=`. Whitespace between operator
+/// and version is allowed (`"= 1.0.0"` is valid). When the manifest
+/// uses one of these, the user has made a deliberate choice — most
+/// commonly `=` for exact-pin — that the editor must not silently
+/// drop. Otherwise a bump from `"= 0.1.0-beta.1"` to `"0.1.0-beta.3"`
+/// widens the constraint from "exactly this version" to "default
+/// caret," which is a semantically different requirement.
+///
+/// Multi-requirement specs (`">=1.0, <2.0"`) and wildcards (`"*"`) are
+/// opaque — half-rewriting them is worse than collapsing them to a
+/// concrete bare version, so we fall back to verbatim replacement and
+/// trust the user to audit the diff.
+fn preserve_constraint_prefix(existing: &str, new_version: &str) -> String {
+    if existing.contains(',') {
+        return new_version.to_string();
+    }
+    let prefix_len = existing
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or(existing.len());
+    let prefix = &existing[..prefix_len];
+    let is_operator_prefix = !prefix.is_empty()
+        && prefix
+            .chars()
+            .all(|c| matches!(c, '=' | '~' | '^' | '>' | '<') || c.is_whitespace())
+        && prefix.chars().any(|c| !c.is_whitespace());
+    if !is_operator_prefix {
+        return new_version.to_string();
+    }
+    format!("{prefix}{new_version}")
 }
 
 /// Walk every Cargo.toml in `workspace_root` (the root manifest + each
@@ -754,5 +791,166 @@ serde = "1.0"
             matches!(err, Error::InvalidManifest { .. }),
             "expected InvalidManifest, got {err:?}",
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Constraint-prefix preservation.
+    //
+    // Real-world case caught by the tokio dogfood (2026-05-19):
+    // `tokio/Cargo.toml` declares `tracing-mock = "= 0.1.0-beta.1"` under
+    // `[target.'cfg(all(tokio_unstable, target_has_atomic = "64"))'.dev-dependencies]`.
+    // The `= ` exact-pin operator is load-bearing — the user explicitly
+    // does NOT want minor/patch drift. Pre-fix the editor replaced the
+    // value verbatim and silently dropped the `=`, widening the
+    // constraint from "exactly this version" to "default caret".
+    //
+    // The same class of bug applies to all prefix operators cargo
+    // accepts: `=`, `~`, `^`, `>`, `<`, `>=`, `<=`. Multi-requirement
+    // specs like `">=1, <2"` are opaque to us — we replace verbatim
+    // rather than risk half-rewriting one half of the constraint.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn preserves_exact_pin_prefix_on_bare_string() {
+        let toml = r#"[dependencies]
+tracing-mock = "= 0.1.0-beta.1"
+"#;
+        let (out, outcome) = update_constraint(toml, "tracing-mock", "0.1.0-beta.3")
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.contains(r#"tracing-mock = "= 0.1.0-beta.3""#),
+            "exact-pin `= ` prefix must survive: {out}"
+        );
+        assert_eq!(outcome.previous, "= 0.1.0-beta.1");
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn preserves_tilde_prefix_on_bare_string() {
+        let toml = r#"[dependencies]
+foo = "~1.2"
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"foo = "~1.5.2""#),
+            "tilde prefix must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn preserves_caret_prefix_on_bare_string() {
+        let toml = r#"[dependencies]
+foo = "^1.0"
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"foo = "^1.5.2""#),
+            "explicit caret prefix must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn preserves_gte_prefix_on_bare_string() {
+        let toml = r#"[dependencies]
+foo = ">=1.0"
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"foo = ">=1.5.2""#),
+            ">= prefix must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn preserves_exact_pin_prefix_on_inline_table_version() {
+        let toml = r#"[dependencies]
+foo = { version = "= 1.0", features = ["x"] }
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"version = "= 1.5.2""#),
+            "inline-table exact-pin must survive: {out}"
+        );
+        assert!(out.contains(r#"features = ["x"]"#));
+    }
+
+    #[test]
+    fn preserves_exact_pin_prefix_on_full_table_version() {
+        let toml = r#"[dependencies.foo]
+version = "= 1.0"
+features = ["x"]
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"version = "= 1.5.2""#),
+            "full-table exact-pin must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_verbatim_for_multi_requirement_constraint() {
+        // `">=1, <2"` is two comma-separated constraints. Half-rewriting
+        // one half is worse than replacing the whole string with the
+        // resolved bare version — the user can audit the diff.
+        let toml = r#"[dependencies]
+foo = ">=1, <2"
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"foo = "1.5.2""#),
+            "multi-requirement must collapse to bare: {out}"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_verbatim_for_wildcard_constraint() {
+        // `"*"` (any version) carries no operator we can preserve onto a
+        // concrete version. Replace verbatim — the bump pins it.
+        let toml = r#"[dependencies]
+foo = "*"
+"#;
+        let (out, _) = update_constraint(toml, "foo", "1.5.2").unwrap().unwrap();
+        assert!(
+            out.contains(r#"foo = "1.5.2""#),
+            "wildcard must collapse to bare: {out}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Dotted-header dep declaration.
+    //
+    // Real-world case caught by the tokio dogfood (2026-05-19):
+    // `tokio/Cargo.toml` declares
+    //   [target.'cfg(windows)'.dependencies.windows-sys]
+    //   version = "0.61"
+    //   optional = true
+    // The dep entry IS the table header — `windows-sys` is the final
+    // segment of the dotted path, not a child key under
+    // `[target.'cfg(windows)'.dependencies]`. The editor walks to
+    // `["target", cfg, "dependencies"]` and iterates the children, so
+    // `windows-sys` shows up as an `Item::Table` and is handled by the
+    // existing full-table path — but we lacked a regression test for
+    // this real-world shape until the dogfood surfaced it.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn edits_dotted_header_target_cfg_dep_entry() {
+        let toml = r#"[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+optional = true
+"#;
+        let (out, outcome) = update_constraint(toml, "windows-sys", "0.62.0")
+            .unwrap()
+            .unwrap();
+        assert!(
+            out.contains(r#"version = "0.62.0""#),
+            "dotted-header dep version must update: {out}"
+        );
+        assert!(
+            out.contains("optional = true"),
+            "sibling fields must survive: {out}"
+        );
+        assert!(outcome.changed);
     }
 }
