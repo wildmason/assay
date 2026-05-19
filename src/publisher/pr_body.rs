@@ -125,6 +125,7 @@ mod tests {
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -137,6 +138,9 @@ mod tests {
             classification,
             notes: vec![],
             failure_details: vec![],
+            cached_workflow_count: 0,
+            total_workflow_count: 0,
+            member_skipped_workflow_count: 0,
         }
     }
 
@@ -223,6 +227,9 @@ mod tests {
             classification: Classification::Stubbed,
             notes: vec!["no affected workflow identified".into()],
             failure_details: vec![],
+            cached_workflow_count: 0,
+            total_workflow_count: 0,
+            member_skipped_workflow_count: 0,
         };
         let body = render_pr_body(&sample_proposal(), &outcome, &sample_ctx());
         assert!(body.contains("No ci-forge run was recorded"));

@@ -189,6 +189,10 @@ pub struct WorkerContext<'a> {
     /// Mutex around `git worktree add` (and any other git-mutating
     /// preflight). Workers must `git_mutex.lock()` around those calls.
     pub git_mutex: &'a Mutex<()>,
+    /// When `true`, the worker filters gate workflows by workspace-
+    /// member precision before invoking the validator (`--member-gate`
+    /// CLI flag).
+    pub member_gate: bool,
 }
 
 #[cfg(test)]
@@ -277,6 +281,7 @@ mod tests {
         let ctx = WorkerContext {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
+            member_gate: false,
         };
         let pool = WorkerPool {
             threads: 4,
@@ -302,6 +307,7 @@ mod tests {
         let ctx = WorkerContext {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
+            member_gate: false,
         };
         let pool = WorkerPool {
             threads: 8,
@@ -320,6 +326,7 @@ mod tests {
         let ctx = WorkerContext {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
+            member_gate: false,
         };
         let pool = WorkerPool {
             threads: 1,
@@ -345,6 +352,7 @@ mod tests {
         let ctx = WorkerContext {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
+            member_gate: false,
         };
         let pool = WorkerPool {
             threads: 4,
@@ -368,6 +376,7 @@ mod tests {
         let ctx = WorkerContext {
             semaphores: vec![("cargo", cargo_sem.clone())],
             git_mutex: &Mutex::new(()),
+            member_gate: false,
         };
         let pool = WorkerPool {
             threads: 4,
@@ -409,6 +418,7 @@ mod tests {
         let ctx = WorkerContext {
             semaphores: vec![("cargo", cargo_sem.clone())],
             git_mutex: &Mutex::new(()),
+            member_gate: false,
         };
         let pool = WorkerPool {
             threads: 4,

@@ -15,12 +15,56 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::model::{Classification, Proposal, ValidationOutcome};
 use crate::process_runner::{RunResult, run_with_timeout};
+#[cfg(test)]
+use crate::verdict_cache::DEFAULT_CACHE_TTL;
+use crate::verdict_cache::{
+    CACHE_SCHEMA_VERSION, CacheEntry, CacheKey, CacheKeyInputs, CachedInputs, CachedVerdict,
+    VerdictCache, fingerprint_commands, fingerprint_file, fingerprint_workspace_files,
+};
 use crate::workflow_filter::WorkflowFilter;
+
+/// Event label baked into cache keys for workflow-bound backends. The
+/// validator currently always runs with `--event push`; if that ever
+/// becomes configurable, the event used here MUST match the event the
+/// backend uses, or cache keys will diverge from execution semantics.
+const VALIDATOR_EVENT: &str = "push";
+
+/// Event sentinel for tree-mode backends. Tree-mode runs the backend's
+/// own command sequence against the prepared tree, so "event" is a
+/// degenerate dimension — but the key still needs a value distinct from
+/// the workflow-bound `push` so a tree-mode entry can't collide with a
+/// forge-run entry that happens to share fingerprints.
+const TREE_MODE_EVENT: &str = "<tree-mode>";
+
+/// Set of canonical manifest + lockfile filenames hashed into the
+/// workspace fingerprint. A change to any of these produces a different
+/// cache key. Missing files contribute a stable "missing" marker so
+/// adding or removing a lockfile is also detected.
+const WORKSPACE_FINGERPRINT_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+];
+
+/// Compute the workspace fingerprint for the prepared `workspace`
+/// directory. Hashes the canonical manifest + lockfile set; missing
+/// files contribute a stable "missing" marker.
+fn compute_workspace_fingerprint(workspace: &Path) -> String {
+    let paths: Vec<PathBuf> = WORKSPACE_FINGERPRINT_FILES
+        .iter()
+        .map(|name| workspace.join(name))
+        .collect();
+    let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    fingerprint_workspace_files(&refs)
+}
 
 // =============================================================================
 // Executor and outcome types
@@ -87,6 +131,11 @@ pub struct WorkflowOutcome {
     /// diagnosis. Full logs are at `log_path`.
     pub stderr_tail: String,
     pub log_path: PathBuf,
+    /// `Some(unix_secs)` when this outcome was served from the verdict
+    /// cache rather than freshly executed. The report renders cached
+    /// outcomes with a distinct tag so operators can distinguish
+    /// cache reuse from real CI runs.
+    pub cached_at_unix_secs: Option<u64>,
 }
 
 // =============================================================================
@@ -133,6 +182,16 @@ pub trait ValidatorBackend: Send + Sync {
     /// override.
     fn needs_workflow_file(&self) -> bool {
         true
+    }
+
+    /// Identity string mixed into the verdict cache key. Workflow-bound
+    /// backends (`ForgeRunBackend`) can return just `name()` because the
+    /// workflow file content is fingerprinted separately. Tree-mode
+    /// backends (`BuildTestBackend`, `CustomBackend`) MUST override
+    /// to include their command list so two backends with the same
+    /// name but different commands produce distinct cache keys.
+    fn fingerprint(&self) -> String {
+        self.name().to_string()
     }
 }
 
@@ -207,6 +266,7 @@ impl ForgeRunBackend {
             duration_ms,
             stderr_tail,
             log_path: log_path.to_path_buf(),
+            cached_at_unix_secs: None,
         }
     }
 }
@@ -263,6 +323,7 @@ impl ValidatorBackend for ForgeRunBackend {
                 duration_ms: duration.as_millis(),
                 stderr_tail: stderr_tail(&stderr, 4096),
                 log_path: log_path.to_path_buf(),
+                cached_at_unix_secs: None,
             }),
         }
     }
@@ -484,6 +545,7 @@ impl BuildTestBackend {
                             duration_ms,
                             stderr_tail: stderr_tail_str,
                             log_path: log_path.to_path_buf(),
+                            cached_at_unix_secs: None,
                         };
                     }
                 }
@@ -497,6 +559,7 @@ impl BuildTestBackend {
                         duration_ms,
                         stderr_tail: stderr_tail(&stderr_str, 4096),
                         log_path: log_path.to_path_buf(),
+                        cached_at_unix_secs: None,
                     };
                 }
                 BuildTestStepOutcome::SpawnFailed { error } => {
@@ -514,6 +577,7 @@ impl BuildTestBackend {
                         duration_ms,
                         stderr_tail: String::new(),
                         log_path: log_path.to_path_buf(),
+                        cached_at_unix_secs: None,
                     };
                 }
             }
@@ -526,6 +590,7 @@ impl BuildTestBackend {
             duration_ms,
             stderr_tail: String::new(),
             log_path: log_path.to_path_buf(),
+            cached_at_unix_secs: None,
         }
     }
 }
@@ -539,6 +604,10 @@ impl ValidatorBackend for BuildTestBackend {
         // We validate by running `cargo build` + `cargo test` against
         // the prepared tree — no .github/workflows/*.yml required.
         false
+    }
+
+    fn fingerprint(&self) -> String {
+        format!("{}:{}", self.label, fingerprint_commands(&self.commands))
     }
 
     fn validate_workflow(
@@ -612,6 +681,7 @@ impl ValidatorBackend for BuildTestBackend {
                         duration_ms: started.elapsed().as_millis(),
                         stderr_tail: stderr_tail(&stderr_combined, 4096),
                         log_path: log_path.to_path_buf(),
+                        cached_at_unix_secs: None,
                     });
                 }
                 break;
@@ -758,6 +828,7 @@ impl CustomBackend {
                     duration_ms,
                     stderr_tail: stderr_tail(&stderr_str, 4096),
                     log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
                 }
             }
             Ok(RunResult::Completed { status, stderr, .. }) => {
@@ -776,6 +847,7 @@ impl CustomBackend {
                     duration_ms,
                     stderr_tail: stderr_tail(&stderr_str, 4096),
                     log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
                 }
             }
             Ok(RunResult::TimedOut { stderr, .. }) => {
@@ -788,6 +860,7 @@ impl CustomBackend {
                     duration_ms,
                     stderr_tail: stderr_tail(&stderr_str, 4096),
                     log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
                 }
             }
             Err(err) => {
@@ -805,6 +878,7 @@ impl CustomBackend {
                     duration_ms,
                     stderr_tail: String::new(),
                     log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
                 }
             }
         }
@@ -820,6 +894,14 @@ impl ValidatorBackend for CustomBackend {
         // The gate command is operator-supplied and runs against the
         // tree itself. Workflow paths are irrelevant.
         false
+    }
+
+    fn fingerprint(&self) -> String {
+        format!(
+            "{}:{}",
+            self.label,
+            fingerprint_commands(std::slice::from_ref(&self.argv))
+        )
     }
 
     fn validate_workflow(
@@ -840,6 +922,7 @@ impl ValidatorBackend for CustomBackend {
                 duration_ms: 0,
                 stderr_tail: String::new(),
                 log_path: log_path.to_path_buf(),
+                cached_at_unix_secs: None,
             });
         }
         let started = Instant::now();
@@ -888,6 +971,7 @@ pub struct Validator {
     backend: Box<dyn ValidatorBackend>,
     workflow_timeout: Duration,
     workflow_filter: WorkflowFilter,
+    cache: Option<VerdictCache>,
 }
 
 impl Validator {
@@ -908,6 +992,7 @@ impl Validator {
             backend,
             workflow_timeout: DEFAULT_WORKFLOW_TIMEOUT,
             workflow_filter: WorkflowFilter::pull_request_default(),
+            cache: None,
         }
     }
 
@@ -923,6 +1008,16 @@ impl Validator {
     /// whose `on:` block declares `pull_request`).
     pub fn with_workflow_filter(mut self, filter: WorkflowFilter) -> Self {
         self.workflow_filter = filter;
+        self
+    }
+
+    /// Enable the verdict cache. Subsequent calls to
+    /// [`Self::validate`] consult the cache before invoking the backend
+    /// and persist deterministic outcomes (Pass / Regression) for reuse.
+    /// `SetupFailure` and `Timeout` are never cached — those flavors
+    /// depend on the environment and a re-run may legitimately succeed.
+    pub fn with_cache(mut self, cache: VerdictCache) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -1001,6 +1096,9 @@ impl Validator {
                         .to_string(),
                 ],
                 failure_details: Vec::new(),
+                cached_workflow_count: 0,
+                total_workflow_count: 0,
+                member_skipped_workflow_count: 0,
             });
         }
 
@@ -1023,6 +1121,9 @@ impl Validator {
                     dropped.join(", ")
                 )],
                 failure_details: Vec::new(),
+                cached_workflow_count: 0,
+                total_workflow_count: 0,
+                member_skipped_workflow_count: 0,
             });
         }
         let mut filter_notes = Vec::new();
@@ -1052,27 +1153,50 @@ impl Validator {
                 source,
             })?;
 
+        // Workspace fingerprint is computed once and reused across
+        // workflows — the manifest+lockfile state doesn't change while
+        // we iterate the gate workflows of a single proposal.
+        let workspace_fingerprint = if self.cache.is_some() {
+            compute_workspace_fingerprint(workspace)
+        } else {
+            String::new()
+        };
+
         let mut run_ids = Vec::new();
         let mut any_failure = false;
         let mut notes = filter_notes;
         let mut validated = Vec::new();
         let mut failure_details: Vec<crate::model::FailureDetail> = Vec::new();
+        let mut cached_count: usize = 0;
+        let total_count = workflow_paths.len();
 
         for workflow in workflow_paths {
             let stem = workflow_log_stem(workflow);
             let log_path = log_dir.path().join(format!("{stem}.log"));
-            let outcome = self.backend.validate_workflow(
+            let outcome = self.validate_one_workflow(
                 workflow,
                 workspace,
-                self.workflow_timeout,
                 &log_path,
+                &workspace_fingerprint,
+                VALIDATOR_EVENT,
+                Some(workflow),
             )?;
+            if outcome.cached_at_unix_secs.is_some() {
+                cached_count += 1;
+            }
             validated.push(workflow.clone());
             if let Some(id) = &outcome.forge_run_id {
                 run_ids.push(id.clone());
             }
             match &outcome.result {
-                WorkflowResult::Pass => {}
+                WorkflowResult::Pass => {
+                    if let Some(unix_secs) = outcome.cached_at_unix_secs {
+                        notes.push(format!(
+                            "workflow {} served from cache (cached_at_unix_secs={unix_secs})",
+                            workflow.display(),
+                        ));
+                    }
+                }
                 WorkflowResult::Fail(flavor) => {
                     any_failure = true;
                     let (flavor_label, flavor_short) = match flavor {
@@ -1085,8 +1209,12 @@ impl Validator {
                         ),
                         FailureFlavor::Timeout => ("TIMEOUT".to_string(), "TIMEOUT".to_string()),
                     };
+                    let cached_suffix = match outcome.cached_at_unix_secs {
+                        Some(unix_secs) => format!(" [cached @ {unix_secs}]"),
+                        None => String::new(),
+                    };
                     notes.push(format!(
-                        "workflow {} concluded {flavor_label}",
+                        "workflow {} concluded {flavor_label}{cached_suffix}",
                         workflow.display(),
                     ));
                     failure_details.push(crate::model::FailureDetail {
@@ -1114,7 +1242,81 @@ impl Validator {
             classification,
             notes,
             failure_details,
+            cached_workflow_count: cached_count,
+            total_workflow_count: total_count,
+            member_skipped_workflow_count: 0,
         })
+    }
+
+    /// Wrap a single backend invocation with cache lookup + write.
+    /// Returns the outcome with `cached_at_unix_secs` populated when a
+    /// fresh cache entry covered the work.
+    ///
+    /// `workspace_fingerprint` is the precomputed manifest+lockfile
+    /// digest at `workspace`. `event` is the GHA-style event label
+    /// (workflow-bound: `push`; tree-mode: the tree-mode sentinel).
+    /// `workflow_for_fp` is `Some(<file>)` for workflow-bound runs (the
+    /// file is hashed into the cache key) and `None` for tree-mode
+    /// (where the backend's command list is hashed instead).
+    fn validate_one_workflow(
+        &self,
+        workflow: &Path,
+        workspace: &Path,
+        log_path: &Path,
+        workspace_fingerprint: &str,
+        event: &str,
+        workflow_for_fp: Option<&Path>,
+    ) -> Result<WorkflowOutcome> {
+        let cache = match &self.cache {
+            Some(c) => c,
+            None => {
+                return self.backend.validate_workflow(
+                    workflow,
+                    workspace,
+                    self.workflow_timeout,
+                    log_path,
+                );
+            }
+        };
+
+        let workflow_fingerprint = match workflow_for_fp {
+            Some(path) => fingerprint_file(path),
+            None => self.backend.fingerprint(),
+        };
+        let inputs = CacheKeyInputs {
+            workspace_fingerprint,
+            workflow_fingerprint: &workflow_fingerprint,
+            backend_name: self.backend.name(),
+            event,
+            schema_version: CACHE_SCHEMA_VERSION,
+        };
+        let key = CacheKey::compute(&inputs);
+
+        if let Some(entry) = cache.read(&key, SystemTime::now()) {
+            return Ok(rehydrate_outcome_from_cache(
+                workflow,
+                self.backend.name(),
+                log_path,
+                entry,
+            ));
+        }
+
+        let outcome =
+            self.backend
+                .validate_workflow(workflow, workspace, self.workflow_timeout, log_path)?;
+        // Only deterministic verdicts go into the cache. SetupFailure
+        // and Timeout reflect the environment and a re-run may produce
+        // a different result; writing them would lock in transient
+        // breakage.
+        if let Some(entry) = outcome_to_cache_entry(&outcome, &key, &inputs) {
+            if let Err(err) = cache.write(&key, &entry) {
+                eprintln!(
+                    "[verdict-cache] failed to persist entry for `{}`: {err}",
+                    workflow.display()
+                );
+            }
+        }
+        Ok(outcome)
     }
 
     /// Tree-mode dispatch: a backend that doesn't need a workflow file
@@ -1136,16 +1338,35 @@ impl Validator {
         let synthetic = PathBuf::from(format!("<tree:{}>", self.backend.name()));
         let stem = "tree-mode";
         let log_path = log_dir.path().join(format!("{stem}.log"));
-        let outcome = self.backend.validate_workflow(
+        let workspace_fingerprint = if self.cache.is_some() {
+            compute_workspace_fingerprint(workspace)
+        } else {
+            String::new()
+        };
+        let outcome = self.validate_one_workflow(
             &synthetic,
             workspace,
-            self.workflow_timeout,
             &log_path,
+            &workspace_fingerprint,
+            TREE_MODE_EVENT,
+            None,
         )?;
+        let cached_count = if outcome.cached_at_unix_secs.is_some() {
+            1
+        } else {
+            0
+        };
         let mut notes = Vec::new();
         let mut failure_details: Vec<crate::model::FailureDetail> = Vec::new();
         let (classification, conclusion) = match &outcome.result {
-            WorkflowResult::Pass => (Classification::Exact, "success".to_string()),
+            WorkflowResult::Pass => {
+                if let Some(unix_secs) = outcome.cached_at_unix_secs {
+                    notes.push(format!(
+                        "tree-mode validation served from cache (cached_at_unix_secs={unix_secs})"
+                    ));
+                }
+                (Classification::Exact, "success".to_string())
+            }
             WorkflowResult::Fail(flavor) => {
                 let (flavor_label, flavor_short) = match flavor {
                     FailureFlavor::Regression { details } => {
@@ -1157,7 +1378,13 @@ impl Validator {
                     ),
                     FailureFlavor::Timeout => ("TIMEOUT".to_string(), "TIMEOUT".to_string()),
                 };
-                notes.push(format!("tree-mode validation concluded {flavor_label}"));
+                let cached_suffix = match outcome.cached_at_unix_secs {
+                    Some(unix_secs) => format!(" [cached @ {unix_secs}]"),
+                    None => String::new(),
+                };
+                notes.push(format!(
+                    "tree-mode validation concluded {flavor_label}{cached_suffix}"
+                ));
                 failure_details.push(crate::model::FailureDetail {
                     workflow: outcome.workflow.clone(),
                     backend: outcome.backend.to_string(),
@@ -1176,8 +1403,80 @@ impl Validator {
             classification,
             notes,
             failure_details,
+            cached_workflow_count: cached_count,
+            total_workflow_count: 1,
+            member_skipped_workflow_count: 0,
         })
     }
+}
+
+/// Reconstruct a [`WorkflowOutcome`] from a cache entry. The cached
+/// log is not reattached — `log_path` points at the sandbox tempdir
+/// the caller would have written into; we keep that path so receipts
+/// still reference a stable location.
+fn rehydrate_outcome_from_cache(
+    workflow: &Path,
+    backend_name: &'static str,
+    log_path: &Path,
+    entry: CacheEntry,
+) -> WorkflowOutcome {
+    let result = match entry.verdict {
+        CachedVerdict::Pass => WorkflowResult::Pass,
+        CachedVerdict::Regression { details } => {
+            WorkflowResult::Fail(FailureFlavor::Regression { details })
+        }
+    };
+    WorkflowOutcome {
+        workflow: workflow.to_path_buf(),
+        backend: backend_name,
+        result,
+        forge_run_id: entry.forge_run_id,
+        duration_ms: entry.duration_ms,
+        stderr_tail: entry.stderr_tail,
+        log_path: log_path.to_path_buf(),
+        cached_at_unix_secs: Some(entry.cached_at_unix_secs),
+    }
+}
+
+/// Convert a freshly-produced [`WorkflowOutcome`] into a [`CacheEntry`]
+/// suitable for persistence. Returns `None` for non-deterministic
+/// verdicts (`SetupFailure`, `Timeout`) — the call site MUST skip the
+/// write rather than caching an environment-dependent flavor.
+fn outcome_to_cache_entry(
+    outcome: &WorkflowOutcome,
+    key: &CacheKey,
+    inputs: &CacheKeyInputs<'_>,
+) -> Option<CacheEntry> {
+    let verdict = match &outcome.result {
+        WorkflowResult::Pass => CachedVerdict::Pass,
+        WorkflowResult::Fail(FailureFlavor::Regression { details }) => CachedVerdict::Regression {
+            details: details.clone(),
+        },
+        WorkflowResult::Fail(FailureFlavor::SetupFailure { .. } | FailureFlavor::Timeout) => {
+            return None;
+        }
+    };
+    let cached_at_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(CacheEntry {
+        schema_version: CACHE_SCHEMA_VERSION,
+        cache_key: key.as_str().to_string(),
+        verdict,
+        forge_run_id: outcome.forge_run_id.clone(),
+        log_path: Some(outcome.log_path.clone()),
+        duration_ms: outcome.duration_ms,
+        stderr_tail: outcome.stderr_tail.clone(),
+        backend: outcome.backend.to_string(),
+        cached_at_unix_secs,
+        inputs: CachedInputs {
+            workspace_fingerprint: inputs.workspace_fingerprint.to_string(),
+            workflow_fingerprint: inputs.workflow_fingerprint.to_string(),
+            backend_name: inputs.backend_name.to_string(),
+            event: inputs.event.to_string(),
+        },
+    })
 }
 
 /// Filesystem-safe workflow filename stem (extension dropped; non-alnum
@@ -1226,6 +1525,7 @@ mod tests {
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -1554,6 +1854,7 @@ mod tests {
                 duration_ms: self.duration_ms,
                 stderr_tail: self.stderr_tail.clone(),
                 log_path: log_path.to_path_buf(),
+                cached_at_unix_secs: None,
             })
         }
     }
@@ -1695,6 +1996,7 @@ mod tests {
                     duration_ms: 1,
                     stderr_tail: format!("stderr for workflow #{i}"),
                     log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
                 })
             }
         }
@@ -1766,6 +2068,7 @@ mod tests {
                     duration_ms: 999,
                     stderr_tail: "tree-mode cargo check failed".into(),
                     log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
                 })
             }
             fn needs_workflow_file(&self) -> bool {
@@ -2234,5 +2537,361 @@ mod tests {
             }
             Ok(_) => panic!("should fail when no backend applies"),
         }
+    }
+
+    // =========================================================================
+    // Verdict cache integration tests
+    // =========================================================================
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// MockBackend variant that counts how many times `validate_workflow`
+    /// was actually invoked. Lets us prove cache hits short-circuit the
+    /// backend call.
+    struct CountingBackend {
+        result: WorkflowResult,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingBackend {
+        fn new(result: WorkflowResult) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    result,
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl ValidatorBackend for CountingBackend {
+        fn name(&self) -> &'static str {
+            "counting-mock"
+        }
+        fn validate_workflow(
+            &self,
+            workflow: &Path,
+            _tree: &Path,
+            _timeout: Duration,
+            log_path: &Path,
+        ) -> Result<WorkflowOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WorkflowOutcome {
+                workflow: workflow.to_path_buf(),
+                backend: self.name(),
+                result: self.result.clone(),
+                forge_run_id: None,
+                duration_ms: 7,
+                stderr_tail: String::new(),
+                log_path: log_path.to_path_buf(),
+                cached_at_unix_secs: None,
+            })
+        }
+    }
+
+    fn fixture_workspace_with_manifest() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        // A Cargo.toml gives the workspace_fingerprint a non-trivial
+        // value so two distinct repos can produce distinct keys; the
+        // exact content doesn't matter to these tests.
+        std::fs::write(tmp.path().join("Cargo.toml"), b"[package]\nname = \"x\"\n").unwrap();
+        let workflow = tmp.path().join("a.yml");
+        // `on: pull_request` keeps the default workflow filter happy —
+        // the filter drops push-only workflows by design, but these
+        // tests are about cache behavior, not filter behavior.
+        std::fs::write(
+            &workflow,
+            b"name: a\non:\n  pull_request:\n    branches: [main]\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps: []\n",
+        )
+        .unwrap();
+        let workspace = tmp.path().to_path_buf();
+        (tmp, workspace, workflow)
+    }
+
+    #[test]
+    fn cache_hit_short_circuits_backend_for_pass() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Pass);
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        // First call: miss → backend runs and writes the entry.
+        let outcome1 = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(outcome1.conclusion, "success");
+        assert_eq!(outcome1.cached_workflow_count, 0);
+        assert_eq!(outcome1.total_workflow_count, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second call: hit → backend NOT called; cached_at populated.
+        let outcome2 = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(outcome2.conclusion, "success");
+        assert_eq!(outcome2.cached_workflow_count, 1);
+        assert_eq!(outcome2.total_workflow_count, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cache hit must not invoke the backend a second time"
+        );
+    }
+
+    #[test]
+    fn cache_hit_short_circuits_backend_for_regression() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) =
+            CountingBackend::new(WorkflowResult::Fail(FailureFlavor::Regression {
+                details: "conclusion: failure".into(),
+            }));
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        let outcome1 = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(outcome1.conclusion, "failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let outcome2 = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(outcome2.conclusion, "failure");
+        assert_eq!(outcome2.cached_workflow_count, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cached Regression must not re-invoke the backend"
+        );
+    }
+
+    #[test]
+    fn setup_failure_is_not_cached() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) =
+            CountingBackend::new(WorkflowResult::Fail(FailureFlavor::SetupFailure {
+                reason: "binary not found".into(),
+            }));
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "SetupFailure must NOT be cached — environment-dependent flavor"
+        );
+    }
+
+    #[test]
+    fn timeout_is_not_cached() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Fail(FailureFlavor::Timeout));
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Timeout must NOT be cached — could be slow runner, not real timeout"
+        );
+    }
+
+    #[test]
+    fn validator_without_cache_does_not_cache() {
+        let (_tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Pass);
+        // No .with_cache() call.
+        let validator = Validator::with_backend(Box::new(backend));
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        let outcome2 = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome2.cached_workflow_count, 0);
+    }
+
+    #[test]
+    fn workspace_state_change_invalidates_cache() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Pass);
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        // Simulate a lockfile bump landing in the workspace — the cache
+        // must treat this as a different state and re-validate.
+        std::fs::write(workspace.join("Cargo.lock"), b"# bumped\n").unwrap();
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "lockfile mutation must invalidate the cache key"
+        );
+    }
+
+    #[test]
+    fn workflow_file_change_invalidates_cache() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Pass);
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        // Keep `on: pull_request` so the filter still accepts it, but
+        // change the body so the file content hash differs.
+        std::fs::write(
+            &workflow,
+            b"name: a\non:\n  pull_request:\n    branches: [main]\njobs:\n  changed:\n    runs-on: ubuntu-latest\n    steps: []\n",
+        )
+        .unwrap();
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "workflow file edit must invalidate the cache key"
+        );
+    }
+
+    #[test]
+    fn cached_outcome_carries_cached_at_unix_secs() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, _calls) = CountingBackend::new(WorkflowResult::Pass);
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        let outcome = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        // The note for a cached passing workflow should carry the
+        // "served from cache" signal so the operator can audit reuse.
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|n| n.contains("served from cache")),
+            "cached outcome should be flagged in notes: {:?}",
+            outcome.notes
+        );
+    }
+
+    #[test]
+    fn build_test_backend_fingerprint_includes_commands() {
+        let cargo = BuildTestBackend::cargo();
+        let other = BuildTestBackend::with_commands(
+            vec![vec!["just".into(), "test".into()]],
+            "build-test-cargo",
+        );
+        // Same label but different commands — fingerprints must
+        // diverge so two backends with the same name but different
+        // command lists can't collide on cache keys.
+        assert_ne!(cargo.fingerprint(), other.fingerprint());
+    }
+
+    #[test]
+    fn custom_backend_fingerprint_includes_argv() {
+        let a = CustomBackend::new(vec!["bash".into(), "ci.sh".into()]);
+        let b = CustomBackend::new(vec!["bash".into(), "other.sh".into()]);
+        assert_ne!(a.fingerprint(), b.fingerprint());
     }
 }

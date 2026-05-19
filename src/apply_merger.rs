@@ -369,6 +369,7 @@ fn synthesize_merged_proposal(
         notes: proposals.iter().map(|p| p.id.clone()).collect(),
         bump_tier: Default::default(),
         affected_consumers: Vec::new(),
+        explanation: None,
     }
 }
 
@@ -578,6 +579,7 @@ mod tests {
             notes: vec![],
             bump_tier: Default::default(),
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -590,6 +592,9 @@ mod tests {
             classification: Classification::Exact,
             notes: vec![],
             failure_details: vec![],
+            cached_workflow_count: 0,
+            total_workflow_count: 0,
+            member_skipped_workflow_count: 0,
         }
     }
 

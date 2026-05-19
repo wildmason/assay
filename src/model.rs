@@ -119,6 +119,36 @@ impl BumpTier {
     }
 }
 
+/// Structured explanation for *why* a proposal's [`BumpTier`] was chosen.
+///
+/// Populated by the proposer when `--explain` is set so the operator can
+/// audit the classifier's verdict without re-running the analysis with
+/// debug logging. The reporter surfaces this inline beneath each
+/// proposal in the text format and inlines it in the JSON format.
+///
+/// Lives on [`Proposal`] as `Option<BumpExplanation>` — `None` keeps
+/// receipt size flat when the operator didn't ask for explanations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BumpExplanation {
+    /// One-line, prose summary suitable for inline display (e.g.
+    /// "same major version, manifest pin keeps cargo from bumping
+    /// — Compatible").
+    pub summary: String,
+    /// Stable rule identifier. Useful for filtering / scripting (e.g.
+    /// `cargo:caret-major-1-plus`, `gha:ref-shape-loosening`,
+    /// `lockfile-within-constraint`).
+    pub rule: String,
+    /// Structured inputs that drove the decision. Lets a future
+    /// `--format json` consumer reason about classifier output without
+    /// re-parsing the prose summary. BTreeMap so ordering is stable
+    /// across receipts.
+    pub inputs: BTreeMap<String, String>,
+    /// The classifier's verdict in human prose (e.g. "Compatible" /
+    /// "Breaking" / "LockfileOnly"). Matches `BumpTier::as_str()`
+    /// values verbatim.
+    pub decision: String,
+}
+
 /// A concrete dependency update proposed by an ecosystem's Proposer stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
@@ -155,6 +185,12 @@ pub struct Proposal {
     /// `#[serde(default)]` for receipt back-compat with older runs.
     #[serde(default)]
     pub affected_consumers: Vec<ConsumerId>,
+    /// Structured "why this tier" explanation. Populated only when
+    /// `--explain` is set on the CLI; `None` otherwise. `#[serde(default)]`
+    /// so receipts written before `--explain` shipped still
+    /// deserialize cleanly.
+    #[serde(default)]
+    pub explanation: Option<BumpExplanation>,
 }
 
 /// Diagnostic detail captured when a validator backend fails on a
@@ -208,6 +244,33 @@ pub struct ValidationOutcome {
     /// written before this field existed still deserialize cleanly.
     #[serde(default)]
     pub failure_details: Vec<FailureDetail>,
+    /// Number of per-workflow validations served from the verdict cache
+    /// rather than freshly executed. Defaults to 0 for back-compat with
+    /// receipts written before the cache existed.
+    #[serde(default)]
+    pub cached_workflow_count: usize,
+    /// Total number of per-workflow validations attempted (cached +
+    /// fresh). Defaults to 0 for back-compat; older receipts can recover
+    /// this from `validated_workflows.len()`.
+    #[serde(default)]
+    pub total_workflow_count: usize,
+    /// Number of gate workflows the member-precise filter dropped
+    /// before this proposal entered the validator. Non-zero only
+    /// when `--member-gate` is set AND at least one workflow named
+    /// only non-affected members. Defaults to 0 for back-compat.
+    #[serde(default)]
+    pub member_skipped_workflow_count: usize,
+}
+
+/// Current on-disk schema version stamped into every
+/// [`AssayRunReceipt`]. Bump only on **breaking** changes; additive
+/// fields with `#[serde(default)]` (cached_workflow_count,
+/// total_workflow_count, member_skipped_workflow_count, etc.) are
+/// back-compatible across the same major schema version.
+pub const CURRENT_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+fn default_receipt_schema_version() -> u32 {
+    CURRENT_RECEIPT_SCHEMA_VERSION
 }
 
 /// Top-level run receipt written to `.assay/runs/<run-id>/run.json`.
@@ -215,8 +278,15 @@ pub struct ValidationOutcome {
 /// Schema-compatible with ci-forge's `RunStoreReceipt` envelope at the
 /// `provenance.records[]` level — the index loader for `.assay/runs/` can
 /// read this file too once the shared loader lands.
+///
+/// `schema_version` is stamped at write time from
+/// [`CURRENT_RECEIPT_SCHEMA_VERSION`]. Consumers should compare against
+/// that constant when reading older receipts to know what optional
+/// fields to expect; `#[serde(default)]` on the field keeps
+/// hypothetical pre-versioning receipts parseable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssayRunReceipt {
+    #[serde(default = "default_receipt_schema_version")]
     pub schema_version: u32,
     pub run_id: String,
     pub started_at: String,
@@ -314,6 +384,144 @@ mod tests {
         let proposal: Proposal = serde_json::from_str(legacy_json)
             .expect("legacy receipt without bump_tier should still parse");
         assert_eq!(proposal.bump_tier, BumpTier::LockfileOnly);
+    }
+
+    #[test]
+    fn proposal_without_explanation_field_deserializes_as_none() {
+        // Receipts written before --explain shipped must still parse;
+        // bump_tier exists in the receipt but explanation does not.
+        let legacy_json = r#"{
+            "id": "cargo-serde-1-0-228",
+            "ecosystem": "cargo",
+            "kind": "version",
+            "subject": "serde",
+            "from": "1.0.100",
+            "to": "1.0.228",
+            "initial_classification": "exact",
+            "manifest_paths": [],
+            "notes": [],
+            "bump_tier": "compatible"
+        }"#;
+        let proposal: Proposal = serde_json::from_str(legacy_json)
+            .expect("legacy receipt without explanation should still parse");
+        assert!(proposal.explanation.is_none());
+    }
+
+    #[test]
+    fn bump_explanation_round_trips_through_serde() {
+        let mut inputs = BTreeMap::new();
+        inputs.insert("from_major".into(), "1".into());
+        inputs.insert("to_major".into(), "1".into());
+        let exp = BumpExplanation {
+            summary: "same major, manifest pin keeps cargo from bumping".into(),
+            rule: "cargo:caret-major-1-plus".into(),
+            inputs,
+            decision: "compatible".into(),
+        };
+        let json = serde_json::to_string(&exp).unwrap();
+        let back: BumpExplanation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, exp);
+    }
+
+    #[test]
+    fn proposal_with_explanation_round_trips() {
+        let mut inputs = BTreeMap::new();
+        inputs.insert("from_tag".into(), "v3.5.2".into());
+        inputs.insert("to_tag".into(), "v4.0.0".into());
+        let exp = BumpExplanation {
+            summary: "actions: major version changed".into(),
+            rule: "gha:major-bump".into(),
+            inputs,
+            decision: "breaking".into(),
+        };
+        let proposal = Proposal {
+            id: "gha-actions-checkout-v4".into(),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: "v3.5.2".into(),
+            to: "v4.0.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Breaking,
+            affected_consumers: vec![],
+            explanation: Some(exp.clone()),
+        };
+        let json = serde_json::to_string(&proposal).unwrap();
+        let back: Proposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.explanation, Some(exp));
+    }
+
+    #[test]
+    fn receipt_stamps_current_schema_version_when_serialized() {
+        let receipt = AssayRunReceipt {
+            schema_version: CURRENT_RECEIPT_SCHEMA_VERSION,
+            run_id: "assay-test".into(),
+            started_at: "2026-05-19T00:00:00Z".into(),
+            finished_at: "2026-05-19T00:00:01Z".into(),
+            repository: RepositoryRef {
+                path: PathBuf::from("/tmp/x"),
+                github: None,
+                git_ref: None,
+            },
+            summary: RunSummary::default(),
+            provenance: Provenance { records: vec![] },
+        };
+        let json = serde_json::to_string(&receipt).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.get("schema_version").and_then(|v| v.as_u64()),
+            Some(CURRENT_RECEIPT_SCHEMA_VERSION as u64),
+            "receipt must carry the current schema_version on disk"
+        );
+    }
+
+    #[test]
+    fn receipt_without_schema_version_defaults_to_current() {
+        // A receipt written before schema_version was a field (hypothetical
+        // pre-versioning past) MUST still parse — serde defaults to the
+        // current constant via `default_receipt_schema_version`.
+        let legacy_json = r#"{
+            "run_id": "assay-legacy",
+            "started_at": "2026-05-19T00:00:00Z",
+            "finished_at": "2026-05-19T00:00:01Z",
+            "repository": { "path": "/tmp/x" },
+            "summary": {
+                "manifests_scanned": 0,
+                "proposals_total": 0,
+                "proposals_passed": 0,
+                "proposals_failed": 0,
+                "proposals_unvalidated": 0,
+                "prs_opened": 0
+            },
+            "provenance": { "records": [] }
+        }"#;
+        let receipt: AssayRunReceipt = serde_json::from_str(legacy_json)
+            .expect("legacy receipt without schema_version should parse");
+        assert_eq!(receipt.schema_version, CURRENT_RECEIPT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn receipt_round_trips_with_legacy_schema_version() {
+        // A receipt carrying an explicit older `schema_version` is
+        // preserved verbatim on read — consumers can detect the drift.
+        let receipt = AssayRunReceipt {
+            schema_version: 0, // hypothetical legacy
+            run_id: "assay-legacy".into(),
+            started_at: "2026-05-19T00:00:00Z".into(),
+            finished_at: "2026-05-19T00:00:01Z".into(),
+            repository: RepositoryRef {
+                path: PathBuf::from("/tmp/x"),
+                github: None,
+                git_ref: None,
+            },
+            summary: RunSummary::default(),
+            provenance: Provenance { records: vec![] },
+        };
+        let json = serde_json::to_string(&receipt).unwrap();
+        let back: AssayRunReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema_version, 0);
     }
 
     #[test]

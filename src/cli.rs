@@ -176,6 +176,41 @@ pub struct AnalyzeArgs {
     /// merged with — and never override — config-file ignores.
     #[arg(long = "ignore", value_name = "ECO:SUBJECT")]
     pub ignore: Vec<String>,
+
+    /// Bypass the per-workflow verdict cache: every validator invocation
+    /// runs the gate workflow fresh, and no entry is written. Use when
+    /// you suspect a cached entry is stale beyond its TTL or want a
+    /// clean CI baseline. Has no effect on DryRun (validator skipped).
+    #[arg(long = "no-cache")]
+    pub no_cache: bool,
+
+    /// Verdict cache TTL. Cached entries older than this value are
+    /// treated as cache misses and re-validated. Accepts shorthand
+    /// durations: `30m`, `2h`, `7d`, `1w`. Default: `7d`.
+    #[arg(long = "cache-ttl", value_name = "DURATION", default_value = "7d")]
+    pub cache_ttl: String,
+
+    /// For every proposal, attach a structured rationale to the
+    /// receipt and surface it in the report. Each explanation names
+    /// the classifier rule that fired (e.g. `cargo:caret-major-1-plus`,
+    /// `gha:ref-shape-loosening`), the inputs that drove the decision,
+    /// and the resulting tier. Useful for auditing why a bump was
+    /// classified Compatible vs Breaking when the choice isn't obvious.
+    #[arg(long)]
+    pub explain: bool,
+
+    /// Filter validator gate workflows by workspace-member precision:
+    /// when a workflow uses an explicit `-p <member>` / `--package
+    /// <member>` / `--workspace <member>` selector that targets ONLY
+    /// non-affected members, skip the workflow. Workflows with
+    /// wildcard selectors (`--workspace` / `-r` / etc.) and workflows
+    /// with no member selectors are kept conservatively. Opt-in via
+    /// this flag for v1; default behavior is unchanged (every gate
+    /// workflow runs against every proposal). Speeds up validation
+    /// on large monorepos where a dep is consumed by only a small
+    /// subset of members.
+    #[arg(long = "member-gate")]
+    pub member_gate: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -400,6 +435,15 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         proposal.affected_consumers = consumers;
                     }
                 }
+                // --explain: attach a structured rationale to every
+                // proposal so the operator can audit why each was
+                // classified as it was. No-op when the flag isn't set;
+                // the proposers run the same classification logic
+                // regardless, this just persists the matching
+                // explanation for the receipt + reporter.
+                if args.explain {
+                    populate_proposal_explanations(&mut proposals, ecosystem.name());
+                }
                 for proposal in &proposals {
                     provenance.records.push(ProvenanceRecord {
                         tool: "assay".into(),
@@ -437,8 +481,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut pre_validation_failures = 0usize;
 
     if mode.runs_validator() && !all_proposals.is_empty() {
-        let validator =
-            build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
+        let validator = build_validator(&args, &args.repo)?
+            .with_workflow_filter(workflow_filter_from_args(&args));
 
         let units: Vec<WorkUnit> = all_proposals
             .iter()
@@ -481,6 +525,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         let ctx = WorkerContext {
             semaphores,
             git_mutex: &git_mutex,
+            member_gate: args.member_gate,
         };
 
         let validator_ref = &validator;
@@ -569,8 +614,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         // proposals. When the run is report-only or had no proposals,
         // no validator was built — but we wouldn't be inside this block
         // either, so the unwrap is safe by construction.
-        let validator =
-            build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
+        let validator = build_validator(&args, &args.repo)?
+            .with_workflow_filter(workflow_filter_from_args(&args));
         if matches!(mode, ApplyMode::ApplyLocal) {
             commit_summary = Some(perform_apply_local_commit(
                 &args.repo,
@@ -615,7 +660,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     };
     let finished_at = iso8601_now();
     let receipt = AssayRunReceipt {
-        schema_version: 1,
+        schema_version: crate::model::CURRENT_RECEIPT_SCHEMA_VERSION,
         run_id: run_id.clone(),
         started_at,
         finished_at,
@@ -657,6 +702,25 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 "assay: validated {} green / {} red / {} unvalidated",
                 proposals_passed, proposals_failed, proposals_unvalidated,
             );
+            let (cached_workflow_total, fresh_workflow_total) =
+                aggregate_cache_counts(&completed_runs);
+            if cached_workflow_total + fresh_workflow_total > 0 {
+                let saved_pct = if cached_workflow_total + fresh_workflow_total > 0 {
+                    (cached_workflow_total * 100) / (cached_workflow_total + fresh_workflow_total)
+                } else {
+                    0
+                };
+                println!(
+                    "assay: verdict cache: {} cached / {} fresh ({}% reused; --no-cache to bypass, --cache-ttl <dur> to tune)",
+                    cached_workflow_total, fresh_workflow_total, saved_pct,
+                );
+            }
+            let member_skipped_total = aggregate_member_skipped_count(&completed_runs);
+            if member_skipped_total > 0 {
+                println!(
+                    "assay: member-precise gating: {member_skipped_total} workflow(s) skipped (named only non-affected workspace members)",
+                );
+            }
             if let Some(red_section) =
                 format_red_proposal_section(&completed_runs, &pre_validation_failure_rows)
             {
@@ -807,7 +871,13 @@ struct WorkUnit {
 /// future error-reporting that wants to address the failed proposal by
 /// id. The current aggregator only reads them via the structural match
 /// in `analyze_command`, so allow the dead-code lint here.
-#[allow(dead_code)]
+///
+/// The `Completed` variant carries a `ValidationOutcome` (large struct
+/// with provenance vectors) while the failure variants are smaller; the
+/// `large_enum_variant` clippy lint flags the size disparity but
+/// boxing every variant would muddy the call sites and the enum is
+/// only ever held on one thread at a time. Allow the lint.
+#[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug)]
 enum WorkerOutcome {
     /// Apply tree preparation or `apply_proposal` failed before validation
@@ -900,6 +970,12 @@ fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal
             }
             line.push_str(&format_consumers_suffix(&p.affected_consumers));
             println!("{line}");
+            // When --explain was set, the proposer attached a
+            // BumpExplanation; render it as an indented sub-line so the
+            // operator sees the rule + reason inline with the proposal.
+            if let Some(exp) = &p.explanation {
+                println!("      [{}] {}", exp.rule, exp.summary);
+            }
         }
     };
     print_group("compatible", compatible);
@@ -1022,8 +1098,44 @@ fn process_proposal_unit(
     let workflow_paths = ecosystem
         .gate_workflows(&unit.proposal, &apply_tree)
         .unwrap_or_default();
+    // Member-precise filter: when --member-gate is set, drop
+    // workflows that name only non-affected workspace members. The
+    // filter never drops wildcard workflows (--workspace etc.) or
+    // workflows with no member selectors.
+    let (workflow_paths, member_skipped) = if ctx.member_gate {
+        let (kept, dropped) = crate::member_gate::filter_workflows_by_member(
+            &apply_tree,
+            &workflow_paths,
+            &unit.proposal.affected_consumers,
+        );
+        for record in &dropped {
+            records.push(ProvenanceRecord {
+                tool: "assay".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                stage: format!("member-gate.{}", ecosystem.name()),
+                subject: unit.proposal.id.clone(),
+                status: Classification::Stubbed,
+                summary: format!(
+                    "skipped workflow `{}` ({:?})",
+                    record.workflow.display(),
+                    record.decision
+                ),
+                artifact_path: None,
+                details: Some(serde_json::json!({
+                    "workflow": record.workflow,
+                    "decision": format!("{:?}", record.decision),
+                })),
+            });
+        }
+        (kept, dropped.len())
+    } else {
+        (workflow_paths, 0usize)
+    };
     let outcome = match validator.validate(&unit.proposal, &apply_tree, &workflow_paths) {
-        Ok(outcome) => outcome,
+        Ok(mut outcome) => {
+            outcome.member_skipped_workflow_count = member_skipped;
+            outcome
+        }
         Err(err) => {
             let summary = format!("validator could not run: {err}");
             records.push(ProvenanceRecord {
@@ -1108,6 +1220,32 @@ const REPORTER_STDERR_LINE_LIMIT: usize = 12;
 /// `subject from → to` line, a flavor tag (`[REGRESSION]`,
 /// `[SETUP-FAILURE]`, `[TIMEOUT]`, or `[APPLY-FAILURE]` for pre-
 /// validation failures), and either the last N lines of captured
+/// Aggregate cached/fresh per-workflow validation counts across every
+/// completed proposal run in this analyze pass. Sums [`ValidationOutcome::
+/// cached_workflow_count`] and `total_workflow_count - cached_workflow_count`
+/// so the report can render the cache-utilization line without re-deriving
+/// the breakdown elsewhere.
+fn aggregate_cache_counts(completed_runs: &[ProposalRun]) -> (usize, usize) {
+    let mut cached = 0usize;
+    let mut total = 0usize;
+    for run in completed_runs {
+        cached += run.outcome.cached_workflow_count;
+        total += run.outcome.total_workflow_count;
+    }
+    let fresh = total.saturating_sub(cached);
+    (cached, fresh)
+}
+
+/// Sum [`ValidationOutcome::member_skipped_workflow_count`] across all
+/// completed proposal runs. Returns the total number of workflows the
+/// member-precise filter dropped this pass.
+fn aggregate_member_skipped_count(completed_runs: &[ProposalRun]) -> usize {
+    completed_runs
+        .iter()
+        .map(|r| r.outcome.member_skipped_workflow_count)
+        .sum()
+}
+
 /// stderr (validator failures) or the apply-stage summary string
 /// (pre-validation failures). Ordering is alphabetical by proposal
 /// id so successive runs produce byte-identical output.
@@ -2359,8 +2497,7 @@ impl ProjectScope {
                         path.display()
                     ))
                 })?;
-            let (artifact_root, scan_root) =
-                anchor_artifact_root_at_git_root(&scan_root_initial);
+            let (artifact_root, scan_root) = anchor_artifact_root_at_git_root(&scan_root_initial);
             return Ok(ProjectScope {
                 artifact_root,
                 scan_roots: vec![scan_root],
@@ -2482,12 +2619,6 @@ fn relative_prefix(base: &Path, target: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Infer (ecosystem, repo_root) from a manifest file path.
-///
-/// Recognized manifests:
-/// - `<root>/Cargo.toml` → cargo, root = parent
-/// - `<root>/.github/workflows/<name>.yml` → github-actions, root = `<root>`
-/// - `<root>/.github/actions/<name>/action.yml` → github-actions, root = `<root>`
 /// Walk up from `start` looking for a `.git` directory or file (worktree
 /// pointer). Returns the directory containing it. `None` when `start`
 /// is not inside any git checkout.
@@ -2531,7 +2662,10 @@ fn anchor_artifact_root_at_git_root(scan_root_initial: &Path) -> (PathBuf, PathB
             .unwrap_or_else(|_| scan_root_initial.to_path_buf());
         return (git_root, scan_root_abs);
     }
-    (scan_root_initial.to_path_buf(), scan_root_initial.to_path_buf())
+    (
+        scan_root_initial.to_path_buf(),
+        scan_root_initial.to_path_buf(),
+    )
 }
 
 fn infer_project_scope_from_manifest(path: &Path) -> Option<(EcosystemSelector, PathBuf)> {
@@ -2576,22 +2710,69 @@ fn infer_project_scope_from_manifest(path: &Path) -> Option<(EcosystemSelector, 
 /// defer to [`Validator::auto`] to pick `forge-run` (when `forge` and
 /// `.github/workflows/` are both present) or `build-test` (manifest-
 /// inferred fallback).
-fn build_validator(args: &AnalyzeArgs) -> Result<Validator> {
-    if let Some(cmd) = args.gate_cmd.as_deref() {
-        return Ok(Validator::with_backend(Box::new(
-            CustomBackend::from_gate_cmd(cmd),
-        )));
-    }
-    if let Some(file) = args.gate_file.as_deref() {
-        return Ok(Validator::with_backend(Box::new(
-            CustomBackend::from_gate_file(file),
-        )));
-    }
-    let validator_executor = match args.executor {
-        ExecutorChoice::Host => ValidatorExecutor::Host,
-        ExecutorChoice::Docker => ValidatorExecutor::Docker,
+///
+/// The verdict cache is wired in when `!args.no_cache`. Cache entries
+/// live under `<artifact_root>/.assay/verdict-cache/` so every
+/// (workspace, workflow) pair has a content-addressed verdict file. The
+/// cache TTL comes from `args.cache_ttl` (parsed via
+/// [`parse_cache_ttl`]).
+fn build_validator(args: &AnalyzeArgs, artifact_root: &Path) -> Result<Validator> {
+    let base = if let Some(cmd) = args.gate_cmd.as_deref() {
+        Validator::with_backend(Box::new(CustomBackend::from_gate_cmd(cmd)))
+    } else if let Some(file) = args.gate_file.as_deref() {
+        Validator::with_backend(Box::new(CustomBackend::from_gate_file(file)))
+    } else {
+        let validator_executor = match args.executor {
+            ExecutorChoice::Host => ValidatorExecutor::Host,
+            ExecutorChoice::Docker => ValidatorExecutor::Docker,
+        };
+        Validator::auto(&args.repo, validator_executor)?
     };
-    Validator::auto(&args.repo, validator_executor)
+
+    if args.no_cache {
+        return Ok(base);
+    }
+
+    let ttl = parse_cache_ttl(&args.cache_ttl).map_err(|msg| {
+        Error::other(format!(
+            "--cache-ttl `{}` is not a valid duration: {}. \
+             Accepts `<n>s`, `<n>m`, `<n>h`, `<n>d`, or `<n>w`.",
+            args.cache_ttl, msg
+        ))
+    })?;
+    let cache_dir = artifact_root.join(".assay").join("verdict-cache");
+    let cache = crate::verdict_cache::VerdictCache::new(cache_dir, ttl);
+    Ok(base.with_cache(cache))
+}
+
+/// Parse a `--cache-ttl` value (e.g. `7d`, `30m`, `2h`, `1w`, `300s`)
+/// into a `Duration`. Accepts integer-valued suffixed forms only — no
+/// fractions, no compound expressions like `1h30m`. Returns a
+/// human-readable error string on failure.
+pub fn parse_cache_ttl(s: &str) -> std::result::Result<std::time::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty value".into());
+    }
+    let (num_part, unit_part): (&str, &str) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(idx) => (&s[..idx], &s[idx..]),
+        None => (s, "s"),
+    };
+    if num_part.is_empty() {
+        return Err(format!("missing number in `{s}`"));
+    }
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| format!("`{num_part}` is not a non-negative integer"))?;
+    let secs = match unit_part.trim() {
+        "s" => n,
+        "m" => n.saturating_mul(60),
+        "h" => n.saturating_mul(60 * 60),
+        "d" => n.saturating_mul(60 * 60 * 24),
+        "w" => n.saturating_mul(60 * 60 * 24 * 7),
+        other => return Err(format!("unknown unit `{other}`")),
+    };
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 /// Build the [`WorkflowFilter`] from the parsed CLI args.
@@ -2609,6 +2790,46 @@ fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
         include_globs: args.include_workflows.clone(),
         exclude_globs: args.exclude_workflows.clone(),
         ..base
+    }
+}
+
+/// Populate `proposal.explanation` for each proposal in `proposals`
+/// by dispatching to the matching ecosystem's explainer. Called only
+/// when `--explain` is set; otherwise proposals retain their default
+/// `explanation: None`.
+///
+/// The dispatch keys on the ecosystem name (matching the strings
+/// `ecosystem.name()` returns: `"cargo"`, `"github-actions"`,
+/// `"npm"`). Proposals from a future ecosystem without a registered
+/// explainer fall through with `None` rather than panic — the
+/// reporter handles that gracefully (no rationale line printed).
+fn populate_proposal_explanations(proposals: &mut [Proposal], ecosystem_name: &str) {
+    use crate::ecosystem::{cargo as cargo_eco, github_actions as gha_eco, npm as npm_eco};
+    use crate::model::BumpTier;
+    for proposal in proposals.iter_mut() {
+        let explanation = match (ecosystem_name, proposal.bump_tier) {
+            ("cargo", BumpTier::LockfileOnly) => Some(cargo_eco::explain_lockfile_only_bump(
+                &proposal.from,
+                &proposal.to,
+                None,
+            )),
+            ("cargo", _) => Some(cargo_eco::explain_unchanged_bump(
+                &proposal.from,
+                &proposal.to,
+            )),
+            ("github-actions", _) => Some(gha_eco::explain_action_bump(
+                Some(&proposal.from),
+                &proposal.to,
+            )),
+            ("npm", BumpTier::LockfileOnly) => Some(npm_eco::explain_npm_lockfile_only_bump(
+                &proposal.from,
+                &proposal.to,
+                None,
+            )),
+            ("npm", _) => Some(npm_eco::explain_npm_bump(&proposal.from, &proposal.to)),
+            _ => None,
+        };
+        proposal.explanation = explanation;
     }
 }
 
@@ -2770,6 +2991,7 @@ mod tests {
                 notes: vec![],
                 bump_tier: BumpTier::Breaking,
                 affected_consumers: Vec::new(),
+                explanation: None,
             },
             sandbox: PathBuf::from("/tmp/sandbox"),
             outcome: crate::model::ValidationOutcome {
@@ -2786,6 +3008,9 @@ mod tests {
                     stderr_tail: stderr.into(),
                     duration_ms: 1234,
                 }],
+                cached_workflow_count: 0,
+                total_workflow_count: 1,
+                member_skipped_workflow_count: 0,
             },
             scan_root: std::path::PathBuf::new(),
         }
@@ -2807,6 +3032,7 @@ mod tests {
                 notes: vec![],
                 bump_tier: BumpTier::LockfileOnly,
                 affected_consumers: Vec::new(),
+                explanation: None,
             },
             sandbox: PathBuf::from("/tmp/sb"),
             outcome: crate::model::ValidationOutcome {
@@ -2817,9 +3043,59 @@ mod tests {
                 classification: Classification::Exact,
                 notes: vec![],
                 failure_details: vec![],
+                cached_workflow_count: 0,
+                total_workflow_count: 0,
+                member_skipped_workflow_count: 0,
             },
             scan_root: std::path::PathBuf::new(),
         }
+    }
+
+    fn green_run_with_cache_counts(id: &str, cached: usize, total: usize) -> ProposalRun {
+        let mut run = green_run(id);
+        run.outcome.cached_workflow_count = cached;
+        run.outcome.total_workflow_count = total;
+        run
+    }
+
+    #[test]
+    fn aggregate_cache_counts_sums_across_proposals() {
+        let runs = vec![
+            green_run_with_cache_counts("a", 3, 4),
+            green_run_with_cache_counts("b", 1, 2),
+            green_run_with_cache_counts("c", 0, 5),
+        ];
+        let (cached, fresh) = aggregate_cache_counts(&runs);
+        assert_eq!(cached, 4);
+        // total = 4 + 2 + 5 = 11; fresh = 11 - 4 = 7.
+        assert_eq!(fresh, 7);
+    }
+
+    #[test]
+    fn aggregate_cache_counts_returns_zero_when_no_runs() {
+        assert_eq!(aggregate_cache_counts(&[]), (0, 0));
+    }
+
+    #[test]
+    fn aggregate_cache_counts_handles_all_cached() {
+        let runs = vec![
+            green_run_with_cache_counts("a", 3, 3),
+            green_run_with_cache_counts("b", 2, 2),
+        ];
+        let (cached, fresh) = aggregate_cache_counts(&runs);
+        assert_eq!(cached, 5);
+        assert_eq!(fresh, 0);
+    }
+
+    #[test]
+    fn aggregate_cache_counts_handles_all_fresh() {
+        let runs = vec![
+            green_run_with_cache_counts("a", 0, 3),
+            green_run_with_cache_counts("b", 0, 4),
+        ];
+        let (cached, fresh) = aggregate_cache_counts(&runs);
+        assert_eq!(cached, 0);
+        assert_eq!(fresh, 7);
     }
 
     fn apply_failure_row(
@@ -2844,6 +3120,7 @@ mod tests {
                 notes: vec![],
                 bump_tier: BumpTier::Breaking,
                 affected_consumers: Vec::new(),
+                explanation: None,
             },
             summary: summary.into(),
         }
@@ -3012,7 +3289,9 @@ mod tests {
         // predicate must report it.
         assert!(!porcelain_line_is_assay_artifact(" M src/cli.rs"));
         assert!(!porcelain_line_is_assay_artifact("?? new-file.txt"));
-        assert!(!porcelain_line_is_assay_artifact("?? \"path with space.txt\""));
+        assert!(!porcelain_line_is_assay_artifact(
+            "?? \"path with space.txt\""
+        ));
         // A `.assay-foo/` (lookalike that isn't actually `.assay/`)
         // must not be filtered — the predicate is strict.
         assert!(!porcelain_line_is_assay_artifact("?? .assay-other/foo"));
@@ -3329,6 +3608,7 @@ mod tests {
                 notes: vec![],
                 bump_tier: BumpTier::LockfileOnly,
                 affected_consumers: Vec::new(),
+                explanation: None,
             },
             sandbox: PathBuf::from("/tmp/sb"),
             outcome: crate::model::ValidationOutcome {
@@ -3339,6 +3619,9 @@ mod tests {
                 classification: Classification::Stubbed,
                 notes: vec![],
                 failure_details: vec![],
+                cached_workflow_count: 0,
+                total_workflow_count: 0,
+                member_skipped_workflow_count: 0,
             },
             scan_root: std::path::PathBuf::new(),
         };
@@ -3409,6 +3692,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -3484,6 +3771,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -3899,7 +4190,172 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         }
+    }
+
+    #[test]
+    fn parse_cache_ttl_accepts_supported_units() {
+        use std::time::Duration;
+        assert_eq!(parse_cache_ttl("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_cache_ttl("30m"), Ok(Duration::from_secs(30 * 60)));
+        assert_eq!(parse_cache_ttl("2h"), Ok(Duration::from_secs(2 * 60 * 60)));
+        assert_eq!(parse_cache_ttl("7d"), Ok(Duration::from_secs(7 * 86400)));
+        assert_eq!(parse_cache_ttl("1w"), Ok(Duration::from_secs(7 * 86400)));
+    }
+
+    #[test]
+    fn parse_cache_ttl_rejects_empty_and_garbage() {
+        assert!(parse_cache_ttl("").is_err());
+        assert!(parse_cache_ttl("abc").is_err());
+        assert!(parse_cache_ttl("1y").is_err(), "year unit not supported");
+        assert!(
+            parse_cache_ttl("1h30m").is_err(),
+            "compound durations not supported"
+        );
+        assert!(parse_cache_ttl("-30s").is_err(), "negative values rejected");
+    }
+
+    #[test]
+    fn parse_cache_ttl_bare_number_treated_as_seconds() {
+        // `300` (no suffix) is parsed as seconds — keeps cache_ttl=300
+        // round-trippable with the verdict_cache module's internal repr.
+        assert_eq!(
+            parse_cache_ttl("300"),
+            Ok(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn parse_cli_accepts_no_cache_flag() {
+        let cli = parse_cli(["assay", "analyze", "--no-cache"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(args.no_cache);
+    }
+
+    #[test]
+    fn parse_cli_accepts_cache_ttl_flag() {
+        let cli = parse_cli(["assay", "analyze", "--cache-ttl", "2h"]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(args.cache_ttl, "2h");
+    }
+
+    #[test]
+    fn parse_cli_defaults_cache_ttl_to_seven_days() {
+        let cli = parse_cli(["assay", "analyze"]);
+        let Command::Analyze(args) = cli.command;
+        assert_eq!(args.cache_ttl, "7d");
+        assert!(!args.no_cache);
+    }
+
+    #[test]
+    fn parse_cli_accepts_explain_flag() {
+        let cli = parse_cli(["assay", "analyze", "--explain"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(args.explain);
+    }
+
+    #[test]
+    fn parse_cli_explain_defaults_to_false() {
+        let cli = parse_cli(["assay", "analyze"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(!args.explain);
+    }
+
+    #[test]
+    fn populate_explanations_fills_cargo_proposals() {
+        use crate::model::{BumpTier, ProposalKind};
+        let mut proposals = vec![Proposal {
+            id: "cargo-serde-1-0-228".into(),
+            ecosystem: "cargo".into(),
+            kind: ProposalKind::Version,
+            subject: "serde".into(),
+            from: "1.0.100".into(),
+            to: "1.0.228".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+            affected_consumers: vec![],
+            explanation: None,
+        }];
+        populate_proposal_explanations(&mut proposals, "cargo");
+        let exp = proposals[0]
+            .explanation
+            .as_ref()
+            .expect("--explain should attach a BumpExplanation");
+        assert_eq!(exp.rule, "cargo:caret-major-1-plus");
+        assert_eq!(exp.decision, "compatible");
+    }
+
+    #[test]
+    fn populate_explanations_fills_gha_proposals() {
+        use crate::model::{BumpTier, ProposalKind};
+        let mut proposals = vec![Proposal {
+            id: "gha-actions-checkout-v4".into(),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: "v3.5.2".into(),
+            to: "v4.0.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Breaking,
+            affected_consumers: vec![],
+            explanation: None,
+        }];
+        populate_proposal_explanations(&mut proposals, "github-actions");
+        let exp = proposals[0].explanation.as_ref().unwrap();
+        assert_eq!(exp.rule, "gha:major-bump");
+        assert_eq!(exp.decision, "breaking");
+    }
+
+    #[test]
+    fn populate_explanations_uses_lockfile_only_explainer_for_lockfile_tier() {
+        use crate::model::{BumpTier, ProposalKind};
+        let mut proposals = vec![Proposal {
+            id: "cargo-clap-4-5-1".into(),
+            ecosystem: "cargo".into(),
+            kind: ProposalKind::Version,
+            subject: "clap".into(),
+            from: "4.5.0".into(),
+            to: "4.5.1".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::LockfileOnly,
+            affected_consumers: vec![],
+            explanation: None,
+        }];
+        populate_proposal_explanations(&mut proposals, "cargo");
+        let exp = proposals[0].explanation.as_ref().unwrap();
+        assert_eq!(exp.rule, "cargo:lockfile-within-constraint");
+        assert_eq!(exp.decision, "lockfile-only");
+    }
+
+    #[test]
+    fn populate_explanations_leaves_unknown_ecosystem_untouched() {
+        use crate::model::{BumpTier, ProposalKind};
+        let mut proposals = vec![Proposal {
+            id: "fictional-x-1".into(),
+            ecosystem: "fictional".into(),
+            kind: ProposalKind::Version,
+            subject: "x".into(),
+            from: "1.0.0".into(),
+            to: "1.0.1".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+            affected_consumers: vec![],
+            explanation: None,
+        }];
+        populate_proposal_explanations(&mut proposals, "fictional");
+        assert!(proposals[0].explanation.is_none());
     }
 
     #[test]
@@ -3996,8 +4452,12 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
-        let validator = build_validator(&args).expect("gate-cmd should always build");
+        let validator = build_validator(&args, &args.repo).expect("gate-cmd should always build");
         // CustomBackend reports `needs_workflow_file() == false`, so the
         // validator runs the gate command once against the tree using a
         // synthetic workflow path. With `make test` (the gate) failing on
@@ -4020,6 +4480,7 @@ mod tests {
                     notes: vec![],
                     bump_tier: crate::model::BumpTier::LockfileOnly,
                     affected_consumers: Vec::new(),
+                    explanation: None,
                 },
                 tmp.path(),
                 &[],
@@ -4064,9 +4525,13 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         // Just needs to not error during construction.
-        build_validator(&args).expect("gate-file should always build");
+        build_validator(&args, &args.repo).expect("gate-file should always build");
     }
 
     #[test]
@@ -4097,6 +4562,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -4106,7 +4575,7 @@ mod tests {
         // If for some reason a backend was selectable on this host
         // (unlikely in an empty tempdir), that's fine — the test
         // proves construction works either way.
-        if let Err(err) = build_validator(&args) {
+        if let Err(err) = build_validator(&args, &args.repo) {
             let msg = err.to_string();
             assert!(
                 msg.contains("no validator backend applicable"),
@@ -4144,6 +4613,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -4190,6 +4663,7 @@ mod tests {
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -4202,6 +4676,9 @@ mod tests {
             classification: crate::model::Classification::Exact,
             notes: Vec::new(),
             failure_details: Vec::new(),
+            cached_workflow_count: 0,
+            total_workflow_count: 0,
+            member_skipped_workflow_count: 0,
         }
     }
 
@@ -4765,6 +5242,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -4796,6 +5277,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -4825,6 +5310,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -4856,6 +5345,10 @@ mod tests {
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
+            no_cache: false,
+            cache_ttl: "7d".into(),
+            explain: false,
+            member_gate: false,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;

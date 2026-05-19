@@ -378,7 +378,10 @@ max_parallel = 2
         let config = parse(text, Path::new(".assay.toml"))
             .expect("config without [assay] section should parse via defaults");
         assert_eq!(config.meta.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(config.project.roots, vec![PathBuf::from("src-tauri"), PathBuf::from("ui")]);
+        assert_eq!(
+            config.project.roots,
+            vec![PathBuf::from("src-tauri"), PathBuf::from("ui")]
+        );
         assert_eq!(config.ecosystems.cargo.max_parallel, 2);
     }
 

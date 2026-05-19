@@ -454,6 +454,7 @@ pub(crate) fn build_action_proposals(
             notes,
             bump_tier: tier,
             affected_consumers: Vec::new(),
+            explanation: None,
         });
     }
     proposals
@@ -655,6 +656,96 @@ pub(crate) fn classify_action_bump(from_tag: Option<&str>, to_tag: &str) -> Bump
     BumpTier::Compatible
 }
 
+/// Build a structured [`crate::model::BumpExplanation`] for a GHA
+/// action-pin bump, paralleling [`classify_action_bump`]. Captures the
+/// exact rule that fired (unknown-from / unparseable / major-bump /
+/// ref-shape-loosening / same-major-compatible) and the inputs that
+/// drove it.
+pub(crate) fn explain_action_bump(
+    from_tag: Option<&str>,
+    to_tag: &str,
+) -> crate::model::BumpExplanation {
+    use crate::model::BumpExplanation;
+    use std::collections::BTreeMap;
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("to_tag".into(), to_tag.to_string());
+    if let Some(f) = from_tag {
+        inputs.insert("from_tag".into(), f.to_string());
+    }
+
+    let Some(from_tag) = from_tag else {
+        return BumpExplanation {
+            summary: format!(
+                "gha: source pin is unknown (no `# vN.N.N` comment recorded in the workflow); \
+                 cannot prove the bump is compatible, so {to_tag} is classified Breaking \
+                 conservatively"
+            ),
+            rule: "gha:unknown-from".into(),
+            inputs,
+            decision: "breaking".into(),
+        };
+    };
+    let from_parsed = parse_action_tag(from_tag);
+    let to_parsed = parse_action_tag(to_tag);
+    let (from_v, to_v) = match (from_parsed, to_parsed) {
+        (Some(f), Some(t)) => (f, t),
+        _ => {
+            return BumpExplanation {
+                summary: format!(
+                    "gha: one or both tags unparseable as semver (`{from_tag}` -> `{to_tag}`); \
+                     classified Breaking so the operator reviews"
+                ),
+                rule: "gha:unparseable-tag".into(),
+                inputs,
+                decision: "breaking".into(),
+            };
+        }
+    };
+    inputs.insert("from_major".into(), from_v.major.to_string());
+    inputs.insert("to_major".into(), to_v.major.to_string());
+
+    if from_v.major != to_v.major {
+        return BumpExplanation {
+            summary: format!(
+                "gha: major version changed ({} -> {}); breaking-by-spec",
+                from_v.major, to_v.major
+            ),
+            rule: "gha:major-bump".into(),
+            inputs,
+            decision: "breaking".into(),
+        };
+    }
+    let from_spec = tag_specificity(from_tag);
+    let to_spec = tag_specificity(to_tag);
+    inputs.insert("from_specificity".into(), from_spec.to_string());
+    inputs.insert("to_specificity".into(), to_spec.to_string());
+    if from_spec > to_spec {
+        return BumpExplanation {
+            summary: format!(
+                "gha: same major version ({}), but target pin shape is LESS specific than \
+                 source (`{from_tag}` has {from_spec} numeric segment(s); `{to_tag}` has \
+                 {to_spec}). Loosening an immutable pin gives up supply-chain immutability — \
+                 classified Breaking so the operator reviews",
+                from_v.major
+            ),
+            rule: "gha:ref-shape-loosening".into(),
+            inputs,
+            decision: "breaking".into(),
+        };
+    }
+    BumpExplanation {
+        summary: format!(
+            "gha: same major version ({}), target pin shape at least as specific as source \
+             — Compatible",
+            from_v.major
+        ),
+        rule: "gha:same-major-compatible".into(),
+        inputs,
+        decision: "compatible".into(),
+    }
+}
+
 /// Returns 1 for major-only tags (`v1`), 2 for `vX.Y`, 3 for `vX.Y.Z`.
 /// Falls back to 0 for anything else — those route to the `parse_action_tag`
 /// caller's None/error path before reaching this function.
@@ -663,10 +754,7 @@ fn tag_specificity(tag: &str) -> u8 {
         .strip_prefix('v')
         .or_else(|| tag.strip_prefix('V'))
         .unwrap_or(tag);
-    let core = stripped
-        .split(|c: char| c == '-' || c == '+')
-        .next()
-        .unwrap_or(stripped);
+    let core = stripped.split(['-', '+']).next().unwrap_or(stripped);
     let segments: Vec<&str> = core.split('.').collect();
     let mut count = 0u8;
     for seg in segments {
@@ -1344,6 +1432,7 @@ jobs:
             notes: vec!["tag:v4.1.0".into()],
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
 
         // 3. Apply.
@@ -1393,6 +1482,7 @@ jobs:
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
         let eco = GitHubActionsEcosystem;
         let modified = eco
@@ -1431,6 +1521,7 @@ jobs:
             notes: vec![],
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
         let eco = GitHubActionsEcosystem;
         let err = eco
@@ -1682,6 +1773,60 @@ jobs:
         assert_eq!(tag_specificity("v1.2.3+spec"), 3);
     }
 
+    // -------------------------------------------------------------------------
+    // explain_action_bump — structured rationale for --explain.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn explain_same_major_returns_compatible_with_same_major_rule() {
+        let exp = explain_action_bump(Some("v3.1.0"), "v3.5.2");
+        assert_eq!(exp.decision, "compatible");
+        assert_eq!(exp.rule, "gha:same-major-compatible");
+        assert_eq!(exp.inputs.get("from_major").map(String::as_str), Some("3"));
+        assert_eq!(exp.inputs.get("to_major").map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn explain_cross_major_returns_breaking_with_major_bump_rule() {
+        let exp = explain_action_bump(Some("v3.5.2"), "v4.0.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "gha:major-bump");
+    }
+
+    #[test]
+    fn explain_unknown_from_returns_breaking_with_unknown_from_rule() {
+        let exp = explain_action_bump(None, "v4.2.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "gha:unknown-from");
+        assert!(!exp.inputs.contains_key("from_tag"));
+    }
+
+    #[test]
+    fn explain_ref_shape_loosening_returns_breaking_with_loosening_rule() {
+        let exp = explain_action_bump(Some("1.85.0"), "v1");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "gha:ref-shape-loosening");
+        assert_eq!(
+            exp.inputs.get("from_specificity").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            exp.inputs.get("to_specificity").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn explain_unparseable_returns_breaking_with_unparseable_rule() {
+        // Truly non-numeric tags can't be parsed as semver at all and
+        // route through the unparseable-tag branch. (Date-shaped tags
+        // like `2024.01.05` *do* parse — they fire the major-bump
+        // branch when the date majors differ.)
+        let exp = explain_action_bump(Some("main"), "feature-branch");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "gha:unparseable-tag");
+    }
+
     #[test]
     fn classify_unparseable_tag_is_breaking() {
         // Date-based releases (`2024.01.05`) don't fit the semver
@@ -1871,6 +2016,7 @@ jobs:
             notes: vec![],
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
         let proposals = vec![
             make("actions/checkout"),
@@ -1900,6 +2046,7 @@ jobs:
             notes: vec![],
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
         let proposals = vec![make("actions/checkout"), make("actions/checkout-fork")];
         let kept = filter_ignored_actions(proposals, &["actions/checkout".to_string()]);
@@ -1921,6 +2068,7 @@ jobs:
             notes: vec![],
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
         let original = vec![make("a/b"), make("c/d")];
         let kept = filter_ignored_actions(original.clone(), &[]);

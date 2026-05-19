@@ -330,6 +330,153 @@ fn compat_group(v: &semver::Version) -> (u64, u64, u64) {
     }
 }
 
+/// Build a structured [`BumpExplanation`] for a cargo manifest-edit
+/// bump, paralleling [`classify_unchanged_bump`]. The returned
+/// explanation captures the same decision logic in audit-friendly form:
+/// caller passes `from` / `to` versions, the helper resolves the
+/// compat-group rule that fired and packages the inputs so an operator
+/// can read *why* the tier was assigned.
+///
+/// Used only when `--explain` is set on the CLI; the proposer attaches
+/// the result to `Proposal::explanation`.
+pub fn explain_unchanged_bump(from: &str, to: &str) -> crate::model::BumpExplanation {
+    use crate::model::BumpExplanation;
+    use std::collections::BTreeMap;
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("from".into(), from.to_string());
+    inputs.insert("to".into(), to.to_string());
+
+    let from_parsed = semver::Version::parse(from);
+    let to_parsed = semver::Version::parse(to);
+    let (from_v, to_v) = match (from_parsed, to_parsed) {
+        (Ok(f), Ok(t)) => (f, t),
+        _ => {
+            return BumpExplanation {
+                summary: format!(
+                    "cargo: one or both versions unparseable as semver ({from} -> {to}); \
+                     classified Breaking conservatively so the operator reviews"
+                ),
+                rule: "cargo:unparseable-semver".into(),
+                inputs,
+                decision: "breaking".into(),
+            };
+        }
+    };
+
+    let from_group = compat_group(&from_v);
+    let to_group = compat_group(&to_v);
+    inputs.insert(
+        "from_compat_group".into(),
+        format!("{}.{}.{}", from_group.0, from_group.1, from_group.2),
+    );
+    inputs.insert(
+        "to_compat_group".into(),
+        format!("{}.{}.{}", to_group.0, to_group.1, to_group.2),
+    );
+
+    if from_group == to_group {
+        let rule = match (from_v.major, from_v.minor) {
+            (0, 0) => "cargo:caret-0-0-x-same-patch",
+            (0, _) => "cargo:caret-0-x-same-minor",
+            _ => "cargo:caret-major-1-plus",
+        };
+        let summary = match (from_v.major, from_v.minor) {
+            (0, 0) => format!(
+                "cargo: 0.0.x band — every patch is its own group; {from} and {to} share \
+                 patch={}, so the bump stays caret-compatible and only the manifest pin keeps \
+                 cargo from taking it",
+                from_v.patch
+            ),
+            (0, _) => format!(
+                "cargo: 0.x band — caret groups by minor; both versions share minor={}, so \
+                 only the manifest pin keeps cargo from bumping (Compatible)",
+                from_v.minor
+            ),
+            _ => format!(
+                "cargo: 1.0+ band — caret groups by major; both versions share major={}, so \
+                 only the manifest pin keeps cargo from bumping (Compatible)",
+                from_v.major
+            ),
+        };
+        BumpExplanation {
+            summary,
+            rule: rule.into(),
+            inputs,
+            decision: "compatible".into(),
+        }
+    } else {
+        let rule = match (from_v.major, from_v.minor) {
+            (0, 0) => "cargo:caret-0-0-x-patch-crossed",
+            (0, _) if from_v.minor != to_v.minor => "cargo:caret-0-x-minor-crossed",
+            _ if from_v.major != to_v.major => "cargo:caret-major-crossed",
+            _ => "cargo:caret-group-crossed",
+        };
+        let summary = match (from_v.major, from_v.minor) {
+            (0, 0) => format!(
+                "cargo: 0.0.x band — every patch is breaking-by-spec; {from} -> {to} crosses \
+                 a patch boundary"
+            ),
+            (0, _) if from_v.minor != to_v.minor => format!(
+                "cargo: 0.x band — minor bumps are breaking-by-spec; {from} -> {to} crosses \
+                 minor={} -> minor={}",
+                from_v.minor, to_v.minor
+            ),
+            _ if from_v.major != to_v.major => format!(
+                "cargo: 1.0+ band — major bumps are breaking-by-spec; {from} -> {to} crosses \
+                 major={} -> major={}",
+                from_v.major, to_v.major
+            ),
+            _ => format!(
+                "cargo: bump crosses a caret-compat group boundary; {from} -> {to} requires \
+                 review"
+            ),
+        };
+        BumpExplanation {
+            summary,
+            rule: rule.into(),
+            inputs,
+            decision: "breaking".into(),
+        }
+    }
+}
+
+/// Build a structured [`crate::model::BumpExplanation`] for a
+/// `LockfileOnly` cargo bump — one where the new version satisfies the
+/// existing constraint and only the lockfile changes. Always returns
+/// the `lockfile-within-constraint` rule, decision = `lockfile-only`.
+pub fn explain_lockfile_only_bump(
+    from: &str,
+    to: &str,
+    constraint: Option<&str>,
+) -> crate::model::BumpExplanation {
+    use crate::model::BumpExplanation;
+    use std::collections::BTreeMap;
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("from".into(), from.to_string());
+    inputs.insert("to".into(), to.to_string());
+    if let Some(c) = constraint {
+        inputs.insert("constraint".into(), c.to_string());
+    }
+    let summary = match constraint {
+        Some(c) => format!(
+            "cargo: new version {to} satisfies the existing constraint `{c}`; only \
+             Cargo.lock changes (no manifest edit required)"
+        ),
+        None => format!(
+            "cargo: new version {to} satisfies the existing constraint; only \
+             Cargo.lock changes (no manifest edit required)"
+        ),
+    };
+    BumpExplanation {
+        summary,
+        rule: "cargo:lockfile-within-constraint".into(),
+        inputs,
+        decision: "lockfile-only".into(),
+    }
+}
+
 /// Diff two `Cargo.lock` contents (TOML) into a list of version changes.
 /// Used to cross-check the stdout parser; if the two disagree we abort
 /// loudly because either cargo's stdout format drifted or our parser has
@@ -416,6 +563,7 @@ pub fn propose_from_cargo_dry_run(
             notes: Vec::new(),
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         });
     }
     Ok(proposals)
@@ -879,6 +1027,7 @@ pub fn propose_unchanged_from_cargo_stdout(
             notes,
             bump_tier: tier,
             affected_consumers: Vec::new(),
+            explanation: None,
         });
     }
     proposals
@@ -911,6 +1060,7 @@ pub fn propose_from_cargo_stdout(
             notes: Vec::new(),
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         });
     }
     Ok(proposals)
@@ -1276,6 +1426,86 @@ warning: not updating lockfile due to dry run
         );
     }
 
+    // -------------------------------------------------------------------------
+    // explain_unchanged_bump — structured rationale for --explain.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn explain_same_major_1_plus_returns_compatible_with_major_rule() {
+        let exp = explain_unchanged_bump("1.0.100", "1.0.228");
+        assert_eq!(exp.decision, "compatible");
+        assert_eq!(exp.rule, "cargo:caret-major-1-plus");
+        assert_eq!(exp.inputs.get("from").map(String::as_str), Some("1.0.100"));
+        assert_eq!(exp.inputs.get("to").map(String::as_str), Some("1.0.228"));
+        assert_eq!(
+            exp.inputs.get("from_compat_group").map(String::as_str),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn explain_same_minor_0_x_returns_compatible_with_minor_rule() {
+        let exp = explain_unchanged_bump("0.18.1", "0.18.7");
+        assert_eq!(exp.decision, "compatible");
+        assert_eq!(exp.rule, "cargo:caret-0-x-same-minor");
+    }
+
+    #[test]
+    fn explain_same_patch_0_0_x_returns_compatible_with_patch_rule() {
+        let exp = explain_unchanged_bump("0.0.5", "0.0.5");
+        assert_eq!(exp.decision, "compatible");
+        assert_eq!(exp.rule, "cargo:caret-0-0-x-same-patch");
+    }
+
+    #[test]
+    fn explain_cross_major_returns_breaking_with_major_crossed_rule() {
+        let exp = explain_unchanged_bump("1.0.0", "2.0.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "cargo:caret-major-crossed");
+        assert!(exp.summary.contains("major=1"));
+        assert!(exp.summary.contains("major=2"));
+    }
+
+    #[test]
+    fn explain_cross_minor_in_0_x_returns_breaking_with_minor_crossed_rule() {
+        let exp = explain_unchanged_bump("0.18.1", "0.20.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "cargo:caret-0-x-minor-crossed");
+    }
+
+    #[test]
+    fn explain_cross_patch_in_0_0_x_returns_breaking_with_patch_crossed_rule() {
+        let exp = explain_unchanged_bump("0.0.5", "0.0.10");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "cargo:caret-0-0-x-patch-crossed");
+    }
+
+    #[test]
+    fn explain_unparseable_returns_breaking_with_unparseable_rule() {
+        let exp = explain_unchanged_bump("not-a-version", "1.0.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "cargo:unparseable-semver");
+    }
+
+    #[test]
+    fn explain_lockfile_only_carries_constraint_when_supplied() {
+        let exp = explain_lockfile_only_bump("1.0.100", "1.0.228", Some("^1.0"));
+        assert_eq!(exp.decision, "lockfile-only");
+        assert_eq!(exp.rule, "cargo:lockfile-within-constraint");
+        assert_eq!(
+            exp.inputs.get("constraint").map(String::as_str),
+            Some("^1.0")
+        );
+        assert!(exp.summary.contains("^1.0"));
+    }
+
+    #[test]
+    fn explain_lockfile_only_omits_constraint_when_unknown() {
+        let exp = explain_lockfile_only_bump("1.0.100", "1.0.228", None);
+        assert!(!exp.inputs.contains_key("constraint"));
+        assert!(!exp.summary.contains("`"));
+    }
+
     #[test]
     fn parse_unchanged_returns_empty_for_no_verbose_output() {
         // The non-verbose `cargo update --dry-run` output contains a
@@ -1401,6 +1631,7 @@ warning: not updating lockfile due to dry run
             notes: vec![],
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -1608,6 +1839,7 @@ warning: not updating lockfile due to dry run
             notes: vec![],
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -1632,6 +1864,7 @@ warning: not updating lockfile due to dry run
             notes: vec![],
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         };
         let mut workflows = eco.gate_workflows(&stub_proposal, tmp.path()).unwrap();
         workflows.sort();
@@ -1686,6 +1919,7 @@ warning: not updating lockfile due to dry run
             notes: vec![],
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -1818,6 +2052,7 @@ warning: not updating lockfile due to dry run
         Proposal {
             bump_tier: tier,
             affected_consumers: Vec::new(),
+            explanation: None,
             subject: subject.into(),
             id: format!("cargo-{subject}-1-2-3"),
             ..sample_cargo_proposal()

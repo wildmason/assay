@@ -10,6 +10,7 @@ pub mod config;
 pub mod ecosystem;
 pub mod error;
 pub mod external_deps;
+pub mod member_gate;
 pub mod model;
 pub mod process_runner;
 pub mod publisher;
@@ -17,6 +18,7 @@ pub mod receipt;
 pub mod redact;
 pub mod sanitize;
 pub mod validator;
+pub mod verdict_cache;
 pub mod worker_pool;
 pub mod workflow_filter;
 

@@ -57,12 +57,15 @@ enum NpmFlavor {
     Npm,
     /// `pnpm-lock.yaml` — invoke `pnpm`.
     Pnpm,
-    /// `yarn.lock` (yarn 1 / "classic") — invoke `yarn`. Yarn berry
-    /// (yarn ≥ 2) writes a `yarn.lock` with a `__metadata` header and
-    /// is **not** supported by this flavor; berry's outdated UX is
-    /// `yarn npm outdated --json` (different shape) and is intentionally
-    /// out of scope for v1.
+    /// `yarn.lock` (yarn 1 / "classic") — invoke `yarn`. Distinguished
+    /// from [`NpmFlavor::YarnBerry`] by the absence of the
+    /// `__metadata:` header at the top of the lockfile.
     Yarn,
+    /// `yarn.lock` (yarn ≥ 2 / "berry"). Berry core has no built-in
+    /// `outdated` command, so the proposer walks direct deps from
+    /// package.json and queries `yarn npm info <pkg> --json` per dep
+    /// to compute proposals. Apply uses `yarn up <pkg>@<ver>`.
+    YarnBerry,
 }
 
 impl NpmFlavor {
@@ -70,15 +73,31 @@ impl NpmFlavor {
         match self {
             NpmFlavor::Npm => "package-lock.json",
             NpmFlavor::Pnpm => "pnpm-lock.yaml",
-            NpmFlavor::Yarn => "yarn.lock",
+            NpmFlavor::Yarn | NpmFlavor::YarnBerry => "yarn.lock",
         }
     }
 }
 
 fn detect_flavor(repo: &Path) -> Option<NpmFlavor> {
-    [NpmFlavor::Npm, NpmFlavor::Pnpm, NpmFlavor::Yarn]
-        .into_iter()
-        .find(|flavor| repo.join(flavor.lockfile_name()).is_file())
+    // Order matters: npm + pnpm lockfiles are unambiguous. yarn.lock
+    // is shared between yarn1 and berry; the `__metadata:` peek
+    // disambiguates. If somehow both yarn.lock and one of the others
+    // are present (a corrupt repo), npm/pnpm take precedence to match
+    // pre-berry behavior.
+    if repo.join("package-lock.json").is_file() {
+        return Some(NpmFlavor::Npm);
+    }
+    if repo.join("pnpm-lock.yaml").is_file() {
+        return Some(NpmFlavor::Pnpm);
+    }
+    if repo.join("yarn.lock").is_file() {
+        return if yarn_lock_is_berry(repo) {
+            Some(NpmFlavor::YarnBerry)
+        } else {
+            Some(NpmFlavor::Yarn)
+        };
+    }
+    None
 }
 
 /// Returns `true` when `yarn.lock` at `repo` is in the yarn berry
@@ -98,7 +117,9 @@ fn yarn_lock_is_berry(repo: &Path) -> bool {
     // Cap the inspection — large yarn.lock files (a few hundred KB) are
     // common and we don't want to materialize the whole thing just to
     // sniff the header.
-    text.lines().take(50).any(|line| line.trim() == "__metadata:")
+    text.lines()
+        .take(50)
+        .any(|line| line.trim() == "__metadata:")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -147,19 +168,6 @@ impl DependencyEcosystem for NpmEcosystem {
         let Some(flavor) = detect_flavor(repo) else {
             return Ok(Vec::new());
         };
-        if matches!(flavor, NpmFlavor::Yarn) && yarn_lock_is_berry(repo) {
-            // Yarn berry's `yarn npm outdated --json` shape differs from
-            // yarn1 in ways the parser/applier don't handle. Emit a
-            // clear message instead of silently returning 0 proposals
-            // (dogfood-tour-2026-05-19 finding G).
-            eprintln!(
-                "[npm] yarn berry detected at `{}/yarn.lock` (`__metadata:` header). \
-                 Berry is not supported by assay v0.1 — yarn1 lockfiles are. \
-                 Skipping the npm ecosystem for this scan_root.",
-                repo.display()
-            );
-            return Ok(Vec::new());
-        }
         let manifest_paths: Vec<PathBuf> = manifests
             .iter()
             .filter(|m| {
@@ -502,6 +510,7 @@ pub(crate) fn build_npm_proposals(
             notes: Vec::new(),
             bump_tier: tier,
             affected_consumers: Vec::new(),
+            explanation: None,
         });
     }
     proposals
@@ -541,6 +550,144 @@ fn compat_group(v: &semver::Version) -> (u64, u64, u64) {
     }
 }
 
+/// Build a structured [`crate::model::BumpExplanation`] for an npm
+/// version bump, paralleling [`classify_npm_bump`]. npm and cargo
+/// share the caret-compat model; the explanation mirrors the wording
+/// the cargo explainer uses but flags the ecosystem as npm so the
+/// report attribution is correct.
+pub(crate) fn explain_npm_bump(from: &str, to: &str) -> crate::model::BumpExplanation {
+    use crate::model::BumpExplanation;
+    use std::collections::BTreeMap;
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("from".into(), from.to_string());
+    inputs.insert("to".into(), to.to_string());
+
+    let (from_v, to_v) = match (semver::Version::parse(from), semver::Version::parse(to)) {
+        (Ok(f), Ok(t)) => (f, t),
+        _ => {
+            return BumpExplanation {
+                summary: format!(
+                    "npm: one or both versions unparseable as semver ({from} -> {to}); \
+                     classified Breaking conservatively so the operator reviews"
+                ),
+                rule: "npm:unparseable-semver".into(),
+                inputs,
+                decision: "breaking".into(),
+            };
+        }
+    };
+    let from_group = compat_group(&from_v);
+    let to_group = compat_group(&to_v);
+    inputs.insert(
+        "from_compat_group".into(),
+        format!("{}.{}.{}", from_group.0, from_group.1, from_group.2),
+    );
+    inputs.insert(
+        "to_compat_group".into(),
+        format!("{}.{}.{}", to_group.0, to_group.1, to_group.2),
+    );
+
+    if from_group == to_group {
+        let rule = match (from_v.major, from_v.minor) {
+            (0, 0) => "npm:caret-0-0-x-same-patch",
+            (0, _) => "npm:caret-0-x-same-minor",
+            _ => "npm:caret-major-1-plus",
+        };
+        let summary = match (from_v.major, from_v.minor) {
+            (0, 0) => format!(
+                "npm: 0.0.x band — each patch is its own caret group; {from} and {to} share \
+                 patch={}, so only the manifest pin keeps npm from bumping (Compatible)",
+                from_v.patch
+            ),
+            (0, _) => format!(
+                "npm: 0.x band — caret groups by minor; both versions share minor={}, so \
+                 only the manifest pin keeps npm from bumping (Compatible)",
+                from_v.minor
+            ),
+            _ => format!(
+                "npm: 1.0+ band — caret groups by major; both versions share major={}, so \
+                 only the manifest pin keeps npm from bumping (Compatible)",
+                from_v.major
+            ),
+        };
+        BumpExplanation {
+            summary,
+            rule: rule.into(),
+            inputs,
+            decision: "compatible".into(),
+        }
+    } else {
+        let rule = match (from_v.major, from_v.minor) {
+            (0, 0) => "npm:caret-0-0-x-patch-crossed",
+            (0, _) if from_v.minor != to_v.minor => "npm:caret-0-x-minor-crossed",
+            _ if from_v.major != to_v.major => "npm:caret-major-crossed",
+            _ => "npm:caret-group-crossed",
+        };
+        let summary = match (from_v.major, from_v.minor) {
+            (0, 0) => format!(
+                "npm: 0.0.x band — every patch is breaking-by-spec; {from} -> {to} crosses \
+                 a patch boundary"
+            ),
+            (0, _) if from_v.minor != to_v.minor => format!(
+                "npm: 0.x band — minor bumps are breaking-by-spec; {from} -> {to} crosses \
+                 minor={} -> minor={}",
+                from_v.minor, to_v.minor
+            ),
+            _ if from_v.major != to_v.major => format!(
+                "npm: 1.0+ band — major bumps are breaking-by-spec; {from} -> {to} crosses \
+                 major={} -> major={}",
+                from_v.major, to_v.major
+            ),
+            _ => format!(
+                "npm: bump crosses a caret-compat group boundary; {from} -> {to} requires \
+                 review"
+            ),
+        };
+        BumpExplanation {
+            summary,
+            rule: rule.into(),
+            inputs,
+            decision: "breaking".into(),
+        }
+    }
+}
+
+/// Build a `LockfileOnly` explanation — the new version satisfies the
+/// existing constraint and only `package-lock.json` / `pnpm-lock.yaml`
+/// / `yarn.lock` changes.
+pub(crate) fn explain_npm_lockfile_only_bump(
+    from: &str,
+    to: &str,
+    constraint: Option<&str>,
+) -> crate::model::BumpExplanation {
+    use crate::model::BumpExplanation;
+    use std::collections::BTreeMap;
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("from".into(), from.to_string());
+    inputs.insert("to".into(), to.to_string());
+    if let Some(c) = constraint {
+        inputs.insert("constraint".into(), c.to_string());
+    }
+    let summary = match constraint {
+        Some(c) => format!(
+            "npm: new version {to} satisfies the existing constraint `{c}`; only the \
+             lockfile changes (no manifest edit required)"
+        ),
+        None => format!(
+            "npm: new version {to} satisfies the existing constraint; only the lockfile \
+             changes (no manifest edit required)"
+        ),
+    };
+    BumpExplanation {
+        summary,
+        rule: "npm:lockfile-within-constraint".into(),
+        inputs,
+        decision: "lockfile-only".into(),
+    }
+}
+
 /// Filter proposals down to direct deps declared in `package.json` (root
 /// + any workspace members). Drops transitive entries that `npm
 /// outdated` surfaces but the applier can't widen.
@@ -563,6 +710,13 @@ fn run_npm_proposer(
     if bin.is_empty() {
         return Ok(Vec::new());
     }
+    // Yarn berry has no built-in `outdated` and goes through a
+    // dedicated proposer that walks direct deps + queries `yarn npm
+    // info` per dep. Route here instead of falling through the
+    // outdated-subprocess path below.
+    if matches!(flavor, NpmFlavor::YarnBerry) {
+        return propose_berry_updates(repo, manifest_paths);
+    }
     let args: &[&str] = match flavor {
         // `npm outdated` from a workspace root enumerates workspace
         // member deps via npm 7+ flattening; no recursive flag needed.
@@ -575,6 +729,8 @@ fn run_npm_proposer(
         // workspaces in the same shape; yarn 1's `outdated --json`
         // surfaces the project's flat dep set.
         NpmFlavor::Yarn => &["outdated", "--json"],
+        // Routed above.
+        NpmFlavor::YarnBerry => unreachable!("YarnBerry handled by propose_berry_updates"),
     };
 
     let mut cmd = std::process::Command::new(bin);
@@ -594,6 +750,9 @@ fn run_npm_proposer(
 
     let mut rows = match flavor {
         NpmFlavor::Yarn => parse_yarn1_outdated_output(&stdout_str)?,
+        NpmFlavor::YarnBerry => {
+            unreachable!("YarnBerry routed through propose_berry_updates")
+        }
         _ => parse_npm_outdated_output(&stdout_str)?,
     };
     // When `node_modules` isn't materialized, `npm outdated` omits the
@@ -716,6 +875,285 @@ fn extend_dep_names(pkg: &serde_json::Value, names: &mut BTreeSet<String>) {
     }
 }
 
+/// Like [`collect_direct_dep_names`], but pairs each name with its
+/// declared constraint string from package.json. Used by the berry
+/// proposer to know what range each direct dep is pinned to so the
+/// applier can preserve operator-chosen prefixes. Workspace-member
+/// deps merge into the result; later-walked members override earlier
+/// ones on key collision (rare in practice — a workspace shouldn't
+/// declare the same dep at two different constraints across members).
+pub(crate) fn collect_direct_deps_with_constraints(
+    repo: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let root_pkg = repo.join("package.json");
+    if root_pkg.is_file() {
+        let text = std::fs::read_to_string(&root_pkg).map_err(|source| Error::Io {
+            path: root_pkg.clone(),
+            source,
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| Error::other(format!("package.json parse: {e}")))?;
+        extend_dep_constraints(&value, &mut out);
+    }
+    for member in detect_workspace_members(repo)? {
+        let member_pkg = repo.join(&member.relative_path).join("package.json");
+        if !member_pkg.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&member_pkg).map_err(|source| Error::Io {
+            path: member_pkg.clone(),
+            source,
+        })?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            extend_dep_constraints(&value, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+fn extend_dep_constraints(pkg: &serde_json::Value, out: &mut BTreeMap<String, String>) {
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(obj) = pkg.get(field).and_then(|v| v.as_object()) {
+            for (key, value) in obj {
+                if let Some(s) = value.as_str() {
+                    out.insert(key.clone(), s.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Parse a yarn berry `yarn.lock` file (YAML format with descriptor
+/// blocks) and return a `subject -> installed_version` map.
+///
+/// Berry yarn.lock entries look like:
+/// ```yaml
+/// "lodash@npm:^4.17.21":
+///   version: 4.17.21
+///   resolution: "lodash@npm:4.17.21"
+/// ```
+/// Multiple descriptors may share a block via comma-separation. The
+/// `__metadata:` header is skipped. Entries with no top-level `version`
+/// field (e.g. workspace-protocol entries) are skipped — we can't
+/// compare against a "current" version for them.
+pub(crate) fn parse_berry_lockfile(text: &str) -> Result<BTreeMap<String, String>> {
+    let value: serde_yml::Value = serde_yml::from_str(text)
+        .map_err(|e| Error::other(format!("yarn.lock (berry) parse: {e}")))?;
+    let mut out = BTreeMap::new();
+    let Some(top) = value.as_mapping() else {
+        return Ok(out);
+    };
+    for (key, val) in top {
+        let Some(descriptor_blob) = key.as_str() else {
+            continue;
+        };
+        if descriptor_blob == "__metadata" {
+            continue;
+        }
+        let Some(version) = val
+            .as_mapping()
+            .and_then(|m| m.get(serde_yml::Value::String("version".into())))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        // The blob may carry multiple comma-separated descriptors
+        // pointing at the same resolution. Yield one map entry per
+        // distinct package name; if a name appears twice across
+        // blobs (rare — same dep at two pinned versions) the last
+        // wins, matching how berry itself surfaces the package.
+        for descriptor in descriptor_blob.split(',').map(str::trim) {
+            if descriptor.is_empty() {
+                continue;
+            }
+            if let Some(name) = parse_berry_descriptor_name(descriptor) {
+                out.insert(name, version.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Extract just the package name from a berry descriptor.
+///
+/// Berry descriptors look like `<name>@<protocol>:<range>`, e.g.
+/// `lodash@npm:^4.17.21` or `@types/node@npm:^20.10.0`. Scoped names
+/// start with `@` and the relevant `@` separator is the SECOND `@`.
+/// Workspace-protocol entries (`my-pkg@workspace:^`) parse the same
+/// way; the caller decides whether to use them.
+fn parse_berry_descriptor_name(descriptor: &str) -> Option<String> {
+    let trimmed = descriptor.trim().trim_matches('"');
+    // Scoped names: find the second `@` (the one preceded by a
+    // non-`@` char).
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        let at = rest.find('@')?;
+        Some(format!("@{}", &rest[..at]))
+    } else {
+        let at = trimmed.find('@')?;
+        Some(trimmed[..at].to_string())
+    }
+}
+
+/// Query `yarn npm info <pkg> --json` for `pkg`'s latest registry
+/// version. Returns the version string from `dist-tags.latest`, or
+/// `None` when the query fails, the package isn't on the registry,
+/// or the response shape doesn't carry the expected fields.
+///
+/// Berry projects typically pin a specific yarn version via
+/// `packageManager` in package.json and rely on
+/// [corepack](https://nodejs.org/api/corepack.html) to dispatch the
+/// `yarn` command to that version. The `yarn` binary on PATH may
+/// itself be yarn1 (from a global `npm install -g yarn`) — that
+/// binary rejects the berry-specific `yarn npm info` subcommand. To
+/// support both shapes we try `corepack yarn ...` first (works on
+/// every modern Node), then fall back to direct `yarn ...` for
+/// environments where corepack isn't installed but the on-PATH
+/// `yarn` is already a berry-capable shim.
+///
+/// Errors are NOT bubbled — a single registry hiccup shouldn't tank
+/// the whole proposer run.
+fn query_berry_latest_version(repo: &Path, pkg: &str) -> Option<String> {
+    let yarn_bin = npm_binary_name(NpmFlavor::YarnBerry);
+    // On Windows, npm-family binaries ship as `.cmd` shims around
+    // node scripts; `Command::new` resolves only `.exe` automatically.
+    // Same applies to corepack.
+    let corepack_bin = if cfg!(windows) {
+        "corepack.cmd"
+    } else {
+        "corepack"
+    };
+    let attempts: &[(&str, &[&str])] = &[
+        // Corepack-mediated path. `corepack yarn ...` honours
+        // package.json's `packageManager` field and reliably runs
+        // berry even when the global `yarn` shim is yarn1.
+        (corepack_bin, &["yarn", "npm", "info", pkg, "--json"]),
+        // Direct path. Works when `yarn` itself is a berry binary
+        // (e.g. when the project pins berry via `.yarn/releases/...`
+        // and the shim PATH integration is set up correctly).
+        (yarn_bin, &["npm", "info", pkg, "--json"]),
+    ];
+    for (bin, args) in attempts {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(*args).current_dir(repo);
+        let run = match run_with_timeout(cmd, std::time::Duration::from_secs(30)) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let RunResult::Completed { status, stdout, .. } = run else {
+            continue;
+        };
+        if !status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&stdout);
+        // berry's stdout may be a single JSON object or one-line-per-
+        // package JSON streamed by `npm info`. Try whole-string parse
+        // first, then fall back to the first parseable line.
+        let trimmed = text.trim();
+        let parsed = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .or_else(|| {
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            });
+        let Some(value) = parsed else {
+            continue;
+        };
+        if let Some(latest) = value
+            .get("dist-tags")
+            .and_then(|v| v.get("latest"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(latest.to_string());
+        }
+        if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
+/// Yarn berry proposer — walks direct deps from package.json (root +
+/// workspace members), queries `yarn npm info` for each, compares
+/// against the berry yarn.lock's installed version, and emits one
+/// proposal per (newer-version-available) dep.
+///
+/// Berry has no built-in `outdated` command in core (it was removed
+/// in v2; a third-party plugin exists but isn't shipped by default),
+/// so this per-dep walk is the canonical reliable path. Per-dep
+/// registry queries are slow (N subprocesses per project) but
+/// deterministic and don't require a plugin install.
+fn propose_berry_updates(repo: &Path, manifest_paths: &[PathBuf]) -> Result<Vec<Proposal>> {
+    let direct = collect_direct_deps_with_constraints(repo)?;
+    if direct.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lockfile_path = repo.join("yarn.lock");
+    let installed = match std::fs::read_to_string(&lockfile_path) {
+        Ok(text) => parse_berry_lockfile(&text)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(err) => {
+            return Err(Error::Io {
+                path: lockfile_path,
+                source: err,
+            });
+        }
+    };
+    let mut rows: Vec<NpmOutdatedRow> = Vec::new();
+    let mut queried = 0usize;
+    let mut succeeded = 0usize;
+    for name in direct.keys() {
+        queried += 1;
+        let current = installed.get(name).cloned();
+        let Some(latest) = query_berry_latest_version(repo, name) else {
+            continue;
+        };
+        succeeded += 1;
+        // Skip when no current version is known (dep declared but
+        // never installed) or when the lockfile already matches the
+        // latest registry version.
+        let Some(current) = current else { continue };
+        if current == latest {
+            continue;
+        }
+        // Berry has no `wanted` signal (the in-constraint maximum
+        // npm/pnpm both expose). Setting `wanted = current` forces
+        // [`build_npm_proposals`] to route through
+        // [`classify_npm_bump`] rather than collapsing every bump
+        // to `LockfileOnly`. That keeps the tier classification
+        // honest: an exact-pin constraint that doesn't satisfy
+        // `latest` produces a Compatible/Breaking proposal that
+        // requires manifest editing, while a caret-anchored
+        // constraint that does satisfy `latest` will be re-tiered
+        // to LockfileOnly by a future enhancement that inspects
+        // the constraint string. For now we err on the side of
+        // requiring the operator to review constraint edits.
+        rows.push(NpmOutdatedRow {
+            name: name.clone(),
+            current: Some(current.clone()),
+            wanted: current,
+            latest,
+        });
+    }
+    if queried > 0 && succeeded == 0 {
+        eprintln!(
+            "[npm:berry] queried {queried} direct dep(s) via `corepack yarn npm info` and `yarn npm info`; \
+             neither pathway returned a usable registry response. Install corepack (or a berry-capable \
+             yarn binary on PATH) so assay can resolve registry versions for this project.",
+        );
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(build_npm_proposals(&rows, manifest_paths))
+}
+
 /// Apply an npm proposal:
 ///
 /// - **LockfileOnly:** install the explicit target version with
@@ -770,7 +1208,6 @@ fn run_install_pinned(
     version: &str,
     tree_path: &Path,
 ) -> Result<()> {
-    let bin = npm_binary_name(flavor);
     let pinned = format!("{name}@{version}");
     let args: Vec<&str> = match flavor {
         NpmFlavor::Npm => vec![
@@ -785,15 +1222,20 @@ fn run_install_pinned(
         // package.json + yarn.lock; same snapshot/restore wrapper
         // around it ensures LockfileOnly intent.
         NpmFlavor::Yarn => vec!["upgrade", &pinned, "--exact"],
+        // yarn berry: `yarn up <pkg>@<ver>` bumps both
+        // package.json + yarn.lock. Berry's `up` has no `--exact`
+        // flag — exactness comes from passing a fully-specified
+        // version (no `^`/`~`); the snapshot/restore wrapper still
+        // applies for LockfileOnly intent.
+        NpmFlavor::YarnBerry => vec!["up", &pinned],
     };
     let package_json = tree_path.join("package.json");
     let snapshot = std::fs::read(&package_json).map_err(|source| Error::Io {
         path: package_json.clone(),
         source,
     })?;
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(&args).current_dir(tree_path);
-    let install_result = run_install_with_timeout(cmd, bin, tree_path);
+    let (cmd, bin_label) = build_npm_install_command(flavor, &args, tree_path);
+    let install_result = run_install_with_timeout(cmd, bin_label, tree_path);
     // Restore package.json verbatim even if install failed — leaves the
     // sandbox in a sane state for diagnostics. The Result from install
     // is still propagated.
@@ -805,17 +1247,51 @@ fn run_install_pinned(
 /// rationale for dropping `--package-lock-only` as in
 /// [`run_install_pinned`].
 fn run_install_lockfile_only(flavor: NpmFlavor, tree_path: &Path) -> Result<()> {
-    let bin = npm_binary_name(flavor);
     let args: &[&str] = match flavor {
         NpmFlavor::Npm => &["install", "--no-audit", "--no-fund"],
         NpmFlavor::Pnpm => &["install"],
         // yarn1: `yarn install` refreshes yarn.lock against the
         // freshly-edited package.json.
         NpmFlavor::Yarn => &["install"],
+        // yarn berry: same `yarn install` refresh shape.
+        NpmFlavor::YarnBerry => &["install"],
     };
-    let mut cmd = std::process::Command::new(bin);
-    cmd.args(args).current_dir(tree_path);
-    run_install_with_timeout(cmd, bin, tree_path)
+    let (cmd, bin_label) = build_npm_install_command(flavor, args, tree_path);
+    run_install_with_timeout(cmd, bin_label, tree_path)
+}
+
+/// Build the `std::process::Command` for an npm-family install. For
+/// `YarnBerry` this routes through `corepack yarn ...` so the project's
+/// `packageManager` field selects the right yarn version — invoking the
+/// global `yarn` binary directly fails when it's yarn1 but the project
+/// pins berry. For other flavors it returns the binary directly.
+///
+/// Returns `(Command, bin_label)` where `bin_label` is the string used
+/// in error messages (e.g. `"corepack yarn"` for berry,
+/// `"yarn.cmd"` for yarn1).
+fn build_npm_install_command(
+    flavor: NpmFlavor,
+    args: &[&str],
+    tree_path: &Path,
+) -> (std::process::Command, &'static str) {
+    match flavor {
+        NpmFlavor::YarnBerry => {
+            let corepack_bin = if cfg!(windows) {
+                "corepack.cmd"
+            } else {
+                "corepack"
+            };
+            let mut cmd = std::process::Command::new(corepack_bin);
+            cmd.arg("yarn").args(args).current_dir(tree_path);
+            (cmd, "corepack yarn")
+        }
+        _ => {
+            let bin = npm_binary_name(flavor);
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(args).current_dir(tree_path);
+            (cmd, bin)
+        }
+    }
 }
 
 fn run_install_with_timeout(cmd: std::process::Command, bin: &str, tree_path: &Path) -> Result<()> {
@@ -1231,14 +1707,20 @@ fn npm_binary_name(flavor: NpmFlavor) -> &'static str {
         (NpmFlavor::Npm, false) => "npm",
         (NpmFlavor::Pnpm, true) => "pnpm.cmd",
         (NpmFlavor::Pnpm, false) => "pnpm",
-        (NpmFlavor::Yarn, true) => "yarn.cmd",
-        (NpmFlavor::Yarn, false) => "yarn",
+        // yarn1 and yarn berry share the `yarn` shim — berry projects
+        // route through corepack or `.yarn/releases/yarn-*.cjs`, but
+        // from assay's point of view the binary on PATH is the same
+        // name and the per-project resolution picks the right binary.
+        (NpmFlavor::Yarn | NpmFlavor::YarnBerry, true) => "yarn.cmd",
+        (NpmFlavor::Yarn | NpmFlavor::YarnBerry, false) => "yarn",
     }
 }
 
 /// Reverse [`npm_binary_name`]; used by the install path to recover the
-/// flavor when it has only the bin string in hand. Defensive — returns
-/// `None` for any name that didn't come from `npm_binary_name`.
+/// flavor when it has only the bin string in hand. Returns `Yarn`
+/// (yarn1) for the yarn shim because the bin name alone can't
+/// distinguish yarn1 from berry — the diagnostic uses this for the
+/// error message wording, which is the same for both ("yarn not found").
 fn flavor_from_binary_name(bin: &str) -> Option<NpmFlavor> {
     match bin {
         "npm" | "npm.cmd" => Some(NpmFlavor::Npm),
@@ -1254,17 +1736,12 @@ fn flavor_from_binary_name(bin: &str) -> Option<NpmFlavor> {
 /// `io error reading {repo}: program not found` that bubbled up before
 /// (see dogfood-tour-2026-05-19 finding E). All other IO failures
 /// pass through verbatim.
-fn map_npm_spawn_io(
-    source: std::io::Error,
-    bin: &str,
-    flavor: NpmFlavor,
-    repo: &Path,
-) -> Error {
+fn map_npm_spawn_io(source: std::io::Error, bin: &str, flavor: NpmFlavor, repo: &Path) -> Error {
     if source.kind() == std::io::ErrorKind::NotFound {
         let flavor_name = match flavor {
             NpmFlavor::Npm => "npm",
             NpmFlavor::Pnpm => "pnpm",
-            NpmFlavor::Yarn => "yarn",
+            NpmFlavor::Yarn | NpmFlavor::YarnBerry => "yarn",
         };
         return Error::other(format!(
             "{bin} not found on PATH; install {flavor_name} to analyze \
@@ -1388,6 +1865,140 @@ mod tests {
     fn yarn_lock_is_berry_returns_false_when_file_absent() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!yarn_lock_is_berry(tmp.path()));
+    }
+
+    // -------------------------------------------------------------------------
+    // yarn berry proposer — descriptor + lockfile parser + flavor routing.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn detect_flavor_returns_yarn_berry_when_metadata_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            repo.join("yarn.lock"),
+            "__metadata:\n  version: 9\n\n\"x@npm:^1\":\n  version: 1.0.0\n",
+        )
+        .unwrap();
+        assert_eq!(detect_flavor(repo), Some(NpmFlavor::YarnBerry));
+    }
+
+    #[test]
+    fn detect_flavor_returns_yarn1_when_no_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            repo.join("yarn.lock"),
+            "# yarn lockfile v1\n\nx@^1.0.0:\n  version \"1.0.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(detect_flavor(repo), Some(NpmFlavor::Yarn));
+    }
+
+    #[test]
+    fn parse_berry_descriptor_name_handles_unscoped_packages() {
+        assert_eq!(
+            parse_berry_descriptor_name("lodash@npm:^4.17.21"),
+            Some("lodash".into())
+        );
+        assert_eq!(
+            parse_berry_descriptor_name("\"lodash@npm:^4.17.21\""),
+            Some("lodash".into())
+        );
+    }
+
+    #[test]
+    fn parse_berry_descriptor_name_handles_scoped_packages() {
+        assert_eq!(
+            parse_berry_descriptor_name("@types/node@npm:^20.10.0"),
+            Some("@types/node".into())
+        );
+        assert_eq!(
+            parse_berry_descriptor_name("\"@angular/compiler@npm:21.2.13\""),
+            Some("@angular/compiler".into())
+        );
+    }
+
+    #[test]
+    fn parse_berry_descriptor_name_handles_workspace_protocol() {
+        assert_eq!(
+            parse_berry_descriptor_name("my-pkg@workspace:^"),
+            Some("my-pkg".into())
+        );
+    }
+
+    #[test]
+    fn parse_berry_lockfile_extracts_subject_to_version_map() {
+        let lockfile = "__metadata:\n  version: 9\n  cacheKey: 10\n\n\
+                        \"lodash@npm:^4.17.21\":\n  version: 4.17.21\n  resolution: \"lodash@npm:4.17.21\"\n\n\
+                        \"@types/node@npm:^20.10.0\":\n  version: 20.10.5\n  resolution: \"@types/node@npm:20.10.5\"\n";
+        let map = parse_berry_lockfile(lockfile).unwrap();
+        assert_eq!(map.get("lodash").map(String::as_str), Some("4.17.21"));
+        assert_eq!(map.get("@types/node").map(String::as_str), Some("20.10.5"));
+    }
+
+    #[test]
+    fn parse_berry_lockfile_skips_metadata_block() {
+        let lockfile = "__metadata:\n  version: 9\n\n\"x@npm:^1\":\n  version: 1.0.0\n";
+        let map = parse_berry_lockfile(lockfile).unwrap();
+        assert!(!map.contains_key("__metadata"));
+        assert_eq!(map.get("x").map(String::as_str), Some("1.0.0"));
+    }
+
+    #[test]
+    fn parse_berry_lockfile_handles_comma_separated_descriptors() {
+        // Multiple descriptors for the same resolution share an entry.
+        // Both should yield the same version.
+        let lockfile = "\"lodash@npm:^4.17.21, lodash@npm:^4.17.20\":\n  version: 4.17.21\n";
+        let map = parse_berry_lockfile(lockfile).unwrap();
+        assert_eq!(map.get("lodash").map(String::as_str), Some("4.17.21"));
+    }
+
+    #[test]
+    fn parse_berry_lockfile_skips_entries_without_version() {
+        // Workspace-protocol entries often have a `linkType:` and a
+        // `version` field, but defensive: if `version` is missing, skip.
+        let lockfile = "\"odd-one@workspace:packages/odd\":\n  resolution: \"odd-one@workspace:packages/odd\"\n";
+        let map = parse_berry_lockfile(lockfile).unwrap();
+        assert!(!map.contains_key("odd-one"));
+    }
+
+    #[test]
+    fn parse_berry_lockfile_returns_empty_for_garbage() {
+        // Malformed YAML returns an error, but the parser surfaces it
+        // via Result rather than panicking. The proposer routes
+        // through Err and aborts the scan_root.
+        let map = parse_berry_lockfile("__metadata:\n  version: 9\n");
+        assert!(map.is_ok());
+    }
+
+    #[test]
+    fn propose_berry_updates_returns_empty_when_no_direct_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("package.json"), "{}").unwrap();
+        std::fs::write(repo.join("yarn.lock"), "__metadata:\n  version: 9\n").unwrap();
+        let proposals = propose_berry_updates(repo, &[]).unwrap();
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn collect_direct_deps_with_constraints_records_constraint_strings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"dependencies":{"lodash":"^4.17.21"},"devDependencies":{"@types/node":"~20.10.0"}}"#,
+        )
+        .unwrap();
+        let deps = collect_direct_deps_with_constraints(repo).unwrap();
+        assert_eq!(deps.get("lodash").map(String::as_str), Some("^4.17.21"));
+        assert_eq!(
+            deps.get("@types/node").map(String::as_str),
+            Some("~20.10.0")
+        );
     }
 
     #[test]
@@ -1565,6 +2176,49 @@ mod tests {
     fn classify_npm_zero_dot_x_groups_by_minor() {
         assert_eq!(classify_npm_bump("0.18.1", "0.18.7"), BumpTier::Compatible);
         assert_eq!(classify_npm_bump("0.18.1", "0.20.0"), BumpTier::Breaking);
+    }
+
+    // -------------------------------------------------------------------------
+    // explain_npm_bump — structured rationale for --explain.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn explain_npm_same_major_1_plus_returns_compatible() {
+        let exp = explain_npm_bump("1.0.0", "1.5.0");
+        assert_eq!(exp.decision, "compatible");
+        assert_eq!(exp.rule, "npm:caret-major-1-plus");
+    }
+
+    #[test]
+    fn explain_npm_cross_major_returns_breaking() {
+        let exp = explain_npm_bump("1.5.0", "2.0.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "npm:caret-major-crossed");
+    }
+
+    #[test]
+    fn explain_npm_cross_minor_in_0_x_returns_breaking() {
+        let exp = explain_npm_bump("0.18.1", "0.20.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "npm:caret-0-x-minor-crossed");
+    }
+
+    #[test]
+    fn explain_npm_unparseable_returns_breaking() {
+        let exp = explain_npm_bump("not-a-version", "1.0.0");
+        assert_eq!(exp.decision, "breaking");
+        assert_eq!(exp.rule, "npm:unparseable-semver");
+    }
+
+    #[test]
+    fn explain_npm_lockfile_only_carries_constraint() {
+        let exp = explain_npm_lockfile_only_bump("4.17.20", "4.17.21", Some("^4.17.0"));
+        assert_eq!(exp.decision, "lockfile-only");
+        assert_eq!(exp.rule, "npm:lockfile-within-constraint");
+        assert_eq!(
+            exp.inputs.get("constraint").map(String::as_str),
+            Some("^4.17.0")
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1920,6 +2574,7 @@ mod tests {
             notes: vec![],
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
@@ -1941,6 +2596,7 @@ mod tests {
             notes: vec![],
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
+            explanation: None,
         }
     }
 
