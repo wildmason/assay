@@ -57,8 +57,11 @@ enum NpmFlavor {
     Npm,
     /// `pnpm-lock.yaml` — invoke `pnpm`.
     Pnpm,
-    /// `yarn.lock` — recognized but not actionable in v1 (different
-    /// `yarn outdated --json` format).
+    /// `yarn.lock` (yarn 1 / "classic") — invoke `yarn`. Yarn berry
+    /// (yarn ≥ 2) writes a `yarn.lock` with a `__metadata` header and
+    /// is **not** supported by this flavor; berry's outdated UX is
+    /// `yarn npm outdated --json` (different shape) and is intentionally
+    /// out of scope for v1.
     Yarn,
 }
 
@@ -76,6 +79,26 @@ fn detect_flavor(repo: &Path) -> Option<NpmFlavor> {
     [NpmFlavor::Npm, NpmFlavor::Pnpm, NpmFlavor::Yarn]
         .into_iter()
         .find(|flavor| repo.join(flavor.lockfile_name()).is_file())
+}
+
+/// Returns `true` when `yarn.lock` at `repo` is in the yarn berry
+/// (yarn ≥ 2) format. Berry files open with a `__metadata:` header
+/// block. Yarn 1's lockfile has no such block — entries start
+/// immediately with the package descriptor (`<name>@<version>:` form).
+///
+/// This is a cheap content peek (first ~512 bytes); we don't parse the
+/// whole file. Falsey on read errors so the caller still attempts
+/// proposal generation rather than spuriously bailing on a transient
+/// filesystem hiccup.
+fn yarn_lock_is_berry(repo: &Path) -> bool {
+    let path = repo.join("yarn.lock");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    // Cap the inspection — large yarn.lock files (a few hundred KB) are
+    // common and we don't want to materialize the whole thing just to
+    // sniff the header.
+    text.lines().take(50).any(|line| line.trim() == "__metadata:")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -124,6 +147,19 @@ impl DependencyEcosystem for NpmEcosystem {
         let Some(flavor) = detect_flavor(repo) else {
             return Ok(Vec::new());
         };
+        if matches!(flavor, NpmFlavor::Yarn) && yarn_lock_is_berry(repo) {
+            // Yarn berry's `yarn npm outdated --json` shape differs from
+            // yarn1 in ways the parser/applier don't handle. Emit a
+            // clear message instead of silently returning 0 proposals
+            // (dogfood-tour-2026-05-19 finding G).
+            eprintln!(
+                "[npm] yarn berry detected at `{}/yarn.lock` (`__metadata:` header). \
+                 Berry is not supported by assay v0.1 — yarn1 lockfiles are. \
+                 Skipping the npm ecosystem for this scan_root.",
+                repo.display()
+            );
+            return Ok(Vec::new());
+        }
         let manifest_paths: Vec<PathBuf> = manifests
             .iter()
             .filter(|m| {
@@ -267,10 +303,16 @@ struct OutdatedEntry {
     /// is in `package.json` but hasn't been installed yet.
     #[serde(default)]
     current: Option<String>,
-    /// Highest version that satisfies the current constraint.
-    wanted: String,
-    /// Most recent publish on the registry.
-    latest: String,
+    /// Highest version that satisfies the current constraint. Absent
+    /// when pnpm reports a `file:` / `link:` / `workspace:` dep — those
+    /// have no registry-side "wanted" to bump to and are skipped by
+    /// the proposer.
+    #[serde(default)]
+    wanted: Option<String>,
+    /// Most recent publish on the registry. Absent for the same
+    /// non-registry dep flavors as `wanted` above.
+    #[serde(default)]
+    latest: Option<String>,
 }
 
 /// One JSON value per dep emitted by `npm outdated --json`.
@@ -328,11 +370,17 @@ pub(crate) fn parse_npm_outdated_output(stdout: &str) -> Result<Vec<NpmOutdatedR
                 None => continue,
             },
         };
+        // Skip non-registry deps (`file:`, `link:`, `workspace:`) — pnpm
+        // -r emits these with `wanted` or `latest` absent (or a path-shaped
+        // `wanted`), and there's no registry-side version to bump to.
+        let (Some(wanted), Some(latest)) = (entry.wanted, entry.latest) else {
+            continue;
+        };
         rows.push(NpmOutdatedRow {
             name,
             current: entry.current,
-            wanted: entry.wanted,
-            latest: entry.latest,
+            wanted,
+            latest,
         });
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -516,18 +564,23 @@ fn run_npm_proposer(
         return Ok(Vec::new());
     }
     let args: &[&str] = match flavor {
+        // `npm outdated` from a workspace root enumerates workspace
+        // member deps via npm 7+ flattening; no recursive flag needed.
         NpmFlavor::Npm => &["outdated", "--json"],
-        NpmFlavor::Pnpm => &["outdated", "--format=json"],
+        // `pnpm outdated` from a workspace root reports ONLY the root
+        // package's deps. `-r` (recursive) enumerates every workspace
+        // member's outdated entries; without it, monorepos look empty.
+        NpmFlavor::Pnpm => &["outdated", "-r", "--format=json"],
+        // Yarn 1 has no `-r` analogue and doesn't ship native
+        // workspaces in the same shape; yarn 1's `outdated --json`
+        // surfaces the project's flat dep set.
         NpmFlavor::Yarn => &["outdated", "--json"],
     };
 
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args).current_dir(repo);
-    let run =
-        run_with_timeout(cmd, std::time::Duration::from_secs(120)).map_err(|source| Error::Io {
-            path: repo.to_path_buf(),
-            source,
-        })?;
+    let run = run_with_timeout(cmd, std::time::Duration::from_secs(120))
+        .map_err(|source| map_npm_spawn_io(source, bin, flavor, repo))?;
     let RunResult::Completed { status, stdout, .. } = run else {
         return Err(Error::other(format!(
             "{bin} outdated timed out against `{}`",
@@ -766,11 +819,13 @@ fn run_install_lockfile_only(flavor: NpmFlavor, tree_path: &Path) -> Result<()> 
 }
 
 fn run_install_with_timeout(cmd: std::process::Command, bin: &str, tree_path: &Path) -> Result<()> {
-    let run =
-        run_with_timeout(cmd, std::time::Duration::from_secs(300)).map_err(|source| Error::Io {
-            path: tree_path.to_path_buf(),
-            source,
-        })?;
+    // Recover the flavor from the binary name so a missing-binary
+    // error from the install path produces the same flavor-aware
+    // message as the proposer path. Fallback to npm if we can't
+    // recognize it (defensive — bin always comes from npm_binary_name).
+    let flavor = flavor_from_binary_name(bin).unwrap_or(NpmFlavor::Npm);
+    let run = run_with_timeout(cmd, std::time::Duration::from_secs(300))
+        .map_err(|source| map_npm_spawn_io(source, bin, flavor, tree_path))?;
     let RunResult::Completed {
         status,
         stdout,
@@ -1176,7 +1231,50 @@ fn npm_binary_name(flavor: NpmFlavor) -> &'static str {
         (NpmFlavor::Npm, false) => "npm",
         (NpmFlavor::Pnpm, true) => "pnpm.cmd",
         (NpmFlavor::Pnpm, false) => "pnpm",
-        (NpmFlavor::Yarn, _) => "",
+        (NpmFlavor::Yarn, true) => "yarn.cmd",
+        (NpmFlavor::Yarn, false) => "yarn",
+    }
+}
+
+/// Reverse [`npm_binary_name`]; used by the install path to recover the
+/// flavor when it has only the bin string in hand. Defensive — returns
+/// `None` for any name that didn't come from `npm_binary_name`.
+fn flavor_from_binary_name(bin: &str) -> Option<NpmFlavor> {
+    match bin {
+        "npm" | "npm.cmd" => Some(NpmFlavor::Npm),
+        "pnpm" | "pnpm.cmd" => Some(NpmFlavor::Pnpm),
+        "yarn" | "yarn.cmd" => Some(NpmFlavor::Yarn),
+        _ => None,
+    }
+}
+
+/// Convert a spawn-time `io::Error` into a flavor-aware [`Error`].
+/// When the kind is `NotFound` (the package manager isn't on PATH),
+/// the message names the flavor — far more useful than the generic
+/// `io error reading {repo}: program not found` that bubbled up before
+/// (see dogfood-tour-2026-05-19 finding E). All other IO failures
+/// pass through verbatim.
+fn map_npm_spawn_io(
+    source: std::io::Error,
+    bin: &str,
+    flavor: NpmFlavor,
+    repo: &Path,
+) -> Error {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        let flavor_name = match flavor {
+            NpmFlavor::Npm => "npm",
+            NpmFlavor::Pnpm => "pnpm",
+            NpmFlavor::Yarn => "yarn",
+        };
+        return Error::other(format!(
+            "{bin} not found on PATH; install {flavor_name} to analyze \
+             {flavor_name}-flavored projects (detected from lockfile at `{}`)",
+            repo.display()
+        ));
+    }
+    Error::Io {
+        path: repo.to_path_buf(),
+        source,
     }
 }
 
@@ -1252,6 +1350,68 @@ mod tests {
         let rows = parse_npm_outdated_output(stdout).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].current, None);
+    }
+
+    #[test]
+    fn yarn_lock_is_berry_detects_metadata_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        // yarn berry shape — has `__metadata:` block at top.
+        std::fs::write(
+            repo.join("yarn.lock"),
+            "# This file is generated by running \"yarn install\" inside your project.\n\
+             # Manual changes might be lost - proceed with caution!\n\
+             \n\
+             __metadata:\n  version: 9\n  cacheKey: 10\n\n\
+             \"@angular/compiler@npm:21.2.13\":\n  version: 21.2.13\n",
+        )
+        .unwrap();
+        assert!(yarn_lock_is_berry(repo));
+    }
+
+    #[test]
+    fn yarn_lock_is_berry_returns_false_for_yarn1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        // yarn1 shape — no `__metadata:` block.
+        std::fs::write(
+            repo.join("yarn.lock"),
+            "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\
+             # yarn lockfile v1\n\n\
+             ansi-styles@^4.1.0:\n  version \"4.3.0\"\n",
+        )
+        .unwrap();
+        assert!(!yarn_lock_is_berry(repo));
+    }
+
+    #[test]
+    fn yarn_lock_is_berry_returns_false_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!yarn_lock_is_berry(tmp.path()));
+    }
+
+    #[test]
+    fn parse_outdated_skips_file_link_workspace_deps() {
+        // pnpm outdated -r emits entries for `file:` / `workspace:` deps
+        // with no `latest` (and/or a path-shaped `wanted`). These can't
+        // be bumped against a registry, so the parser drops them.
+        // Captured shape: real `pnpm outdated -r` against vite's
+        // `@vitejs/test-aliased-module` entry.
+        let stdout = r#"{
+            "regular": {"current":"1.0.0","wanted":"1.0.1","latest":"1.0.1"},
+            "@vitejs/test-aliased-module": {
+                "wanted": "@vitejs/test-aliased-module@file:playground/alias/dir/module",
+                "isDeprecated": false,
+                "dependencyType": "dependencies"
+            },
+            "internal-pkg": {
+                "wanted": "workspace:^",
+                "isDeprecated": false
+            }
+        }"#;
+        let rows = parse_npm_outdated_output(stdout).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "regular");
     }
 
     #[test]
