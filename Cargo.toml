@@ -1,12 +1,15 @@
 [package]
 name = "assay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wildmason/assay"
 homepage = "https://github.com/wildmason/assay"
 description = "Dependency upgrade impact analyzer — test upgrades against your projects' real CI before you adopt them"
+readme = "README.md"
+keywords = ["dependency", "upgrade", "ci", "cargo", "npm"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "assay"
