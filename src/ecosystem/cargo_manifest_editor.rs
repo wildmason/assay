@@ -70,6 +70,23 @@ pub fn update_constraint(
         .parse::<DocumentMut>()
         .map_err(|e| Error::other(format!("Cargo.toml parse error: {e}")))?;
 
+    // `[workspace.dependencies]` is the source-of-truth for workspaces
+    // that share constraints via `foo = { workspace = true }` in members.
+    // It MUST be tried first: a workspace root commonly carries both the
+    // declaration here AND a `foo.workspace = true` consumer entry in
+    // its own `[dependencies]` (when the root manifest is also a binary
+    // crate, as in rust-lang/cargo). Checking the consumer table first
+    // would short-circuit on the inheritance marker and silently skip
+    // the real edit site in the same file.
+    if let Some(outcome) = try_edit_at(
+        &mut doc,
+        &["workspace", "dependencies"],
+        crate_name,
+        new_version,
+    )? {
+        return finalize(doc, outcome);
+    }
+
     // Standard dep tables, in priority order. `dev-dependencies` and
     // `build-dependencies` matter when a single crate appears in
     // multiple sections — we edit the first match. If a real project
@@ -79,17 +96,6 @@ pub fn update_constraint(
         if let Some(outcome) = try_edit_at(&mut doc, &[table_name], crate_name, new_version)? {
             return finalize(doc, outcome);
         }
-    }
-
-    // `[workspace.dependencies]` is the source-of-truth for workspaces
-    // that share constraints via `foo = { workspace = true }` in members.
-    if let Some(outcome) = try_edit_at(
-        &mut doc,
-        &["workspace", "dependencies"],
-        crate_name,
-        new_version,
-    )? {
-        return finalize(doc, outcome);
     }
 
     // `[target.'<cfg>'.dependencies]` — iterate every cfg key. Member
@@ -933,6 +939,81 @@ foo = "*"
     // existing full-table path — but we lacked a regression test for
     // this real-world shape until the dogfood surfaced it.
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Workspace-root + binary-crate combined manifest.
+    //
+    // Real-world case caught by the rust-lang/cargo dogfood (2026-05-19):
+    // `cargo/Cargo.toml` is BOTH the workspace root (declaring
+    // `[workspace.dependencies] tar = { version = "0.4.45" }`) AND the
+    // cargo binary's manifest (declaring `[dependencies] tar.workspace = true`).
+    //
+    // Pre-fix, `update_constraint` iterated `[dependencies]` first, found
+    // `tar.workspace = true`, returned `inherited_from_workspace`
+    // (changed=false), and short-circuited without ever checking
+    // `[workspace.dependencies]` in the same manifest. The walker then
+    // moved on to member manifests, none of which carried
+    // `[workspace.dependencies]` either, and the apply failed with
+    // "no manifest carried a matching dep entry."
+    //
+    // Fix: try `[workspace.dependencies]` first. If the dep is declared
+    // there, the bump lands at the source-of-truth; if not, fall back
+    // to the other tables (where `workspace = true` correctly marks
+    // inheritance and the walker continues to the next manifest).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn edits_workspace_dependencies_when_root_also_inherits_in_its_own_dep_table() {
+        // Root manifest declares the constraint AND consumes it via
+        // workspace inheritance — the same manifest is both source and
+        // consumer.
+        let toml = r#"[workspace]
+members = []
+
+[workspace.dependencies]
+tar = { version = "0.4.45", default-features = false }
+
+[package]
+name = "cargo"
+version = "0.1.0"
+
+[dependencies]
+tar.workspace = true
+"#;
+        let (out, outcome) = update_constraint(toml, "tar", "0.4.46").unwrap().unwrap();
+        // The [workspace.dependencies] entry must be widened. The
+        // [dependencies] inheritance marker must survive unchanged.
+        assert!(
+            out.contains(r#"tar = { version = "0.4.46""#),
+            "[workspace.dependencies] tar must update: {out}"
+        );
+        assert!(
+            out.contains("tar.workspace = true"),
+            "[dependencies] inheritance marker must survive: {out}"
+        );
+        assert_eq!(outcome.table, "workspace.dependencies");
+        assert!(outcome.changed);
+    }
+
+    #[test]
+    fn member_with_workspace_inheritance_still_redirects_when_root_lacks_dep() {
+        // Member-only manifest that inherits — must still return the
+        // inheritance marker so the walker keeps looking in OTHER
+        // manifests (the root). This is the inverse of the fix above:
+        // when [workspace.dependencies] is absent, the walker MUST be
+        // able to defer to a different manifest.
+        let toml = r#"[package]
+name = "member"
+version = "0.1.0"
+
+[dependencies]
+tar = { workspace = true }
+"#;
+        let (out, outcome) = update_constraint(toml, "tar", "0.4.46").unwrap().unwrap();
+        assert_eq!(out, toml, "member manifest must not be rewritten");
+        assert!(!outcome.changed);
+        assert_eq!(outcome.previous, "workspace");
+    }
 
     #[test]
     fn edits_dotted_header_target_cfg_dep_entry() {
