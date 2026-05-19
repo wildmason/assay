@@ -1,3 +1,4 @@
 /target
 /.assay
+/.ci-forge
 **/*.rs.bk
