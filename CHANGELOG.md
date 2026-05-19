@@ -14,6 +14,8 @@ All notable changes to `assay` are documented here. Format follows [Keep a Chang
 - **Polyglot auto-detection.** Plain `assay analyze` on a Tauri-shape repo (Cargo at `src-tauri/`, npm at `ui/`, workflows at root) now auto-adds `src-tauri/Cargo.toml` and `ui/`/`frontend/`/`app/`/`web/`/`client/`'s `package.json` to scan roots when the repo root has no top-level manifest and `[project] roots` is empty.
 - **GitHub Actions ref-shape classifier.** Pin-loosening from immutable `1.85.0` to floating `v1` is now classified `Breaking` (not `Compatible`), surfacing the supply-chain regression the operator should review.
 - **README + CHANGELOG.** First public-facing docs.
+- **`--apply-pr` pre-flight `gh auth` check.** Verifies `gh` is installed and the active token carries `repo` scope BEFORE the validator runs, so unauthenticated operators fail fast instead of after minutes of validation. `--force` bypasses for the operator with reasons (manual PR-open path, `gh` in a non-standard location, etc.).
+- **`PullRequestBackend::list_labels`** — backend trait gained a label-listing method; `GhCliBackend` implements it via `gh api repos/<o>/<r>/labels --paginate --jq '.[].name'`. Used by the publisher to filter out non-existent labels before `gh pr create`.
 
 ### Changed
 
@@ -26,6 +28,8 @@ All notable changes to `assay` are documented here. Format follows [Keep a Chang
 
 ### Fixed
 
+- **`--apply-pr` hardcoded label crashed PR-open against repos without an `assay` label.** The publisher now reads labels from `config.pull_request.labels` (default `["assay", "dependencies"]`) and filters them through `backend.list_labels()` so missing labels are dropped with a stderr warning instead of failing `gh pr create`. On `list_labels` error the publisher drops all labels to preserve forward progress — the PR is the load-bearing artifact, labels are categorisation polish.
+- **`--apply-pr` "branch already exists" error gave no recovery hint.** When a prior run created a local branch and failed before PR open, retrying produced `git worktree add ... already exists` with no guidance. The new error message includes the exact cleanup commands (`git branch -D <branch>` and the corresponding remote-delete one-liner).
 - **Yarn1 silently disabled.** `npm_binary_name(Yarn)` returned an empty string, short-circuiting `run_npm_proposer`. Now returns `yarn.cmd` / `yarn`.
 - **Missing pnpm/yarn binary** produced the unhelpful `io error reading .: program not found`. New `map_npm_spawn_io` converts `NotFound` IO errors into `pnpm.cmd not found on PATH; install pnpm to analyze pnpm-flavored projects (detected from lockfile at <path>)`.
 - **Gitignored lockfile in apply-local.** `git add Cargo.lock` against a tokio-style repo that gitignores its lockfile no longer aborts the commit; the partitioned-add wrapper stages only tracked paths and surfaces the excluded paths as a warning.
@@ -38,7 +42,9 @@ All notable changes to `assay` are documented here. Format follows [Keep a Chang
 
 - Three new modules: `verdict_cache.rs`, `member_gate.rs`, expanded `validator.rs` cache integration.
 - New `BumpExplanation` model + per-ecosystem explainers (`cargo::explain_unchanged_bump`, `github_actions::explain_action_bump`, `npm::explain_npm_bump`).
-- Test count: 468 → 592 (+124).
+- **Removed `publisher::UnconfiguredBackend` stub** + its module-level docstring that referenced the abandoned GitHub-App / installation-token design. `GhCliBackend` is the only live backend; the publisher's design rationale now matches the code.
+- `--apply-pr` end-to-end dogfood against `wildmason/safe-bundle`. See `docs/dogfood-tour-apply-pr-2026-05-19.md`.
+- Test count: 468 → 603 (+135).
 
 ## [0.1.0] — 2026-05-17
 

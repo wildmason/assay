@@ -202,7 +202,11 @@ assay analyze --ignore cargo:reqwest --ignore github-actions:actions/checkout
 
 ## Authentication (apply-pr only)
 
-`assay --apply-pr` uses your `gh` CLI's `gh auth token` as the primary credential source. Falls back to `$GH_TOKEN`. No GitHub App registration; no JWT scaffolding. The publisher checks `gh api /repos/<owner>/<repo>` for default-branch / protected-branch metadata and refuses to push to those without `--force`.
+`assay --apply-pr` uses your `gh` CLI's `gh auth token` as the primary credential source. Falls back to `$GH_TOKEN`. No GitHub App registration; no JWT scaffolding.
+
+Before validating any proposals, `--apply-pr` pre-flights `gh auth status` and refuses if `gh` isn't installed, isn't logged in, or its token lacks `repo` scope. `--force` bypasses if you have reasons (manual PR-open path, `gh` in a non-standard location, etc.). After validation, the publisher hits `gh api /repos/<owner>/<repo>` for default-branch / protected-branch metadata and refuses to push to those without `--force`.
+
+**PR labels:** `config.pull_request.labels` in `.assay.toml` controls which labels the publisher attaches (default `["assay", "dependencies"]`). Labels that don't exist on the target repo are dropped with a stderr warning rather than failing the whole `gh pr create` call — so you can use the defaults safely on any repo.
 
 ## CLI surface
 
