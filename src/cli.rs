@@ -367,6 +367,12 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
              Pass --force to override.",
         ));
     }
+    // Apply-pr preflight: gh CLI must be installed and authenticated with
+    // the repo scope. Fail fast before doing validation work the operator
+    // would only discover wasted at `gh pr create` time. --force bypasses.
+    if matches!(mode, ApplyMode::ApplyPr) && !args.force {
+        preflight_apply_pr_gh_auth(&GhCliBackend::default())?;
+    }
 
     let registry = default_registry();
     let started_at = iso8601_now();
@@ -639,6 +645,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 &args.remote,
                 &run_id,
                 &validator,
+                &config.pull_request.labels,
             )?);
         }
     }
@@ -1722,6 +1729,83 @@ fn compute_branch_name_for_runs(runs: &[&ProposalRun]) -> String {
     format!("assay/multi/{}-{hex_short}", runs.len())
 }
 
+/// Pre-flight check that `gh` is installed and authenticated with the
+/// `repo` scope before `--apply-pr` starts validating proposals.
+///
+/// Without this guard the operator could spend minutes on validation
+/// only to fail at `gh pr create` time. `--force` bypasses upstream for
+/// edge cases (`gh` in a non-standard location, plans to open the PR
+/// manually after the branch lands, etc.).
+/// Format the error message for a failed `git worktree add` during
+/// --apply-pr. When stderr suggests the branch already exists (the
+/// common case when a prior run failed before PR open), append a
+/// remediation hint listing the exact cleanup commands.
+fn format_worktree_add_failure(branch: &str, stderr_trimmed: &str) -> String {
+    if stderr_trimmed.contains("already exists") {
+        return format!(
+            "git worktree add (branch `{branch}`) failed: {stderr_trimmed}\n\n\
+             A prior --apply-pr run likely created this branch and exited before opening the PR. \
+             To retry, delete the branch first:\n  \
+             git branch -D {branch}\n  \
+             git push <remote> --delete {branch}   # only if the prior run also pushed"
+        );
+    }
+    format!("git worktree add (branch `{branch}`) failed: {stderr_trimmed}")
+}
+
+/// Filter the operator's requested labels down to those that actually
+/// exist on the target repo. `gh pr create --label <name>` fails the
+/// whole call if any label is missing, so we silently drop the missing
+/// ones and warn the operator. On `list_labels` error (network, scope,
+/// etc.) we drop ALL labels to preserve forward progress — the PR is
+/// the load-bearing artifact; labels are categorisation polish.
+fn filter_labels_to_existing(
+    backend: &dyn crate::publisher::PullRequestBackend,
+    owner: &str,
+    repo: &str,
+    requested: &[String],
+) -> Vec<String> {
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let existing = match backend.list_labels(owner, repo) {
+        Ok(labels) => labels,
+        Err(err) => {
+            eprintln!(
+                "assay: WARNING: couldn't list labels on {owner}/{repo} ({err}); \
+                 opening the PR without any labels"
+            );
+            return Vec::new();
+        }
+    };
+    let existing_set: std::collections::HashSet<&str> =
+        existing.iter().map(String::as_str).collect();
+    let (keep, drop_): (Vec<&String>, Vec<&String>) = requested
+        .iter()
+        .partition(|name| existing_set.contains(name.as_str()));
+    if !drop_.is_empty() {
+        eprintln!(
+            "assay: WARNING: dropping {} label(s) that don't exist on {owner}/{repo}: {}",
+            drop_.len(),
+            drop_
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    keep.into_iter().cloned().collect()
+}
+
+fn preflight_apply_pr_gh_auth(backend: &GhCliBackend) -> Result<()> {
+    backend.check_auth().map_err(|err| {
+        Error::other(format!(
+            "apply-pr pre-flight: gh CLI auth check failed: {err} \
+             (run `gh auth login -s repo` and retry, or pass --force to skip this check)"
+        ))
+    })
+}
+
 /// Run the post-validation `--apply-pr` flow:
 /// branch → worktree → merge-apply → copy_back → commit → push → open PR.
 #[allow(clippy::too_many_arguments)]
@@ -1735,6 +1819,7 @@ fn perform_apply_pr(
     remote: &str,
     run_id: &str,
     validator: &Validator,
+    requested_labels: &[String],
 ) -> Result<ApplyPrSummary> {
     let red_count = pre_validation_failures
         + completed_runs
@@ -1852,9 +1937,10 @@ fn perform_apply_pr(
             source,
         })?;
     if !output.status.success() {
-        return Err(Error::other(format!(
-            "git worktree add (branch `{branch}`) failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::other(format_worktree_add_failure(
+            &branch,
+            stderr.trim(),
         )));
     }
 
@@ -1971,6 +2057,7 @@ fn perform_apply_pr(
         format!("Bump {} dependencies via assay", shipped_flat.len())
     };
     let base = detect_default_branch(repo, remote).unwrap_or_else(|| "main".into());
+    let labels = filter_labels_to_existing(backend, &owner, &repo_name, requested_labels);
     let mut request = build_pull_request_request(PullRequestParams {
         owner: &owner,
         repo: &repo_name,
@@ -1978,7 +2065,7 @@ fn perform_apply_pr(
         base: &base,
         subject: &title,
         body: body.clone(),
-        labels: vec!["assay".into()],
+        labels,
         reviewers: vec![],
         draft: false,
     });
@@ -4844,6 +4931,10 @@ mod tests {
         // Records calls so tests can assert on them.
         opened: std::sync::Mutex<Vec<crate::publisher::PullRequestRequest>>,
         metadata: crate::publisher::BranchMetadata,
+        // Labels the test claims exist on the repo. Defaults to empty
+        // (no labels exist) so older tests don't need to be aware of the
+        // label filter at all.
+        existing_labels: Vec<String>,
     }
 
     impl crate::publisher::PullRequestBackend for MockPrBackend {
@@ -4869,6 +4960,14 @@ mod tests {
                 url: "https://github.com/assay/test/pull/99".into(),
                 number: 99,
             })
+        }
+
+        fn list_labels(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
+            Ok(self.existing_labels.clone())
         }
     }
 
@@ -4960,6 +5059,7 @@ mod tests {
                 is_default: false,
                 is_protected: false,
             },
+            existing_labels: Vec::new(),
         };
 
         let validator = test_validator_unused();
@@ -4973,6 +5073,7 @@ mod tests {
             "origin",
             "assay-test-run-pushed",
             &validator,
+            &[],
         )
         .expect("apply-pr should succeed");
 
@@ -5022,6 +5123,7 @@ mod tests {
                 is_default: false,
                 is_protected: false,
             },
+            existing_labels: Vec::new(),
         };
 
         let validator = test_validator_unused();
@@ -5035,6 +5137,7 @@ mod tests {
             "origin",
             "assay-test-run-refused",
             &validator,
+            &[],
         )
         .expect("refusal is not an error result");
 
@@ -5094,6 +5197,7 @@ mod tests {
                 is_default: false,
                 is_protected: true,
             },
+            existing_labels: Vec::new(),
         };
 
         let validator = test_validator_unused();
@@ -5107,6 +5211,7 @@ mod tests {
             "origin",
             "assay-test-run-protected",
             &validator,
+            &[],
         )
         .expect_err("protected branch metadata must reject");
         assert!(
@@ -5116,6 +5221,211 @@ mod tests {
         assert!(
             backend.opened.lock().unwrap().is_empty(),
             "no PR should have been opened after guard refusal"
+        );
+    }
+
+    // ----- format_worktree_add_failure ------------------------------------
+
+    #[test]
+    fn worktree_add_failure_passes_through_unrelated_errors() {
+        let msg = format_worktree_add_failure(
+            "assay/cargo/serde-1-0-215",
+            "fatal: could not switch to directory",
+        );
+        assert!(msg.contains("could not switch to directory"));
+        assert!(
+            !msg.contains("delete the branch"),
+            "no remediation hint when stderr doesn't mention 'already exists'"
+        );
+    }
+
+    #[test]
+    fn worktree_add_failure_appends_remediation_when_branch_already_exists() {
+        let msg = format_worktree_add_failure(
+            "assay/multi/3-abc",
+            "fatal: a branch named 'assay/multi/3-abc' already exists",
+        );
+        assert!(msg.contains("already exists"));
+        assert!(
+            msg.contains("git branch -D assay/multi/3-abc"),
+            "should include the exact branch-delete recipe: {msg}"
+        );
+        assert!(
+            msg.contains("git push <remote> --delete assay/multi/3-abc"),
+            "should include the remote-cleanup recipe: {msg}"
+        );
+    }
+
+    // ----- filter_labels_to_existing --------------------------------------
+
+    /// Backend stub that returns a static label list (or an error).
+    struct LabelListBackend {
+        labels: std::result::Result<Vec<String>, crate::publisher::BackendError>,
+    }
+
+    impl crate::publisher::PullRequestBackend for LabelListBackend {
+        fn fetch_branch_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<crate::publisher::BranchMetadata, crate::publisher::BackendError>
+        {
+            unreachable!("filter_labels_to_existing must not call fetch_branch_metadata")
+        }
+        fn open_pull_request(
+            &self,
+            _: &crate::publisher::PullRequestRequest,
+        ) -> std::result::Result<
+            crate::publisher::PullRequestResponse,
+            crate::publisher::BackendError,
+        > {
+            unreachable!("filter_labels_to_existing must not call open_pull_request")
+        }
+        fn list_labels(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
+            match &self.labels {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(match e {
+                    crate::publisher::BackendError::Network(s) => {
+                        crate::publisher::BackendError::Network(s.clone())
+                    }
+                    crate::publisher::BackendError::Auth(s) => {
+                        crate::publisher::BackendError::Auth(s.clone())
+                    }
+                    crate::publisher::BackendError::NotConfigured(s) => {
+                        crate::publisher::BackendError::NotConfigured(s.clone())
+                    }
+                    crate::publisher::BackendError::Rejected(s) => {
+                        crate::publisher::BackendError::Rejected(s.clone())
+                    }
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn filter_labels_returns_empty_when_no_labels_requested() {
+        let backend = LabelListBackend {
+            labels: Ok(vec!["assay".into()]),
+        };
+        let out = filter_labels_to_existing(&backend, "o", "r", &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_labels_drops_missing_labels_keeping_only_existing() {
+        let backend = LabelListBackend {
+            labels: Ok(vec!["assay".into(), "bug".into()]),
+        };
+        let out = filter_labels_to_existing(
+            &backend,
+            "o",
+            "r",
+            &["assay".into(), "dependencies".into(), "bug".into()],
+        );
+        assert_eq!(
+            out,
+            vec!["assay".to_string(), "bug".to_string()],
+            "should keep existing labels in request order"
+        );
+    }
+
+    #[test]
+    fn filter_labels_returns_empty_when_none_of_requested_exist() {
+        let backend = LabelListBackend {
+            labels: Ok(vec!["wontfix".into()]),
+        };
+        let out =
+            filter_labels_to_existing(&backend, "o", "r", &["assay".into(), "dependencies".into()]);
+        assert!(out.is_empty(), "missing labels should all be dropped");
+    }
+
+    #[test]
+    fn filter_labels_returns_empty_when_list_labels_errors() {
+        let backend = LabelListBackend {
+            labels: Err(crate::publisher::BackendError::Network("503".into())),
+        };
+        let out = filter_labels_to_existing(&backend, "o", "r", &["assay".into()]);
+        assert!(
+            out.is_empty(),
+            "on list_labels error the publisher drops all labels for forward progress"
+        );
+    }
+
+    // ----- preflight_apply_pr_gh_auth -------------------------------------
+
+    fn make_gh_fixture(tmp: &std::path::Path, stdout: &str, exit_code: i32) -> std::path::PathBuf {
+        if cfg!(windows) {
+            let p = tmp.join("gh.cmd");
+            std::fs::write(
+                &p,
+                format!("@echo off\necho {stdout}\nexit /b {exit_code}\n"),
+            )
+            .unwrap();
+            p
+        } else {
+            let p = tmp.join("gh");
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\nprintf '%s\\n' '{stdout}'\nexit {exit_code}\n"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+            p
+        }
+    }
+
+    #[test]
+    fn preflight_apply_pr_gh_auth_succeeds_with_repo_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = make_gh_fixture(tmp.path(), "Token scopes: 'repo', 'workflow'", 0);
+        let backend = GhCliBackend::new(gh);
+        preflight_apply_pr_gh_auth(&backend).expect("repo-scoped fixture should pass preflight");
+    }
+
+    #[test]
+    fn preflight_apply_pr_gh_auth_fails_when_gh_exits_nonzero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = make_gh_fixture(tmp.path(), "not logged in", 1);
+        let backend = GhCliBackend::new(gh);
+        let err = preflight_apply_pr_gh_auth(&backend)
+            .expect_err("unauthenticated fixture should fail preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apply-pr") || msg.contains("--apply-pr"),
+            "error should mention apply-pr context: {msg}"
+        );
+        assert!(
+            msg.contains("gh auth login") || msg.contains("--force"),
+            "error should include a remediation hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn preflight_apply_pr_gh_auth_fails_when_repo_scope_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = make_gh_fixture(tmp.path(), "Token scopes: 'gist'", 0);
+        let backend = GhCliBackend::new(gh);
+        let err = preflight_apply_pr_gh_auth(&backend)
+            .expect_err("missing repo scope should fail preflight");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apply-pr") || msg.contains("--apply-pr"),
+            "error should mention apply-pr context: {msg}"
+        );
+        assert!(
+            msg.contains("repo"),
+            "error should reference the missing repo scope: {msg}"
         );
     }
 

@@ -1,16 +1,14 @@
-//! Publisher — the `--apply-remote` slice.
+//! Publisher — the `--apply-pr` slice.
 //!
-//! v1 exposes the testable building blocks (deterministic branch names,
+//! Exposes the testable building blocks (deterministic branch names,
 //! sanitized PR body rendering, charset-safe git argv construction,
-//! three independent push-target guards). The actual HTTP exchange with
-//! GitHub (installation-token mint, branch creation, PR opening) lives
-//! behind the [`PullRequestBackend`] trait so unit tests can drive it
-//! with a deterministic mock; the live Octocrab-backed impl lights up
-//! once the operator has registered a `assay-bot` GitHub App.
-//!
-//! Per plan §A.5: there is NO trait until a second impl materializes —
-//! [`PullRequestBackend`] is allowed only because its `Mock` impl in
-//! tests counts as the second impl.
+//! three independent push-target guards). The PR-opening step itself
+//! lives behind the [`PullRequestBackend`] trait so unit tests can drive
+//! it with a deterministic mock; the live impl ([`gh_cli::GhCliBackend`])
+//! shells out to the operator's own `gh` CLI, honoring whatever
+//! credential `gh auth status` reports (and `$GH_TOKEN` as fallback,
+//! which `gh` reads automatically). No GitHub App registration, no
+//! installation-token mint.
 
 use std::path::PathBuf;
 
@@ -48,9 +46,8 @@ pub struct PullRequestResponse {
     pub number: u64,
 }
 
-/// Pluggable backend so tests can run without GitHub. The live Octocrab
-/// impl will land when the GitHub App is registered; until then only the
-/// mock is wired up.
+/// Pluggable backend so tests can run without GitHub. The live impl is
+/// [`gh_cli::GhCliBackend`]; tests use a deterministic in-process mock.
 pub trait PullRequestBackend: Send + Sync {
     fn fetch_branch_metadata(
         &self,
@@ -63,6 +60,12 @@ pub trait PullRequestBackend: Send + Sync {
         &self,
         request: &PullRequestRequest,
     ) -> Result<PullRequestResponse, BackendError>;
+
+    /// Return the set of label names that currently exist on the
+    /// repository. Used by the publisher to filter out non-existent
+    /// labels before `gh pr create` (which fails the whole call if any
+    /// label is missing).
+    fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<String>, BackendError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,35 +78,6 @@ pub enum BackendError {
     Network(String),
     #[error("forge rejected the request: {0}")]
     Rejected(String),
-}
-
-/// Stub backend used until the GitHub App is registered. Every operation
-/// returns `BackendError::NotConfigured`, which the publisher surfaces
-/// to the operator with a clear remediation message.
-pub struct UnconfiguredBackend;
-
-impl PullRequestBackend for UnconfiguredBackend {
-    fn fetch_branch_metadata(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _branch: &str,
-    ) -> Result<BranchMetadata, BackendError> {
-        Err(BackendError::NotConfigured(
-            "no GitHub App secrets file passed to --secret-file; \
-             run `assay init github-app` and retry"
-                .into(),
-        ))
-    }
-
-    fn open_pull_request(
-        &self,
-        _request: &PullRequestRequest,
-    ) -> Result<PullRequestResponse, BackendError> {
-        Err(BackendError::NotConfigured(
-            "no GitHub App secrets file passed to --secret-file".into(),
-        ))
-    }
 }
 
 /// Inputs to [`build_pull_request_request`]. Groups the params so the
@@ -174,26 +148,10 @@ mod tests {
                 number: 42,
             })
         }
-    }
 
-    #[test]
-    fn unconfigured_backend_returns_not_configured_for_both_methods() {
-        let backend = UnconfiguredBackend;
-        let m = backend.fetch_branch_metadata("o", "r", "b").unwrap_err();
-        assert!(matches!(m, BackendError::NotConfigured(_)));
-        let req = build_pull_request_request(PullRequestParams {
-            owner: "o",
-            repo: "r",
-            branch: "assay/cargo/serde-abc",
-            base: "main",
-            subject: "serde",
-            body: "body".into(),
-            labels: vec![],
-            reviewers: vec![],
-            draft: false,
-        });
-        let p = backend.open_pull_request(&req).unwrap_err();
-        assert!(matches!(p, BackendError::NotConfigured(_)));
+        fn list_labels(&self, _: &str, _: &str) -> Result<Vec<String>, BackendError> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]

@@ -142,6 +142,37 @@ impl PullRequestBackend for GhCliBackend {
         })
     }
 
+    fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<String>, BackendError> {
+        // `gh api repos/<owner>/<repo>/labels --paginate --jq '.[].name'`
+        // returns one label name per line. `--paginate` is important
+        // because GitHub caps the response at 30 labels by default.
+        let output = Command::new(&self.gh_bin)
+            .arg("api")
+            .arg(format!("repos/{owner}/{repo}/labels"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(".[].name")
+            .output()
+            .map_err(|err| {
+                BackendError::Network(format!(
+                    "couldn't execute `gh api` for label list: {err}; gh CLI must be installed"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(BackendError::Network(format!(
+                "`gh api` for label list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     fn open_pull_request(
         &self,
         request: &PullRequestRequest,
