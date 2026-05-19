@@ -17,7 +17,13 @@ const CONFIG_FILENAME: &str = ".assay.toml";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssayConfig {
-    #[serde(rename = "assay")]
+    /// Top-level `[assay]` section carrying `schema_version`. Optional:
+    /// when the section is absent, `MetaSection::default()` provides the
+    /// current schema version so a config without a `[assay]` block is
+    /// accepted as v-current. Mirrors the behavior of every other
+    /// section — explicit values override; missing sections take the
+    /// documented default.
+    #[serde(default, rename = "assay")]
     pub meta: MetaSection,
     #[serde(default)]
     pub ecosystems: EcosystemsSection,
@@ -55,7 +61,20 @@ pub struct ProjectSection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetaSection {
+    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+}
+
+impl Default for MetaSection {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+        }
+    }
+}
+
+fn default_schema_version() -> u32 {
+    CURRENT_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,9 +234,7 @@ impl Default for SafetySection {
 impl Default for AssayConfig {
     fn default() -> Self {
         Self {
-            meta: MetaSection {
-                schema_version: CURRENT_SCHEMA_VERSION,
-            },
+            meta: MetaSection::default(),
             ecosystems: EcosystemsSection {
                 cargo: default_cargo_ecosystem(),
                 github_actions: default_github_actions_ecosystem(),
@@ -344,6 +361,25 @@ mod tests {
         assert!(config.safety.refuse_dirty_tree);
         assert!(config.safety.require_force_for_overrides);
         assert_eq!(config.validation.executor, ValidationExecutor::Docker);
+    }
+
+    #[test]
+    fn accepts_config_without_top_level_assay_section() {
+        // Plan / wiki / README examples historically omitted `[assay]`;
+        // a config that starts straight into `[project]` should resolve
+        // to the current schema_version via MetaSection::default().
+        let text = r#"
+[project]
+roots = ["src-tauri", "ui"]
+
+[ecosystems.cargo]
+max_parallel = 2
+"#;
+        let config = parse(text, Path::new(".assay.toml"))
+            .expect("config without [assay] section should parse via defaults");
+        assert_eq!(config.meta.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(config.project.roots, vec![PathBuf::from("src-tauri"), PathBuf::from("ui")]);
+        assert_eq!(config.ecosystems.cargo.max_parallel, 2);
     }
 
     #[test]
