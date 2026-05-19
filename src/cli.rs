@@ -1388,7 +1388,10 @@ fn perform_apply_local_commit(
         })?
         .to_string();
 
-    git_add_paths(repo, &modified_paths)?;
+    let skipped_gitignored = git_add_paths(repo, &modified_paths)?;
+    if !skipped_gitignored.is_empty() {
+        emit_gitignored_skip_warning(&skipped_gitignored);
+    }
     git_commit(repo, &subject, &body)?;
 
     provenance.records.push(ProvenanceRecord {
@@ -1745,7 +1748,10 @@ fn perform_apply_pr(
             ))
         })?
         .to_string();
-    git_add_paths(&worktree, &modified_paths)?;
+    let skipped_gitignored = git_add_paths(&worktree, &modified_paths)?;
+    if !skipped_gitignored.is_empty() {
+        emit_gitignored_skip_warning(&skipped_gitignored);
+    }
     git_commit(&worktree, &subject, &body)?;
 
     // Push the branch.
@@ -1841,13 +1847,35 @@ fn detect_default_branch(repo: &Path, remote: &str) -> Option<String> {
 
 /// Stage exactly the listed paths via `git add`. Refuses paths that
 /// resolve outside the repo to defend against `..` traversal.
-fn git_add_paths(repo: &Path, paths: &[PathBuf]) -> Result<()> {
+///
+/// Paths that are both untracked AND match a `.gitignore` rule are
+/// silently skipped — `git add` would otherwise abort the whole batch
+/// with "paths are ignored by one of your .gitignore files." Library
+/// projects routinely gitignore lockfiles even though assay's
+/// sandbox-validated bump touches them; refusing to commit anything in
+/// that case would fail an apply where the meaningful artifact (the
+/// manifest constraint widening) was perfectly valid. The caller
+/// receives the skipped paths so it can surface a warning.
+fn git_add_paths(repo: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     if paths.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
+    }
+    let (stageable, ignored) = partition_stageable_paths(repo, paths)?;
+    if stageable.is_empty() {
+        return Err(Error::other(format!(
+            "git add refused: all {} modified path(s) are gitignored — nothing to commit \
+             (paths: {})",
+            ignored.len(),
+            ignored
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
     let mut cmd = std::process::Command::new("git");
     cmd.arg("add").arg("--").current_dir(repo);
-    for path in paths {
+    for path in &stageable {
         cmd.arg(path);
     }
     let output = cmd.output().map_err(|source| Error::Io {
@@ -1860,7 +1888,95 @@ fn git_add_paths(repo: &Path, paths: &[PathBuf]) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(())
+    Ok(ignored)
+}
+
+/// Print a stderr warning naming the gitignored paths that were
+/// excluded from the commit. Library projects routinely gitignore
+/// lockfiles — the meaningful artifact (the manifest constraint
+/// widening) still ships, but the lockfile change stays as an
+/// unstaged working-tree edit the user can either keep, discard with
+/// `git restore`, or regenerate with `cargo update` / `npm install`.
+fn emit_gitignored_skip_warning(skipped: &[PathBuf]) {
+    let joined = skipped
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "assay: warning: {} path(s) gitignored and excluded from commit: {}",
+        skipped.len(),
+        joined,
+    );
+    eprintln!(
+        "assay: note: gitignored files were updated in your working tree but stay untracked per your .gitignore. \
+         Run `git restore <path>` to discard, or regenerate the lockfile to match your local toolchain."
+    );
+}
+
+/// Partition `paths` into "stageable now" vs "untracked + gitignored."
+///
+/// The predicate for skipping is "would `git add` refuse this path?".
+/// Tracked paths can always be re-staged (gitignore is irrelevant once
+/// a file is in the index). Untracked paths that match a gitignore
+/// rule are refused by `git add` and would abort the whole batch.
+///
+/// Two `git` invocations per path is fine here — the path lists this
+/// function receives are bounded by what `copy_back_merged` returns
+/// for a single ecosystem's merged ship plan (small).
+fn partition_stageable_paths(
+    repo: &Path,
+    paths: &[PathBuf],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut stageable: Vec<PathBuf> = Vec::new();
+    let mut ignored: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if path_is_untracked_and_gitignored(repo, path)? {
+            ignored.push(path.clone());
+        } else {
+            stageable.push(path.clone());
+        }
+    }
+    Ok((stageable, ignored))
+}
+
+fn path_is_untracked_and_gitignored(repo: &Path, path: &Path) -> Result<bool> {
+    // Tracked paths can always be re-staged — gitignore rules don't
+    // apply once a file is in the index. Check tracking first; if it's
+    // tracked we don't even need to ask about gitignore.
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(path)
+        .current_dir(repo)
+        .output()
+        .map_err(|source| Error::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+    if tracked.status.success() {
+        return Ok(false);
+    }
+    // Untracked — does it match a gitignore rule? `git check-ignore`
+    // exits 0 when the path is ignored, 1 when not. Any other exit
+    // code (e.g. 128 for "not a git repo") surfaces as a hard error.
+    let ignored = std::process::Command::new("git")
+        .args(["check-ignore", "--"])
+        .arg(path)
+        .current_dir(repo)
+        .output()
+        .map_err(|source| Error::Io {
+            path: repo.to_path_buf(),
+            source,
+        })?;
+    match ignored.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::other(format!(
+            "git check-ignore failed for `{}`: {}",
+            path.display(),
+            String::from_utf8_lossy(&ignored.stderr).trim()
+        ))),
+    }
 }
 
 /// Create a single commit on the current branch with the given subject
@@ -2571,6 +2687,105 @@ mod tests {
             s,
             "  (7 consumers: crate-01, crate-02, crate-03, crate-04, …+3)"
         );
+    }
+
+    // ----- partition_stageable_paths (gitignored-lockfile handling) -----
+
+    fn init_repo_with_commit(repo: &std::path::Path) {
+        git(repo, ["init"]);
+        // user identity for the commit
+        git(repo, ["config", "user.email", "test@example.invalid"]);
+        git(repo, ["config", "user.name", "test"]);
+        std::fs::write(repo.join("README.md"), "x").unwrap();
+        git(repo, ["add", "README.md"]);
+        git(repo, ["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn partition_separates_gitignored_untracked_lockfile_from_tracked_manifest() {
+        // Mirrors the real tokio shape: Cargo.lock listed in .gitignore;
+        // Cargo.toml is a normal tracked manifest. assay's apply-local
+        // copies both back from the sandbox, but `git add Cargo.lock`
+        // would fail with "paths are ignored by one of your .gitignore
+        // files." The partition step lets the commit proceed on the
+        // manifest alone and surface a warning for the lockfile.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo_with_commit(repo);
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\n").unwrap();
+        git(repo, ["add", ".gitignore"]);
+        git(repo, ["commit", "-m", "ignore lockfile"]);
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        git(repo, ["add", "Cargo.toml"]);
+        git(repo, ["commit", "-m", "add manifest"]);
+        // Now write a new lockfile (untracked + gitignored) and modify
+        // the manifest (tracked, unstaged).
+        std::fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n").unwrap();
+
+        let (stageable, ignored) = partition_stageable_paths(
+            repo,
+            &[PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            stageable,
+            vec![PathBuf::from("Cargo.toml")],
+            "tracked manifest must remain stageable"
+        );
+        assert_eq!(
+            ignored,
+            vec![PathBuf::from("Cargo.lock")],
+            "gitignored untracked lockfile must be partitioned out"
+        );
+    }
+
+    #[test]
+    fn partition_keeps_tracked_files_even_if_pattern_would_match_gitignore() {
+        // A file that's been tracked since before a gitignore rule was
+        // added still gets staged — `git add` ignores .gitignore for
+        // already-tracked paths. This is the safety check that prevents
+        // over-skipping.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo_with_commit(repo);
+        // Commit Cargo.lock first, THEN add a gitignore rule for it.
+        std::fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+        git(repo, ["add", "Cargo.lock"]);
+        git(repo, ["commit", "-m", "track lockfile"]);
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\n").unwrap();
+        git(repo, ["add", ".gitignore"]);
+        git(repo, ["commit", "-m", "ignore lockfile post-track"]);
+        // Modify the tracked lockfile.
+        std::fs::write(repo.join("Cargo.lock"), "version = 3\n# bump\n").unwrap();
+
+        let (stageable, ignored) =
+            partition_stageable_paths(repo, &[PathBuf::from("Cargo.lock")]).unwrap();
+
+        assert_eq!(
+            stageable,
+            vec![PathBuf::from("Cargo.lock")],
+            "tracked lockfile must remain stageable even though gitignore pattern matches"
+        );
+        assert!(
+            ignored.is_empty(),
+            "tracked files must never be partitioned to the ignored set"
+        );
+    }
+
+    #[test]
+    fn partition_keeps_untracked_files_that_are_not_gitignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        init_repo_with_commit(repo);
+        std::fs::write(repo.join("new.toml"), "x").unwrap();
+
+        let (stageable, ignored) =
+            partition_stageable_paths(repo, &[PathBuf::from("new.toml")]).unwrap();
+
+        assert_eq!(stageable, vec![PathBuf::from("new.toml")]);
+        assert!(ignored.is_empty());
     }
 
     // ----- missing_cargo_lock_warning -----------------------------------
