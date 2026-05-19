@@ -1,26 +1,35 @@
-name: release
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
 jobs:
-  publish:
-    name: cargo publish
-    runs-on: ubuntu-latest
+  verify:
+    name: Verify ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
-      - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: cargo test
-        run: cargo test --locked --all-targets
-      - name: verify tag matches Cargo.toml version
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
         run: |
           tag="${GITHUB_REF#refs/tags/v}"
           manifest=$(cargo pkgid | sed 's/.*#//')
@@ -30,7 +39,212 @@ jobs:
             echo "::error::tag v${tag} does not match Cargo.toml version ${manifest}"
             exit 1
           fi
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Verify package contents
+        run: cargo package --locked
+
+      - name: Crates.io publish preflight
+        run: cargo publish --dry-run --locked
+
+  create-release:
+    name: Create draft release
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Create or reset draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=true --title "$tag"
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes --title "$tag"
+          fi
+
+  crate:
+    name: Package crate
+    needs: create-release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Package crate
+        run: cargo package --locked
+
+      - name: Upload crate and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $crate = Get-ChildItem -LiteralPath target/package -Filter '*.crate' | Select-Object -First 1
+          if (-not $crate) {
+              throw 'cargo package did not produce a .crate file'
+          }
+          $hash = (Get-FileHash -LiteralPath $crate.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = "$($crate.Name).sha256"
+          "$hash  $($crate.Name)" | Set-Content -NoNewline -LiteralPath $shaPath
+          gh release upload $env:GITHUB_REF_NAME $crate.FullName $shaPath --repo $env:GITHUB_REPOSITORY --clobber
+
+      - name: Attest crate archive
+        uses: actions/attest@v4
+        with:
+          subject-path: target/package/*.crate
+
+  binaries:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: .tar.gz
+            binary_name: assay
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: .tar.gz
+            binary_name: assay
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: .tar.gz
+            binary_name: assay
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: .zip
+            binary_name: assay.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.target }}'
+          $archiveExt = '${{ matrix.archive_ext }}'
+          $asset = "assay-$env:GITHUB_REF_NAME-$target$archiveExt"
+          $dist = Join-Path 'target/release-dist' $target
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          Copy-Item -LiteralPath "target/$target/release/${{ matrix.binary_name }}" -Destination $dist
+          Copy-Item -LiteralPath README.md -Destination $dist
+          Copy-Item -LiteralPath CHANGELOG.md -Destination $dist
+          Copy-Item -LiteralPath LICENSE-MIT -Destination $dist
+          Copy-Item -LiteralPath LICENSE-APACHE -Destination $dist
+
+          if ($archiveExt -eq '.zip') {
+              Compress-Archive -Path "$dist/*" -DestinationPath $asset -Force
+          } else {
+              tar -czf $asset -C $dist .
+          }
+
+          $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -NoNewline -LiteralPath "$asset.sha256"
+
+      - name: Smoke packaged archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.target }}'
+          $archiveExt = '${{ matrix.archive_ext }}'
+          $asset = "assay-$env:GITHUB_REF_NAME-$target$archiveExt"
+          $install = Join-Path 'target/install-smoke' $target
+          New-Item -ItemType Directory -Force -Path $install | Out-Null
+
+          if ($archiveExt -eq '.zip') {
+              Expand-Archive -LiteralPath $asset -DestinationPath $install -Force
+          } else {
+              tar -xzf $asset -C $install
+          }
+
+          $binary = Join-Path $install '${{ matrix.binary_name }}'
+          # `--version` proves the binary starts on this host (catches
+          # cross-compile / linker / glibc mismatches before the artifact
+          # lands on the release page).
+          & $binary --version | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+              throw 'packaged assay binary failed --version smoke'
+          }
+          # `--help` proves clap derive macros expanded correctly + the
+          # analyze subcommand is wired in.
+          & $binary analyze --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              throw 'packaged assay binary failed analyze --help smoke'
+          }
+
+      - name: Attest binary archive
+        uses: actions/attest@v4
+        with:
+          subject-path: assay-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.archive_ext }}
+
+      - name: Upload binary and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = '${{ matrix.target }}'
+          $archiveExt = '${{ matrix.archive_ext }}'
+          $asset = "assay-$env:GITHUB_REF_NAME-$target$archiveExt"
+          gh release upload $env:GITHUB_REF_NAME $asset "$asset.sha256" --repo $env:GITHUB_REPOSITORY --clobber
+
+  cargo-publish:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
+
+  publish-release:
+    name: Publish release
+    needs: [crate, binaries, cargo-publish]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Publish draft release
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
