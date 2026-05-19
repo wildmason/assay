@@ -9,8 +9,8 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use crate::ecosystem::{DependencyEcosystem, EcosystemContext, default_registry};
 use crate::error::{Error, Result};
 use crate::model::{
-    AssayRunReceipt, Classification, Manifest, Proposal, Provenance, ProvenanceRecord,
-    RepositoryRef, RunSummary,
+    AssayRunReceipt, Classification, Manifest, ManifestKind, Proposal, Provenance,
+    ProvenanceRecord, RepositoryRef, RunSummary,
 };
 use crate::publisher::gh_cli::{GhCliBackend, parse_owner_repo_from_origin};
 use crate::publisher::{
@@ -2382,6 +2382,40 @@ fn report_text(name: &str, scan_root_rel: Option<&Path>, manifests: &[Manifest])
     for manifest in manifests {
         println!("  - {}", manifest.path.display());
     }
+    if let Some(warning) = missing_cargo_lock_warning(name, manifests) {
+        eprintln!("{warning}");
+    }
+}
+
+/// Build the warning text shown when a Cargo workspace has `Cargo.toml`
+/// but no `Cargo.lock`. Returns `None` when no warning is warranted.
+///
+/// The proposer compares the committed lockfile against the registry to
+/// find available bumps — without one it cannot find any, and the run
+/// silently reports "0 proposals." That mode of failure misleads the
+/// user into thinking nothing needs upgrading; in reality the analyzer
+/// just had no anchor to compare against. Library crates routinely
+/// don't commit `Cargo.lock`, so this case is common in OSS targets.
+fn missing_cargo_lock_warning(name: &str, manifests: &[Manifest]) -> Option<String> {
+    if name != "cargo" {
+        return None;
+    }
+    let has_toml = manifests
+        .iter()
+        .any(|m| matches!(m.kind, ManifestKind::CargoToml));
+    let has_lock = manifests
+        .iter()
+        .any(|m| matches!(m.kind, ManifestKind::CargoLock));
+    if has_toml && !has_lock {
+        Some(
+            "[cargo] warning: Cargo.lock not found — assay needs a lockfile to detect upgrades. \
+             Run `cargo generate-lockfile` once to materialize one (library crates typically \
+             don't commit Cargo.lock; the file you generate stays untracked)."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 fn report_json(name: &str, scan_root_rel: Option<&Path>, manifests: &[Manifest]) -> Result<()> {
@@ -2537,6 +2571,52 @@ mod tests {
             s,
             "  (7 consumers: crate-01, crate-02, crate-03, crate-04, …+3)"
         );
+    }
+
+    // ----- missing_cargo_lock_warning -----------------------------------
+
+    fn cargo_manifest(kind: ManifestKind, path: &str) -> Manifest {
+        Manifest {
+            path: PathBuf::from(path),
+            kind,
+            metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn warns_when_cargo_workspace_has_no_lockfile() {
+        let manifests = vec![cargo_manifest(ManifestKind::CargoToml, "Cargo.toml")];
+        let warning = missing_cargo_lock_warning("cargo", &manifests).expect(
+            "Cargo.toml without Cargo.lock must surface a warning so the user isn't \
+             misled by a silent zero-proposal result",
+        );
+        assert!(
+            warning.contains("Cargo.lock not found"),
+            "warning must name the missing file: {warning}",
+        );
+        assert!(
+            warning.contains("cargo generate-lockfile"),
+            "warning must include the remediation command: {warning}",
+        );
+    }
+
+    #[test]
+    fn does_not_warn_when_lockfile_present() {
+        let manifests = vec![
+            cargo_manifest(ManifestKind::CargoToml, "Cargo.toml"),
+            cargo_manifest(ManifestKind::CargoLock, "Cargo.lock"),
+        ];
+        assert!(missing_cargo_lock_warning("cargo", &manifests).is_none());
+    }
+
+    #[test]
+    fn does_not_warn_for_non_cargo_ecosystems() {
+        // npm/gha have their own lockfile semantics — this warning is
+        // cargo-specific. A package.json without package-lock.json is
+        // handled by npm's own path.
+        let manifests = vec![cargo_manifest(ManifestKind::PackageJson, "package.json")];
+        assert!(missing_cargo_lock_warning("npm", &manifests).is_none());
+        assert!(missing_cargo_lock_warning("github-actions", &manifests).is_none());
     }
 
     // ----- parse_cli_ignore + resolve_ignore_list ------------------------
