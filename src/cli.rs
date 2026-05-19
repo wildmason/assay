@@ -45,7 +45,7 @@ pub enum Command {
 #[derive(Debug, Args)]
 #[command(group(
     ArgGroup::new("apply_mode")
-        .args(["apply_local", "apply_pr"])
+        .args(["apply_local", "apply_pr", "validate"])
         .multiple(false)
 ))]
 #[command(group(
@@ -61,6 +61,13 @@ pub struct AnalyzeArgs {
     /// Which ecosystems to scan. Defaults to all enabled in config.
     #[arg(long, value_enum)]
     pub ecosystem: Option<EcosystemSelector>,
+
+    /// Run the validator stage on every proposal in an isolated sandbox
+    /// and report per-proposal pass/fail — WITHOUT committing or opening
+    /// PRs. The "test upgrades before adopting" mode. Mutually exclusive
+    /// with `--apply-local` and `--apply-pr`.
+    #[arg(long)]
+    pub validate: bool,
 
     /// Write proposed bumps into an isolated retained worktree but do NOT open PRs.
     /// Mutually exclusive with --apply-pr.
@@ -217,7 +224,15 @@ fn dispatch(cli: Cli) -> Result<()> {
 /// Apply mode derived from mutually-exclusive --apply-local / --apply-pr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyMode {
+    /// Proposer phase only. Fast — no per-proposal sandbox or
+    /// validator. Reports proposals as `unvalidated`.
     DryRun,
+    /// Proposer + validator. Runs each proposal through an isolated
+    /// sandbox + the configured validator gate and reports pass/fail.
+    /// Does NOT commit or open PRs — closes the dogfood-tour-2026-05-19
+    /// finding A (default `analyze` not delivering the "test before
+    /// adopt" value-prop).
+    Validate,
     ApplyLocal,
     ApplyPr,
 }
@@ -228,9 +243,27 @@ impl ApplyMode {
             ApplyMode::ApplyPr
         } else if args.apply_local {
             ApplyMode::ApplyLocal
+        } else if args.validate {
+            ApplyMode::Validate
         } else {
             ApplyMode::DryRun
         }
+    }
+
+    /// `true` when the mode runs the validator stage (Validate /
+    /// ApplyLocal / ApplyPr). DryRun is the only mode that skips it.
+    pub fn runs_validator(self) -> bool {
+        matches!(
+            self,
+            ApplyMode::Validate | ApplyMode::ApplyLocal | ApplyMode::ApplyPr
+        )
+    }
+
+    /// `true` when the mode copies validated greens back to the host
+    /// repo (ApplyLocal commits / ApplyPr pushes). Validate and DryRun
+    /// both leave the host unchanged.
+    pub fn mutates_host(self) -> bool {
+        matches!(self, ApplyMode::ApplyLocal | ApplyMode::ApplyPr)
     }
 }
 
@@ -256,23 +289,29 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         }
     }
     let mode = ApplyMode::from_args(&args);
-    // The host-executor safety check only matters when forge runs the
-    // gate; --gate-cmd / --gate-file bypass forge entirely and the
-    // operator is opting into running their own commands.
+    // The host-executor safety check matters whenever the validator
+    // runs (Validate, ApplyLocal, ApplyPr) — `cargo build` against a
+    // newly-bumped tree may execute build scripts assay just pulled
+    // from the registry. `--gate-cmd` / `--gate-file` bypass forge
+    // entirely and the operator is opting into running their own
+    // commands.
     let gate_override = args.gate_cmd.is_some() || args.gate_file.is_some();
-    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr)
+    if mode.runs_validator()
         && args.executor == ExecutorChoice::Host
         && !args.unsafe_host_validation
         && !gate_override
     {
         return Err(Error::other(
-            "--executor host requires --unsafe-host-validation for apply modes; \
-             dependency validation may execute newly bumped build scripts",
+            "--executor host requires --unsafe-host-validation when the validator runs \
+             (--validate, --apply-local, --apply-pr); dependency validation may \
+             execute newly bumped build scripts",
         ));
     }
 
-    // Safety: apply modes refuse on a dirty tree unless --force.
-    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr) && !args.force {
+    // Safety: mutating modes refuse on a dirty tree unless --force.
+    // Validate runs the validator without touching the host so a
+    // dirty tree is fine.
+    if mode.mutates_host() && !args.force {
         if let Some(dirty_path) = working_tree_dirty_path(&args.repo)? {
             let mode_label = if matches!(mode, ApplyMode::ApplyLocal) {
                 "--apply-local"
@@ -397,7 +436,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut completed_runs: Vec<ProposalRun> = Vec::new();
     let mut pre_validation_failures = 0usize;
 
-    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr) && !all_proposals.is_empty() {
+    if mode.runs_validator() && !all_proposals.is_empty() {
         let validator =
             build_validator(&args)?.with_workflow_filter(workflow_filter_from_args(&args));
 
@@ -524,7 +563,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
 
     let mut commit_summary: Option<CommitSummary> = None;
     let mut pr_summary: Option<ApplyPrSummary> = None;
-    if matches!(mode, ApplyMode::ApplyLocal | ApplyMode::ApplyPr) && !all_proposals.is_empty() {
+    if mode.mutates_host() && !all_proposals.is_empty() {
         // The Validator built above runs the merge step's revalidation
         // pass for any ecosystem with two or more individually-green
         // proposals. When the run is report-only or had no proposals,
@@ -610,7 +649,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         if (compatible + breaking) > 0 {
             print_discovered_section(all_proposals.iter().map(|(_, _, p)| p));
         }
-        if matches!(mode, ApplyMode::ApplyLocal) {
+        // Validate / ApplyLocal / ApplyPr all run the validator and
+        // share the same "validated N green / M red / K unvalidated"
+        // summary line + red-proposal detail section.
+        if mode.runs_validator() {
             println!(
                 "assay: validated {} green / {} red / {} unvalidated",
                 proposals_passed, proposals_failed, proposals_unvalidated,
@@ -620,6 +662,22 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             {
                 print!("{red_section}");
             }
+        }
+        if matches!(mode, ApplyMode::Validate) && !all_proposals.is_empty() {
+            // Validate is non-mutating; the retained sandboxes mirror
+            // the --apply-local behavior so the operator can inspect
+            // exactly what each proposal would have committed.
+            println!(
+                "assay: sandbox worktrees retained for audit under {} (mode=Validate; no commit, no PR)",
+                args.repo
+                    .join(".assay")
+                    .join("runs")
+                    .join(&run_id)
+                    .join("work")
+                    .display()
+            );
+        }
+        if matches!(mode, ApplyMode::ApplyLocal) {
             match &commit_summary {
                 Some(CommitSummary::Committed {
                     bump_count,
@@ -681,15 +739,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             }
         }
         if matches!(mode, ApplyMode::ApplyPr) {
-            println!(
-                "assay: validated {} green / {} red / {} unvalidated",
-                proposals_passed, proposals_failed, proposals_unvalidated,
-            );
-            if let Some(red_section) =
-                format_red_proposal_section(&completed_runs, &pre_validation_failure_rows)
-            {
-                print!("{red_section}");
-            }
+            // "validated" + red section already printed above by the
+            // shared `mode.runs_validator()` branch.
             match &pr_summary {
                 Some(ApplyPrSummary::Published {
                     url,
@@ -2005,6 +2056,13 @@ fn git_commit(repo: &Path, subject: &str, body: &str) -> Result<()> {
 /// Returns `Some(path_to_first_dirty_file)` if `git status --porcelain`
 /// reports any uncommitted change; `None` for a clean tree or when the
 /// repo isn't a git checkout (in which case there's nothing to protect).
+///
+/// `.assay/` (assay's own artifact directory) is filtered out of the
+/// dirty-tree check — its presence is a self-inflicted dirty state and
+/// would otherwise refuse every back-to-back `analyze` → `analyze
+/// --apply-local`. Operators who care about scoping `.assay/` out of
+/// git can `.gitignore` it; this filter just guarantees assay never
+/// trips on its own output.
 fn working_tree_dirty_path(repo: &std::path::Path) -> Result<Option<String>> {
     if !repo.join(".git").exists() {
         return Ok(None);
@@ -2027,7 +2085,35 @@ fn working_tree_dirty_path(repo: &std::path::Path) -> Result<Option<String>> {
         )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().next().map(|s| s.to_string()))
+    Ok(stdout
+        .lines()
+        .find(|line| !porcelain_line_is_assay_artifact(line))
+        .map(|s| s.to_string()))
+}
+
+/// `git status --porcelain` lines start with a 2-char status code + space +
+/// path. Path uses forward slashes regardless of OS. Returns `true` when
+/// the path refers to assay's own `.assay/` artifact tree.
+fn porcelain_line_is_assay_artifact(line: &str) -> bool {
+    // Status code is exactly 2 chars + 1 space; path starts at byte 3.
+    // Quoted paths (when the path contains spaces or special chars) have
+    // a leading `"` which the simple `starts_with(".assay/")` test
+    // wouldn't match — handle both shapes.
+    let Some(rest) = line.get(3..) else {
+        return false;
+    };
+    let path = rest.strip_prefix('"').unwrap_or(rest);
+    // Renames have the shape `R  old -> new`; the new path is what
+    // matters for dirty-tree intent. We check both halves to be safe.
+    if let Some((old_path, new_path)) = path.split_once(" -> ") {
+        return path_is_under_assay_dir(old_path) || path_is_under_assay_dir(new_path);
+    }
+    path_is_under_assay_dir(path)
+}
+
+fn path_is_under_assay_dir(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('"');
+    trimmed == ".assay" || trimmed.starts_with(".assay/")
 }
 
 fn prepare_apply_local_tree(
@@ -2257,23 +2343,27 @@ impl ProjectScope {
                 )));
             }
             if path.is_dir() {
-                let root = path.to_path_buf();
+                let (artifact_root, scan_root) = anchor_artifact_root_at_git_root(path);
                 return Ok(ProjectScope {
-                    artifact_root: root.clone(),
-                    scan_roots: vec![root],
+                    artifact_root,
+                    scan_roots: vec![scan_root],
                     ecosystem_restriction: None,
                 });
             }
-            let (eco, repo_root) = infer_project_scope_from_manifest(path).ok_or_else(|| {
-                Error::other(format!(
-                    "--project file `{}` is not a recognized manifest. \
-                     Supported: Cargo.toml (cargo), .github/workflows/*.yml (github-actions).",
-                    path.display()
-                ))
-            })?;
+            let (eco, scan_root_initial) =
+                infer_project_scope_from_manifest(path).ok_or_else(|| {
+                    Error::other(format!(
+                        "--project file `{}` is not a recognized manifest. \
+                         Supported: Cargo.toml (cargo), .github/workflows/*.yml \
+                         (github-actions).",
+                        path.display()
+                    ))
+                })?;
+            let (artifact_root, scan_root) =
+                anchor_artifact_root_at_git_root(&scan_root_initial);
             return Ok(ProjectScope {
-                artifact_root: repo_root.clone(),
-                scan_roots: vec![repo_root],
+                artifact_root,
+                scan_roots: vec![scan_root],
                 ecosystem_restriction: Some(eco),
             });
         }
@@ -2294,12 +2384,67 @@ impl ProjectScope {
                 scan_roots.push(resolved);
             }
         }
+        // Polyglot auto-detect: when the repo root has no Cargo.toml /
+        // package.json AND the user hasn't configured `[project] roots`,
+        // a Tauri-shaped layout (src-tauri/ + ui/ / frontend/ / app/)
+        // would otherwise scan only `.github/workflows/`. Silently
+        // adding the detected sub-projects gives plain `assay analyze`
+        // the same coverage as a hand-written multi-root config (see
+        // dogfood-tour-2026-05-19 finding L).
+        if config.project.roots.is_empty() && !repo_root_has_a_manifest(&artifact_root) {
+            for extra in detect_polyglot_subdirs(&artifact_root) {
+                if !scan_roots.iter().any(|p| same_path(p, &extra)) {
+                    eprintln!(
+                        "[project] auto-detected polyglot scan root: `{}` \
+                         (set [project] roots = [...] in .assay.toml to silence)",
+                        extra.display()
+                    );
+                    scan_roots.push(extra);
+                }
+            }
+        }
         Ok(ProjectScope {
             artifact_root,
             scan_roots,
             ecosystem_restriction: None,
         })
     }
+}
+
+/// `true` when `repo_root` itself carries any v1 ecosystem manifest at
+/// its top level. Used by polyglot auto-detection to decide whether
+/// `analyze` would otherwise be a one-ecosystem (`.github/workflows/`
+/// only) scan.
+fn repo_root_has_a_manifest(repo_root: &Path) -> bool {
+    repo_root.join("Cargo.toml").is_file() || repo_root.join("package.json").is_file()
+}
+
+/// Probe `repo_root` for canonical Tauri-shape sub-projects. Returns
+/// any subdirectory that contains a v1 ecosystem manifest. Order is
+/// stable across runs.
+fn detect_polyglot_subdirs(repo_root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    // src-tauri/ is the canonical Tauri backend directory; the literal
+    // name is hard-coded by the Tauri CLI scaffold and shows up in
+    // every Wildmason Tauri app (Bridge, Helm, Mortar, Crucible).
+    let cargo_candidates = ["src-tauri"];
+    // UI subfolder names — the small set of conventional choices
+    // across the Tauri / Vue / Next.js + monorepo ecosystem. Order
+    // matches encounter likelihood in Wildmason repos.
+    let npm_candidates = ["ui", "frontend", "app", "web", "client"];
+    for sub in cargo_candidates {
+        let p = repo_root.join(sub);
+        if p.join("Cargo.toml").is_file() {
+            out.push(p);
+        }
+    }
+    for sub in npm_candidates {
+        let p = repo_root.join(sub);
+        if p.join("package.json").is_file() {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Lexical-or-canonical path equivalence. Used by scan_roots dedupe
@@ -2343,6 +2488,52 @@ fn relative_prefix(base: &Path, target: &Path) -> Option<PathBuf> {
 /// - `<root>/Cargo.toml` → cargo, root = parent
 /// - `<root>/.github/workflows/<name>.yml` → github-actions, root = `<root>`
 /// - `<root>/.github/actions/<name>/action.yml` → github-actions, root = `<root>`
+/// Walk up from `start` looking for a `.git` directory or file (worktree
+/// pointer). Returns the directory containing it. `None` when `start`
+/// is not inside any git checkout.
+fn find_enclosing_git_root(start: &Path) -> Option<PathBuf> {
+    let mut cursor = if start.is_absolute() {
+        Some(start.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(start))
+    }?;
+    loop {
+        let dot_git = cursor.join(".git");
+        // `.git` may be a directory (normal repo) OR a regular file
+        // (linked worktrees / submodules); both signal a repo root.
+        if dot_git.exists() {
+            return Some(cursor);
+        }
+        if !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve `(artifact_root, scan_root)` for `--project <PATH>`. When
+/// `scan_root_initial` lives inside a git checkout, `artifact_root`
+/// becomes the repo top-level (absolute) and `scan_root` becomes the
+/// matching absolute path — so `.assay/runs/...` lands next to the
+/// rest of the project's git-managed state and the
+/// `scan_root.canonicalize().strip_prefix(artifact_root.canonicalize())`
+/// arithmetic in `prepare_apply_local_tree` works unambiguously.
+///
+/// When `scan_root_initial` is NOT in a git checkout, both fall back
+/// to its original (caller-supplied) shape — the single-root standalone
+/// behavior.
+fn anchor_artifact_root_at_git_root(scan_root_initial: &Path) -> (PathBuf, PathBuf) {
+    if let Some(git_root) = find_enclosing_git_root(scan_root_initial) {
+        // Canonicalize scan_root so both paths share absolute form and
+        // downstream strip_prefix logic doesn't see relative-vs-absolute
+        // shape mismatch.
+        let scan_root_abs = scan_root_initial
+            .canonicalize()
+            .unwrap_or_else(|_| scan_root_initial.to_path_buf());
+        return (git_root, scan_root_abs);
+    }
+    (scan_root_initial.to_path_buf(), scan_root_initial.to_path_buf())
+}
+
 fn infer_project_scope_from_manifest(path: &Path) -> Option<(EcosystemSelector, PathBuf)> {
     let filename = path.file_name()?.to_str()?;
     if filename.eq_ignore_ascii_case("Cargo.toml") {
@@ -2788,6 +2979,46 @@ mod tests {
         assert!(ignored.is_empty());
     }
 
+    // ----- working_tree_dirty_path ignores .assay/ artifacts ------------
+
+    #[test]
+    fn porcelain_filter_treats_assay_artifacts_as_clean() {
+        // The dirty-tree predicate must NOT trip on assay's own
+        // `.assay/runs/...` directory — otherwise back-to-back
+        // `analyze` and `analyze --apply-local` against the same repo
+        // would always refuse on the (self-inflicted) untracked dir.
+        assert!(porcelain_line_is_assay_artifact("?? .assay/"));
+        assert!(porcelain_line_is_assay_artifact(
+            "?? .assay/runs/assay-12345/run.json"
+        ));
+        assert!(porcelain_line_is_assay_artifact(" M .assay/index.json"));
+        // Quoted form (path with spaces — rare but real).
+        assert!(porcelain_line_is_assay_artifact(
+            "?? \".assay/runs/assay 12345/log.txt\""
+        ));
+        // Rename from outside-into / inside-out of .assay/ — either
+        // side touching .assay/ should be filtered.
+        assert!(porcelain_line_is_assay_artifact(
+            "R  src/foo.rs -> .assay/foo.rs"
+        ));
+        assert!(porcelain_line_is_assay_artifact(
+            "R  .assay/foo.rs -> src/foo.rs"
+        ));
+    }
+
+    #[test]
+    fn porcelain_filter_keeps_real_dirty_paths() {
+        // Anything outside `.assay/` is a real dirty signal and the
+        // predicate must report it.
+        assert!(!porcelain_line_is_assay_artifact(" M src/cli.rs"));
+        assert!(!porcelain_line_is_assay_artifact("?? new-file.txt"));
+        assert!(!porcelain_line_is_assay_artifact("?? \"path with space.txt\""));
+        // A `.assay-foo/` (lookalike that isn't actually `.assay/`)
+        // must not be filtered — the predicate is strict.
+        assert!(!porcelain_line_is_assay_artifact("?? .assay-other/foo"));
+        assert!(!porcelain_line_is_assay_artifact("?? .assaytmp"));
+    }
+
     // ----- missing_cargo_lock_warning -----------------------------------
 
     fn cargo_manifest(kind: ManifestKind, path: &str) -> Manifest {
@@ -3161,6 +3392,7 @@ mod tests {
             ecosystem: None,
             apply_local: true,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: true,
             executor: ExecutorChoice::Host,
@@ -3235,6 +3467,7 @@ mod tests {
             ecosystem: Some(EcosystemSelector::All),
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -3492,6 +3725,156 @@ mod tests {
         assert_eq!(scope.scan_roots, vec![target]);
     }
 
+    #[test]
+    fn apply_mode_from_args_picks_validate_when_flag_set() {
+        let args = AnalyzeArgs {
+            validate: true,
+            ..default_test_args()
+        };
+        assert_eq!(ApplyMode::from_args(&args), ApplyMode::Validate);
+        assert!(ApplyMode::Validate.runs_validator());
+        assert!(!ApplyMode::Validate.mutates_host());
+    }
+
+    #[test]
+    fn apply_mode_helpers_match_documented_matrix() {
+        // DryRun: skip validator, no mutation.
+        assert!(!ApplyMode::DryRun.runs_validator());
+        assert!(!ApplyMode::DryRun.mutates_host());
+        // Validate: run validator, no mutation.
+        assert!(ApplyMode::Validate.runs_validator());
+        assert!(!ApplyMode::Validate.mutates_host());
+        // ApplyLocal: run validator + mutate (commit).
+        assert!(ApplyMode::ApplyLocal.runs_validator());
+        assert!(ApplyMode::ApplyLocal.mutates_host());
+        // ApplyPr: run validator + mutate (push + PR).
+        assert!(ApplyMode::ApplyPr.runs_validator());
+        assert!(ApplyMode::ApplyPr.mutates_host());
+    }
+
+    #[test]
+    fn polyglot_auto_detect_adds_known_tauri_subdirs() {
+        // Repo with no top-level manifest but a Tauri-shaped layout
+        // (src-tauri/Cargo.toml + ui/package.json) should auto-add
+        // both as scan_roots when no explicit `[project] roots` is set.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        std::fs::create_dir_all(repo_root.join("src-tauri")).unwrap();
+        std::fs::write(
+            repo_root.join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_root.join("ui")).unwrap();
+        std::fs::write(
+            repo_root.join("ui").join("package.json"),
+            r#"{"name":"x","version":"0.0.1"}"#,
+        )
+        .unwrap();
+        let args = AnalyzeArgs {
+            repo: repo_root.to_path_buf(),
+            ..default_test_args()
+        };
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
+        // Repo root is always present + auto-detected src-tauri + ui.
+        assert_eq!(scope.scan_roots.len(), 3);
+        assert!(scope.scan_roots.contains(&repo_root.to_path_buf()));
+        assert!(scope.scan_roots.contains(&repo_root.join("src-tauri")));
+        assert!(scope.scan_roots.contains(&repo_root.join("ui")));
+    }
+
+    #[test]
+    fn polyglot_auto_detect_skipped_when_root_has_a_manifest() {
+        // Single-root cargo project with a sibling `ui/` dir (some
+        // unrelated tool's UI bits) must NOT be auto-promoted to a
+        // polyglot scan — the operator's project HAS a top-level
+        // Cargo.toml so the canonical single-root behavior is what
+        // they want.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        std::fs::write(
+            repo_root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_root.join("ui")).unwrap();
+        std::fs::write(
+            repo_root.join("ui").join("package.json"),
+            r#"{"name":"x","version":"0.0.1"}"#,
+        )
+        .unwrap();
+        let args = AnalyzeArgs {
+            repo: repo_root.to_path_buf(),
+            ..default_test_args()
+        };
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
+        // Only the repo root — `ui/` is NOT promoted.
+        assert_eq!(scope.scan_roots, vec![repo_root.to_path_buf()]);
+    }
+
+    #[test]
+    fn polyglot_auto_detect_skipped_when_config_roots_present() {
+        // When the operator HAS set `[project] roots = [...]` explicitly
+        // we trust that config completely — no further auto-detection.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        std::fs::create_dir_all(repo_root.join("src-tauri")).unwrap();
+        std::fs::write(
+            repo_root.join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_root.join("ui")).unwrap();
+        std::fs::write(
+            repo_root.join("ui").join("package.json"),
+            r#"{"name":"x","version":"0.0.1"}"#,
+        )
+        .unwrap();
+        let args = AnalyzeArgs {
+            repo: repo_root.to_path_buf(),
+            ..default_test_args()
+        };
+        let mut config = crate::config::AssayConfig::default();
+        // Explicit roots — only `src-tauri/`, NOT `ui/`. Auto-detect
+        // must not add `ui/` to the scan_roots even though it exists.
+        config.project.roots = vec![PathBuf::from("src-tauri")];
+        let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
+        assert_eq!(scope.scan_roots.len(), 2);
+        assert!(scope.scan_roots.contains(&repo_root.to_path_buf()));
+        assert!(scope.scan_roots.contains(&repo_root.join("src-tauri")));
+        assert!(!scope.scan_roots.contains(&repo_root.join("ui")));
+    }
+
+    #[test]
+    fn project_scope_anchors_artifact_root_at_enclosing_git_root() {
+        // When `--project <sub-dir>` points inside a git repo, the
+        // artifact_root must climb to the repo top-level so
+        // `.assay/runs/...` lands beside the rest of the project's
+        // git-managed state, not buried inside the sub-project (see
+        // dogfood-tour-2026-05-19 finding N).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        // Create the .git marker (a regular file pointer is sufficient
+        // — find_enclosing_git_root treats `.git` as "any kind of file
+        // or directory exists").
+        std::fs::write(repo_root.join(".git"), "gitdir: not-real").unwrap();
+        let sub_dir = repo_root.join("ui");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let args = AnalyzeArgs {
+            repo: repo_root.clone(),
+            project: Some(sub_dir.clone()),
+            ..default_test_args()
+        };
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
+        // artifact_root climbs to repo_root; scan_root stays at the
+        // canonicalized sub_dir.
+        assert_eq!(scope.artifact_root, repo_root);
+        assert_eq!(scope.scan_roots, vec![sub_dir.canonicalize().unwrap()]);
+    }
+
     /// Default AnalyzeArgs for tests that only care about a few fields.
     fn default_test_args() -> AnalyzeArgs {
         AnalyzeArgs {
@@ -3499,6 +3882,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -3595,6 +3979,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -3662,6 +4047,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -3694,6 +4080,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -3740,6 +4127,7 @@ mod tests {
             ecosystem: None,
             apply_local: true,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: true,
             executor: ExecutorChoice::Host,
@@ -4360,6 +4748,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -4390,6 +4779,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -4418,6 +4808,7 @@ mod tests {
             ecosystem: None,
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
@@ -4448,6 +4839,7 @@ mod tests {
             ecosystem: Some(EcosystemSelector::Cargo),
             apply_local: false,
             apply_pr: false,
+            validate: false,
             unsafe_host_validation: false,
             force: false,
             executor: ExecutorChoice::Docker,
