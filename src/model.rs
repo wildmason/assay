@@ -292,10 +292,39 @@ pub struct AssayRunReceipt {
     pub started_at: String,
     pub finished_at: String,
     pub repository: RepositoryRef,
+    /// Reproducibility context: tool version, CLI args, OS/arch.
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` for
+    /// receipt back-compat — receipts written before this field
+    /// existed parse without it; receipts where the context wasn't
+    /// captured serialize without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_context: Option<RunContext>,
     /// Aggregate counts for quick scanning.
     pub summary: RunSummary,
     /// One record per pipeline stage outcome.
     pub provenance: Provenance,
+}
+
+/// Reproducibility metadata captured at the top of each run.
+///
+/// Lifted to top-level so a CI consumer scanning receipts for "what
+/// version + on which machine" doesn't have to walk every provenance
+/// record (each carries `tool` + `version` redundantly today). The
+/// dogfood feedback called out missing `cli_args` / `host` for
+/// reproducibility audits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunContext {
+    /// Exact CLI argv that produced this receipt, including the
+    /// subcommand and all flags. First element is the binary path
+    /// (resolved by the shell).
+    pub cli_args: Vec<String>,
+    /// `CARGO_PKG_VERSION` of the assay binary that produced the
+    /// receipt. Duplicates the per-record `version` field for fast
+    /// top-level access.
+    pub tool_version: String,
+    /// `os` / `arch` keys (`linux`/`macos`/`windows` × `x86_64`/
+    /// `aarch64`). Other keys reserved for future host facts.
+    pub host: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,6 +494,7 @@ mod tests {
                 github: None,
                 git_ref: None,
             },
+            run_context: None,
             summary: RunSummary::default(),
             provenance: Provenance { records: vec![] },
         };
@@ -516,6 +546,7 @@ mod tests {
                 github: None,
                 git_ref: None,
             },
+            run_context: None,
             summary: RunSummary::default(),
             provenance: Provenance { records: vec![] },
         };

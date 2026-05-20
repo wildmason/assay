@@ -25,15 +25,11 @@ pub fn write_run_receipt(workspace_root: &Path, receipt: &AssayRunReceipt) -> Re
         path: run_dir.clone(),
         source,
     })?;
-    // Pre-create receipts/ and logs/ subdirs so later stages don't race.
-    fs::create_dir_all(run_dir.join("receipts")).map_err(|source| Error::Io {
-        path: run_dir.join("receipts"),
-        source,
-    })?;
-    fs::create_dir_all(run_dir.join("logs")).map_err(|source| Error::Io {
-        path: run_dir.join("logs"),
-        source,
-    })?;
+    // `logs/` and `receipts/` subdirs are created lazily by
+    // `write_stage_receipt` / log writers when something actually
+    // lands there. Pre-creating them under DryRun (the most common
+    // mode) littered every run directory with two empty subdirs —
+    // multiple dogfood agents read that as "the run aborted partway."
     let run_json_path = run_dir.join("run.json");
     let json = serde_json::to_string_pretty(receipt).map_err(Error::Json)?;
     fs::write(&run_json_path, json).map_err(|source| Error::Io {
@@ -86,6 +82,7 @@ mod tests {
                 github: Some("wildmason/example".into()),
                 git_ref: Some("main".into()),
             },
+            run_context: None,
             summary: RunSummary {
                 manifests_scanned: 2,
                 proposals_total: 1,
@@ -113,15 +110,39 @@ mod tests {
     }
 
     #[test]
-    fn write_run_receipt_creates_run_dir_and_subdirs() {
+    fn write_run_receipt_creates_run_dir_only() {
+        // logs/ and receipts/ are created lazily by stage writers — a
+        // DryRun receipt-only invocation leaves them absent. The
+        // dogfood feedback was that empty subdirs read as "this run
+        // aborted partway" — better to materialize them only when
+        // something actually writes there.
         let tmp = tempfile::tempdir().unwrap();
         let receipt = sample_receipt("assay-test-1");
         let path = write_run_receipt(tmp.path(), &receipt).unwrap();
         assert!(path.ends_with("run.json"));
         assert!(path.exists());
         let run_dir = tmp.path().join(".assay").join("runs").join("assay-test-1");
+        assert!(!run_dir.join("receipts").exists());
+        assert!(!run_dir.join("logs").exists());
+    }
+
+    #[test]
+    fn write_stage_receipt_materializes_receipts_subdir_lazily() {
+        // The complement to above: as soon as a stage writes a
+        // receipt, the receipts/ subdir appears.
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt = sample_receipt("assay-test-lazy");
+        write_run_receipt(tmp.path(), &receipt).unwrap();
+        let run_dir = tmp.path().join(".assay").join("runs").join("assay-test-lazy");
+        assert!(!run_dir.join("receipts").exists());
+        write_stage_receipt(
+            tmp.path(),
+            "assay-test-lazy",
+            "stage.json",
+            &serde_json::json!({"ok": true}),
+        )
+        .unwrap();
         assert!(run_dir.join("receipts").is_dir());
-        assert!(run_dir.join("logs").is_dir());
     }
 
     #[test]

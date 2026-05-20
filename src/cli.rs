@@ -741,16 +741,31 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         prs_opened: 0,
     };
     let finished_at = iso8601_now();
+    // Canonicalize the repository path so receipts don't carry the
+    // `--project .` trailing-dot artifact (showed up as `<repo>\.` in
+    // the nlg smoke). Falls back to the un-normalized value when
+    // canonicalize fails (path doesn't exist, perms, etc.). The
+    // result is then forward-slash-normalized so cross-platform
+    // receipt consumers don't have to special-case Windows
+    // backslashes (multiple dogfood agents flagged the slash
+    // mixing as cosmetically jarring).
+    let repository_path = args
+        .repo
+        .canonicalize()
+        .map(strip_extended_length_prefix)
+        .map(forward_slash_path)
+        .unwrap_or_else(|_| args.repo.clone());
     let receipt = AssayRunReceipt {
         schema_version: crate::model::CURRENT_RECEIPT_SCHEMA_VERSION,
         run_id: run_id.clone(),
         started_at,
         finished_at,
         repository: RepositoryRef {
-            path: args.repo.clone(),
+            path: repository_path,
             github: None,
             git_ref: None,
         },
+        run_context: Some(capture_run_context()),
         summary,
         provenance,
     };
@@ -964,7 +979,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 None => {}
             }
         }
-        println!("assay: receipt written to {}", run_json_path.display());
+        println!(
+            "assay: receipt written to {}",
+            forward_slash_path(run_json_path.clone()).display()
+        );
     }
     Ok(())
 }
@@ -2992,6 +3010,46 @@ impl ProjectScope {
     }
 }
 
+/// Capture the reproducibility context (argv + tool version + host
+/// OS/arch) at the top of every analyze run. Falls into the
+/// receipt's `run_context` field so a downstream CI consumer can
+/// scan one place for "what version on what machine". The dogfood
+/// (ci-forge agent) flagged the absence of this top-level block as
+/// the main missing piece for reproducibility audits.
+fn capture_run_context() -> crate::model::RunContext {
+    let cli_args: Vec<String> = std::env::args().collect();
+    let mut host = std::collections::BTreeMap::new();
+    host.insert("os".to_string(), std::env::consts::OS.to_string());
+    host.insert("arch".to_string(), std::env::consts::ARCH.to_string());
+    crate::model::RunContext {
+        cli_args,
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        host,
+    }
+}
+
+/// Drop the Windows extended-length path prefix (`\\?\`) that
+/// `Path::canonicalize` emits on Windows. The prefix is technically
+/// correct but visually noisy in receipts and breadcrumbs — every
+/// downstream tool that consumes the path strips it anyway.
+fn strip_extended_length_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
+/// Convert any backslashes to forward slashes so receipt-emitted
+/// paths are consistent across OSes. PathBuf on Windows happily
+/// stores forward slashes; the receipt is display-only on the
+/// downstream side, so we don't need to preserve native separators
+/// for filesystem operations.
+fn forward_slash_path(path: PathBuf) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().replace('\\', "/"))
+}
+
 /// Per-ecosystem remediation hint when `--ecosystem <name>` returns
 /// no manifests. Each branch points at the most common reason from
 /// the 2026-05-20 dogfood: gha repos that don't have
@@ -3031,10 +3089,15 @@ fn augment_with_polyglot_subdirs(
     }
     for extra in detect_polyglot_subdirs(repo_root) {
         if !scan_roots.iter().any(|p| same_path(p, &extra)) {
+            // Strip the `\\?\` extended-length prefix that may show
+            // up after canonicalize on Windows. The path is correct
+            // either way, but the prefix is noise in user-facing
+            // breadcrumbs.
+            let display = strip_extended_length_prefix(extra.clone());
             eprintln!(
                 "[project] auto-detected polyglot scan root: `{}` \
                  (set [project] roots = [...] in .assay.toml to silence)",
-                extra.display()
+                display.display()
             );
             scan_roots.push(extra);
         }
