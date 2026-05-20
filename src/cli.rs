@@ -2830,9 +2830,20 @@ impl ProjectScope {
             }
             if path.is_dir() {
                 let (artifact_root, scan_root) = anchor_artifact_root_at_git_root(path);
+                let mut scan_roots: Vec<PathBuf> = vec![scan_root.clone()];
+                // Polyglot auto-detect ALSO applies when --project points
+                // at a directory — without this, `assay analyze --project
+                // mortar` (Tauri: src-tauri/ + ui/) misses every Cargo
+                // and npm manifest because the root has neither at top
+                // level. Pre-fix dogfood: 49/52 actionable proposals
+                // (94%) silently dropped on mortar. Per-ecosystem gate
+                // honored so a single-cargo / single-npm repo doesn't
+                // also probe for subdirs (a root workspace covers its
+                // members already).
+                augment_with_polyglot_subdirs(&mut scan_roots, &scan_root, config);
                 return Ok(ProjectScope {
                     artifact_root,
-                    scan_roots: vec![scan_root],
+                    scan_roots,
                     ecosystem_restriction: None,
                 });
             }
@@ -2869,25 +2880,7 @@ impl ProjectScope {
                 scan_roots.push(resolved);
             }
         }
-        // Polyglot auto-detect: when the repo root has no Cargo.toml /
-        // package.json AND the user hasn't configured `[project] roots`,
-        // a Tauri-shaped layout (src-tauri/ + ui/ / frontend/ / app/)
-        // would otherwise scan only `.github/workflows/`. Silently
-        // adding the detected sub-projects gives plain `assay analyze`
-        // the same coverage as a hand-written multi-root config (see
-        // dogfood-tour-2026-05-19 finding L).
-        if config.project.roots.is_empty() && !repo_root_has_a_manifest(&artifact_root) {
-            for extra in detect_polyglot_subdirs(&artifact_root) {
-                if !scan_roots.iter().any(|p| same_path(p, &extra)) {
-                    eprintln!(
-                        "[project] auto-detected polyglot scan root: `{}` \
-                         (set [project] roots = [...] in .assay.toml to silence)",
-                        extra.display()
-                    );
-                    scan_roots.push(extra);
-                }
-            }
-        }
+        augment_with_polyglot_subdirs(&mut scan_roots, &artifact_root, config);
         Ok(ProjectScope {
             artifact_root,
             scan_roots,
@@ -2896,19 +2889,50 @@ impl ProjectScope {
     }
 }
 
-/// `true` when `repo_root` itself carries any v1 ecosystem manifest at
-/// its top level. Used by polyglot auto-detection to decide whether
-/// `analyze` would otherwise be a one-ecosystem (`.github/workflows/`
-/// only) scan.
-fn repo_root_has_a_manifest(repo_root: &Path) -> bool {
-    repo_root.join("Cargo.toml").is_file() || repo_root.join("package.json").is_file()
+/// Append polyglot subdirectories (Tauri-style `src-tauri/`/`ui/`,
+/// monorepo-style `apps/<name>/`/`packages/<name>/`) to `scan_roots`
+/// when the repo root doesn't carry the relevant ecosystem's manifest
+/// at top level. No-op when the user supplied `[project] roots = [...]`
+/// in `.assay.toml` (explicit config wins). Each addition emits a
+/// stderr breadcrumb so the operator can see what was auto-detected.
+fn augment_with_polyglot_subdirs(
+    scan_roots: &mut Vec<PathBuf>,
+    repo_root: &Path,
+    config: &crate::config::AssayConfig,
+) {
+    if !config.project.roots.is_empty() {
+        return;
+    }
+    for extra in detect_polyglot_subdirs(repo_root) {
+        if !scan_roots.iter().any(|p| same_path(p, &extra)) {
+            eprintln!(
+                "[project] auto-detected polyglot scan root: `{}` \
+                 (set [project] roots = [...] in .assay.toml to silence)",
+                extra.display()
+            );
+            scan_roots.push(extra);
+        }
+    }
 }
 
-/// Probe `repo_root` for canonical Tauri-shape sub-projects. Returns
-/// any subdirectory that contains a v1 ecosystem manifest. Order is
-/// stable across runs.
+/// Probe `repo_root` for sub-projects in conventional Tauri /
+/// monorepo locations. Returns each subdirectory that carries a v1
+/// ecosystem manifest the root does NOT already cover.
+///
+/// Per-ecosystem gating: a cargo workspace at root already enumerates
+/// its members, so cargo subdirs are skipped. An npm root package.json
+/// already enumerates its workspaces, so npm subdirs are skipped.
+/// This prevents double-counting workspace members while still
+/// catching Tauri layouts (`src-tauri/` Cargo + `ui/` npm with no
+/// root manifest) and rust+frontend polyglots (root Cargo workspace
+/// + `apps/web/` npm — ci-forge's shape).
+///
+/// Order is stable across runs.
 fn detect_polyglot_subdirs(repo_root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    let root_has_cargo = repo_root.join("Cargo.toml").is_file();
+    let root_has_npm = repo_root.join("package.json").is_file();
+
     // src-tauri/ is the canonical Tauri backend directory; the literal
     // name is hard-coded by the Tauri CLI scaffold and shows up in
     // every Wildmason Tauri app (Bridge, Helm, Mortar, Crucible).
@@ -2917,16 +2941,46 @@ fn detect_polyglot_subdirs(repo_root: &Path) -> Vec<PathBuf> {
     // across the Tauri / Vue / Next.js + monorepo ecosystem. Order
     // matches encounter likelihood in Wildmason repos.
     let npm_candidates = ["ui", "frontend", "app", "web", "client"];
-    for sub in cargo_candidates {
-        let p = repo_root.join(sub);
-        if p.join("Cargo.toml").is_file() {
-            out.push(p);
+
+    if !root_has_cargo {
+        for sub in cargo_candidates {
+            let p = repo_root.join(sub);
+            if p.join("Cargo.toml").is_file() {
+                out.push(p);
+            }
         }
     }
-    for sub in npm_candidates {
-        let p = repo_root.join(sub);
-        if p.join("package.json").is_file() {
-            out.push(p);
+    if !root_has_npm {
+        for sub in npm_candidates {
+            let p = repo_root.join(sub);
+            if p.join("package.json").is_file() {
+                out.push(p);
+            }
+        }
+        // Monorepo nested probe: `apps/<name>/package.json` and
+        // `packages/<name>/package.json`. ci-forge's `apps/web/`
+        // (rust workspace at root + Vite frontend nested 2 levels
+        // deep) is unreachable from the 1-level scan above. Cargo is
+        // omitted from this nested probe because a root workspace
+        // already covers its members.
+        for nest in ["apps", "packages"] {
+            let nest_dir = repo_root.join(nest);
+            if !nest_dir.is_dir() {
+                continue;
+            }
+            let entries: Vec<_> = match std::fs::read_dir(&nest_dir) {
+                Ok(iter) => iter.flatten().collect(),
+                Err(_) => continue,
+            };
+            let mut nested: Vec<PathBuf> = entries
+                .into_iter()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && p.join("package.json").is_file())
+                .collect();
+            nested.sort();
+            for p in nested {
+                out.push(p);
+            }
         }
     }
     out
@@ -4461,17 +4515,24 @@ mod tests {
     }
 
     #[test]
-    fn polyglot_auto_detect_skipped_when_root_has_a_manifest() {
-        // Single-root cargo project with a sibling `ui/` dir (some
-        // unrelated tool's UI bits) must NOT be auto-promoted to a
-        // polyglot scan — the operator's project HAS a top-level
-        // Cargo.toml so the canonical single-root behavior is what
-        // they want.
+    fn polyglot_auto_detect_gates_per_ecosystem() {
+        // Cargo workspace at root with a `ui/package.json` (ci-forge
+        // shape): cargo subdir probe is suppressed (root workspace
+        // covers its members) but the npm subdir IS still promoted so
+        // the Vite/React frontend gets scanned alongside the rust
+        // workspace. Inverse holds when root has `package.json` but no
+        // `Cargo.toml` (npm monorepo + bundled rust tool).
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path();
         std::fs::write(
             repo_root.join("Cargo.toml"),
             "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_root.join("src-tauri")).unwrap();
+        std::fs::write(
+            repo_root.join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"y\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(repo_root.join("ui")).unwrap();
@@ -4486,8 +4547,74 @@ mod tests {
         };
         let config = crate::config::AssayConfig::default();
         let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
-        // Only the repo root — `ui/` is NOT promoted.
-        assert_eq!(scope.scan_roots, vec![repo_root.to_path_buf()]);
+        // Repo root + `ui/` (cargo subdir suppressed because root has
+        // Cargo.toml).
+        assert_eq!(scope.scan_roots.len(), 2);
+        assert!(scope.scan_roots.contains(&repo_root.to_path_buf()));
+        assert!(scope.scan_roots.contains(&repo_root.join("ui")));
+        assert!(!scope.scan_roots.contains(&repo_root.join("src-tauri")));
+    }
+
+    #[test]
+    fn polyglot_auto_detect_finds_nested_apps_subdir() {
+        // ci-forge shape: rust workspace at root + frontend nested
+        // two levels deep at `apps/web/package.json`. The 1-level
+        // probe wouldn't find this; the `apps/*` / `packages/*`
+        // monorepo nested probe is what makes it reachable.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        std::fs::write(
+            repo_root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = []\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_root.join("apps").join("web")).unwrap();
+        std::fs::write(
+            repo_root.join("apps").join("web").join("package.json"),
+            r#"{"name":"web","version":"0.0.1"}"#,
+        )
+        .unwrap();
+        let args = AnalyzeArgs {
+            repo: repo_root.to_path_buf(),
+            ..default_test_args()
+        };
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
+        assert_eq!(scope.scan_roots.len(), 2);
+        assert!(scope.scan_roots.contains(&repo_root.join("apps").join("web")));
+    }
+
+    #[test]
+    fn polyglot_auto_detect_runs_for_project_dir_invocation() {
+        // Regression for the 2026-05-20 dogfood finding: `--project
+        // mortar` (Tauri layout) was returning 0 cargo / 0 npm
+        // proposals because polyglot detection only fired on the
+        // no-project path. The fix runs polyglot in the --project
+        // <dir> branch too, so plain `assay analyze --project mortar`
+        // sees `src-tauri/` AND `ui/` automatically.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+        std::fs::create_dir_all(repo_root.join("src-tauri")).unwrap();
+        std::fs::write(
+            repo_root.join("src-tauri").join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_root.join("ui")).unwrap();
+        std::fs::write(
+            repo_root.join("ui").join("package.json"),
+            r#"{"name":"x","version":"0.0.1"}"#,
+        )
+        .unwrap();
+        let args = AnalyzeArgs {
+            project: Some(repo_root.to_path_buf()),
+            repo: repo_root.to_path_buf(),
+            ..default_test_args()
+        };
+        let config = crate::config::AssayConfig::default();
+        let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
+        assert!(scope.scan_roots.contains(&repo_root.join("src-tauri")));
+        assert!(scope.scan_roots.contains(&repo_root.join("ui")));
     }
 
     #[test]
