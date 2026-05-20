@@ -2,6 +2,39 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — 2026-05-20
+
+**Stable release.** Six releases in two days (0.2.0 → 0.7.0) closed every value-prop gap and bug surfaced by the multi-target dogfood tour. 1.0.0 is the same crate as 0.7.0 plus a public stability commitment.
+
+### Stability promise
+
+Starting at 1.0, three surfaces follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html):
+
+- **CLI:** every flag documented in `assay analyze --help` is stable. New flags may be added in minor releases. Subcommands and their flags will not be removed or semantically repurposed within a major version. Exit codes are stable (`0` success, non-zero error).
+- **Receipt schema:** the JSON shape under `.assay/runs/<run-id>/run.json` (rooted at `AssayRunReceipt`) carries `schema_version` and is forward-compatible within a major version. New fields are additive with `#[serde(default)]`; existing fields don't change shape or semantic.
+- **Public Rust API:** the types re-exported from `lib.rs` — `Proposal`, `Manifest`, `ManifestKind`, `Classification`, `ProposalKind`, `ValidationOutcome`, `AssayRunReceipt`, `Error`, `Result`, `AnalyzeArgs`, `DependencyEcosystem`, `EcosystemContext`, `EcosystemName` — follow SemVer. Adding variants to enums in this set is a minor change; removing or renaming is a major change.
+
+Internal modules (`apply_merger`, `worker_pool`, `validator`, `verdict_cache`, `workflow_filter`, `process_runner`, `redact`, `external_deps`, `member_gate`, `publisher`, `sanitize`, `config`) are now `#[doc(hidden)]` — they're still `pub` for the binary's use but are NOT covered by the stability promise. Treat them as implementation detail.
+
+### Documentation
+
+- README gains crates.io + docs.rs badges and reflects the framework-cohort + peer-dep + SHA-pin feature surface.
+- `lib.rs` carries the stability statement.
+
+### Final dogfood verification (2026-05-20)
+
+End-to-end smoke against three targets confirms the 0.5/0.6/0.7 features integrate cleanly:
+
+- **safe-bundle** (cargo single crate): SHA-pin proposals fire for every tag-pinned action (4 actions), tag-bump proposals still emit, cargo `affected_consumers` populates.
+- **mortar** (Tauri polyglot): 22 breaking cargo proposals + npm typescript bump with peer-dep cross-reference (`typescript 5.9.3 -> 6.0.3 (2 consumers: @angular/build, @angular/compiler-cli)`).
+- **ci-forge** (Cargo workspace + nested `apps/web/` npm): `vite 7 -> 8 (2 consumers: @vitejs/plugin-react, @vitest/mocker)` — peer-dep cross-reference + nested-monorepo discovery both working.
+
+### Internal
+
+- `lib.rs` re-exports unchanged; the surface is the same as 0.7.0.
+- Test count: 655 (unchanged from 0.7.0).
+- `#[doc(hidden)]` added to 12 internal modules; docs.rs landing page now shows only the stable surface.
+
 ## [0.7.0] — 2026-05-20
 
 "npm peer-dep awareness" release. Closes the third largest dogfood gap: `affected_consumers` was empty for every npm proposal. For a library that declares `peerDependencies: { "@angular/core": ">=21" }`, an `@angular/core` bump may shift the minimum peer range — exactly the cross-cut a library author needs. Pre-0.7.0 that signal was invisible.

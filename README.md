@@ -2,7 +2,10 @@
 
 **Test dependency upgrades against your projects' real CI before you adopt them.**
 
-`assay` is a standalone CLI that scans a repository for outdated dependencies, computes the upgrade impact (per-workspace-member when applicable), and — optionally — runs the project's own gate workflows against the bumped tree to prove the upgrade survives CI before you commit it. Cargo + GitHub Actions + npm/pnpm/yarn1/yarn berry shipping.
+[![crates.io](https://img.shields.io/crates/v/dep-assay.svg)](https://crates.io/crates/dep-assay)
+[![docs.rs](https://docs.rs/dep-assay/badge.svg)](https://docs.rs/dep-assay)
+
+`assay` is a standalone CLI that scans a repository for outdated dependencies, computes the upgrade impact (per-workspace-member on cargo, peer-dep-aware on npm), and — optionally — runs the project's own gate workflows against the bumped tree to prove the upgrade survives CI before you commit it. Cargo + GitHub Actions + npm/pnpm/yarn1/yarn berry shipping. Framework-cohort aware (`@angular/*`, `@tiptap/*`, `next + @next/*`, etc. move together). SHA-pin hardening proposals for floating GitHub Actions tags by default.
 
 The wedge versus Dependabot/Renovate: **monorepo blast-radius**. When `tar = { version = "0.4.45" }` lives at the workspace root and seven members consume it transitively, the question those tools don't answer is *"if I take tar 0.4.46, which of those seven still pass their CI?"* — `assay` does, by running the project's real CI workflows against the bumped tree.
 
