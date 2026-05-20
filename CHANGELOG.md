@@ -2,6 +2,26 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-05-20
+
+NDJSON streaming events for real-time GUI consumption. The new `--format ndjson` output mode emits one JSON object per line as the run progresses, designed for a Tauri-based progress GUI (`assay-gui`, separate repo) and other live-progress sidecars that update UI state as proposals flow through the worker pool.
+
+### Added
+
+- **`--format ndjson` output mode.** Emits a structured event stream on stdout: `run_started` (with full proposal inventory + cohort groupings), `proposal_validating` / `proposal_completed` for non-cohort proposals, `cohort_validating` / `cohort_completed` for multi-member cohort lockstep units (so the GUI groups members visually instead of showing N separate spinners), `run_completed` with the summary + run.json path. Each event has a `type` discriminator + variant-specific fields. Suppresses all text output so the stream is parseable without prefixes.
+- **`assay::events` module** is part of the public API surface under the 1.0 stability promise (new variants and fields are additive minor changes; existing variants don't change shape within a major version). Re-exports the `Event`, `EventSink`, `EventProposal`, `EventCohort`, `EventSummary` types plus the `NoopEventSink` and `NdjsonStdoutSink` impls.
+- `WorkerContext.event_sink` threads the sink through to every worker. The pipeline calls `sink.emit(...)` unconditionally; the default no-op sink drops events when the user didn't request `--format ndjson`, so existing Text/Json callers see no behavior change.
+
+### Internal
+
+- 4 new tests for the event types (round-trip serde, cohort field presence, skip-when-none on optional cohort field, no-op sink basic). Test count: 693 (up from 689).
+- `process_proposal_unit` now records `worker_started: Instant` so `proposal_completed` / `cohort_completed` events can carry `duration_ms`.
+- New shared `cohort_display_name` helper looks up cohort display strings across both ecosystem registries.
+
+### Live dogfood (slate ui)
+
+- `assay analyze --format ndjson --ecosystem npm` against slate's ui emits two lines: a `run_started` event with all 37 proposals + 3 cohort groupings (angular-framework × 7, angular-tooling × 2, tiptap × 20), then `run_completed` with the summary. Under `--validate`, the per-proposal and per-cohort validating/completed events fire in real time as the worker pool churns.
+
 ## [1.3.0] — 2026-05-20
 
 Cargo workspace cohort awareness — the Cargo analog of the npm cohort work shipped in 1.1.0. Crate families that MUST move together (`tokio` + `tokio-util`, `serde` + `serde_derive`, `tracing` + `tracing-core` + `tracing-subscriber`, `tauri` + `tauri-build` + `tauri-plugin-*`, `prost` family, `tonic` family, `axum` family, `hyper` family, `tower` family, `clap` family, `reqwest` + `reqwest-middleware`, `bevy_*`) now apply + validate + bisect atomically — partial cohort applies (e.g. `tokio@1.45` without `tokio-util` paired to that major+minor) are eliminated.
