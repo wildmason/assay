@@ -2,6 +2,25 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-05-20
+
+Three additive features that close the cohort + monorepo gaps surfaced by the 1.0 dogfood tour. All changes are minor-version-safe under the 1.0 stability promise.
+
+### Added
+
+- **pnpm virtual-store walking for peer-dep cross-reference.** The npm ecosystem's `affected_consumers` now walks `node_modules/.pnpm/<pkg>@<ver>/node_modules/<pkg>/package.json` in addition to the flat hoisted layout. pnpm-style monorepos (the dominant flavor in modern Wildmason projects) put the real install under `.pnpm/`, while the top-level `node_modules/` is just symlinks to declared deps. Before this, transitive peer-dep declarers were invisible to the consumer search; now they're surfaced exactly like first-party consumers. Dedupes by package name across multiple peer-resolution suffixes (e.g. `@wildmason+aegis@1.5.4_@angular+core@21.0.0` and `@wildmason+aegis@1.5.4_@angular+core@22.0.0` register as one consumer).
+- **Multi-cohort lockstep tier widening.** When two or more proposals share a cohort id (`@angular/*` framework, `@tiptap/*`, `@next/*`, etc.), the most invasive member's tier (Breaking > Compatible > LockfileOnly) now propagates to every cohort member. A `@angular/core` Breaking bump bundled with a `@angular/common` Compatible bump can NOT be applied as "Compatible for common, Breaking for core" — pnpm/npm refuses to resolve the lockfile that way. Widened proposals get a structured note (`cohort-lockstep: widened from compatible to breaking to match angular-framework (lockstep with 2 members)`) so the operator can see at a glance why the cohort is being flagged as Breaking. Single-member cohorts are NOT widened — there's no lockstep to enforce.
+- **Atomic apply-as-one-unit for cohort lockstep.** Multi-member cohorts are now applied + validated together as a single atomic unit instead of as N independent proposals. The worker applies ALL members to one sandbox via `apply_merged`, validates the combined state once, and the aggregator expands the shared outcome into one `ProposalRun` per member. The merger's bisect step is cohort-aware: when the merged set goes red, the bisect drops cohort members as a group, never alone. This eliminates the partial-cohort failure mode where `@angular/core@22` would be shipped without `@angular/common@22` (which pnpm/npm would then refuse to resolve on the host).
+
+### Internal
+
+- 17 new tests covering pnpm virtual-store walking (4), cohort tier widening (5), cohort-aware bisect drop groups (3), and cohort-aware work-unit construction (5). Test count: 672 (up from 655).
+- `WorkUnit` carries `lockstep_members: Vec<Proposal>` (internal type, no stability impact); `WorkerOutcome::CohortCompleted` is a new variant the aggregator expands into per-member `ProposalRun`s.
+
+### Live dogfood
+
+- **slate ui** (npm + @angular/* + @tiptap/*): 37 proposals collapsed to 3 cohort headers (`@angular/* framework` × 7, `@angular/* tooling` × 2, `@tiptap/*` × 20) + 5 stand-alones. Display density wins vs. the pre-1.1 wall-of-proposals view.
+
 ## [1.0.0] — 2026-05-20
 
 **Stable release.** Six releases in two days (0.2.0 → 0.7.0) closed every value-prop gap and bug surfaced by the multi-target dogfood tour. 1.0.0 is the same crate as 0.7.0 plus a public stability commitment.
