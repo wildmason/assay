@@ -39,7 +39,7 @@ impl EcosystemName {
 /// action store path, whether network is allowed, and (when present) the
 /// Octocrab handle for tag/release lookups. The HTTP client is optional
 /// because dry-run mode against fixture repos may skip it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct EcosystemContext {
     /// Local offline action store (`.assay/actions`) for SHA resolution.
     pub action_store: Option<PathBuf>,
@@ -57,6 +57,25 @@ pub struct EcosystemContext {
     /// on-disk cache and force a fresh fetch for every lookup.
     /// Ignored in offline mode (there's no source to refresh from).
     pub refresh_cache: bool,
+    /// Emit SHA-pin hardening proposals for tag-pinned actions
+    /// (github-actions ecosystem only). Default `true`: for every
+    /// `actions/foo@vN` pin, the proposer suggests a SHA pin at the
+    /// resolved release tag (`actions/foo@<sha> # vN.M.P`). CLI
+    /// flag `--no-sha-pin-proposals` flips this off when an operator
+    /// prefers tag pins for readability.
+    pub sha_pin_proposals: bool,
+}
+
+impl Default for EcosystemContext {
+    fn default() -> Self {
+        Self {
+            action_store: None,
+            allow_network: true,
+            ignored_subjects: Vec::new(),
+            refresh_cache: false,
+            sha_pin_proposals: true,
+        }
+    }
 }
 
 /// The trait an ecosystem must implement to participate in the

@@ -133,7 +133,7 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
         }
         client = client.with_offline_mode(!ctx.allow_network);
         client = client.with_refresh(ctx.refresh_cache);
-        let proposals = build_action_proposals(manifests, &client);
+        let proposals = build_action_proposals(manifests, &client, ctx.sha_pin_proposals);
         Ok(filter_ignored_actions(proposals, &ctx.ignored_subjects))
     }
 
@@ -367,6 +367,7 @@ pub(crate) fn aggregate_actions_from_manifests(manifests: &[Manifest]) -> Vec<Ac
 pub(crate) fn build_action_proposals(
     manifests: &[Manifest],
     client: &GitHubApiClient,
+    sha_pin_proposals: bool,
 ) -> Vec<Proposal> {
     let aggregates = aggregate_actions_from_manifests(manifests);
     let mut proposals: Vec<Proposal> = Vec::new();
@@ -375,6 +376,23 @@ pub(crate) fn build_action_proposals(
             Ok(Some(info)) => info,
             _ => continue,
         };
+        // Tag-pinned actions get a SHA-pin proposal IN ADDITION to
+        // the tag-bump proposal when `sha_pin_proposals` is on
+        // (default). The two proposals offer the operator different
+        // levels of hardening: the tag bump tracks the latest minor
+        // floating tag (`v6 -> v7`); the SHA pin freezes to the
+        // exact commit GitHub publishes for that tag (mitigates
+        // tag-move attacks). Both target the same upstream release.
+        if matches!(agg.pin_kind, PinKind::Tag) && sha_pin_proposals {
+            let target_tag = pick_target_tag(
+                client,
+                &agg.owner,
+                &agg.repo,
+                &agg.current_ref,
+                &release.tag_name,
+            );
+            proposals.push(build_sha_pin_proposal(&agg, &release, &target_tag, client));
+        }
         let parts: ProposalParts = match agg.pin_kind {
             PinKind::Sha => {
                 if release.commit_sha.eq_ignore_ascii_case(&agg.current_ref) {
@@ -467,6 +485,84 @@ pub(crate) fn build_action_proposals(
 /// for the applier's comment-rewrite). The previous code used a 4-tuple
 /// then patched in the target tag — extracting it makes the
 /// granularity-picker integration honest.
+/// Build the "convert floating tag to SHA pin at <tag>" hardening
+/// proposal. Emitted in addition to (not instead of) the tag-bump
+/// proposal when an action is tag-pinned and `--no-sha-pin-proposals`
+/// isn't set. The operator can pick which form they prefer — both
+/// target the same upstream release.
+///
+/// Classifier verdict is always [`BumpTier::Compatible`] because
+/// the bump is a manifest edit (operator opted into a different
+/// pin form) but doesn't cross semver. The `notes` carry
+/// `tag:<resolved-tag>` (so the applier can write the trailing
+/// comment) and a `security:` note pointing the reader at the
+/// supply-chain rationale. The `kind` stays [`ProposalKind::ActionPin`]
+/// — there's only one kind for ref bumps.
+fn build_sha_pin_proposal(
+    agg: &ActionAggregate,
+    release: &super::github_actions_api::ReleaseInfo,
+    target_tag: &str,
+    client: &GitHubApiClient,
+) -> Proposal {
+    let subject = format!("{}/{}", agg.owner, agg.repo);
+    let id = format!(
+        "gha-{}-{}-sha-pin-{}",
+        sanitize_id_segment(&agg.owner),
+        sanitize_id_segment(&agg.repo),
+        short_sha(&release.commit_sha),
+    );
+    let mut notes = vec![
+        format!("tag:{target_tag}"),
+        format!(
+            "security: SHA pin replaces floating tag `{}` with commit `{}` at `{target_tag}` (mitigates tag-move attacks; see https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions)",
+            agg.current_ref,
+            short_sha(&release.commit_sha)
+        ),
+    ];
+    if client.is_offline() {
+        notes.push(
+            "source:offline-cache (latest release info read from .assay/actions/, may be stale)"
+                .to_string(),
+        );
+    }
+    let classification = if client.is_offline() {
+        Classification::Simulated
+    } else {
+        Classification::Exact
+    };
+    Proposal {
+        id,
+        ecosystem: EcosystemName::GitHubActions.as_str().to_string(),
+        kind: ProposalKind::ActionPin,
+        subject,
+        from: agg.current_ref.clone(),
+        to: release.commit_sha.clone(),
+        initial_classification: classification,
+        manifest_paths: agg.manifest_paths.clone(),
+        notes,
+        bump_tier: BumpTier::Compatible,
+        affected_consumers: Vec::new(),
+        explanation: Some(crate::model::BumpExplanation {
+            summary: format!(
+                "gha: SHA pin hardens the floating tag `{}` against tag-move attacks; \
+                 commit `{}` resolves at tag `{target_tag}`",
+                agg.current_ref,
+                short_sha(&release.commit_sha),
+            ),
+            rule: "gha:tag-to-sha-pinning".into(),
+            inputs: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("from_tag".into(), agg.current_ref.clone());
+                m.insert("to_sha".into(), release.commit_sha.clone());
+                m.insert("to_tag".into(), target_tag.to_string());
+                m
+            },
+            decision: "compatible".into(),
+        }),
+        cohort: None,
+    }
+}
+
 struct ProposalParts {
     from: String,
     to: String,
@@ -1114,7 +1210,25 @@ pub fn rewrite_uses_in_workflow(
         rewritten.push_str(open_quote);
         rewritten.push_str(&new_value);
         rewritten.push_str(close_quote);
-        if let Some(comment) = new_comment {
+        // Auto-add a `# <tag>` comment when:
+        //   - the original line had NO comment,
+        //   - the new value looks like a commit SHA (40 hex chars), AND
+        //   - the caller passed a version_tag.
+        // This is the SHA-pin path: an operator who had
+        // `actions/checkout@v6` (no comment) now gets
+        // `actions/checkout@<sha> # v6.0.2`. Without the auto-comment
+        // the SHA-pin form would lose all human-readable context.
+        let final_comment = match new_comment {
+            Some(c) => Some(c),
+            None => {
+                if let (Some(tag), true) = (version_tag, is_likely_commit_sha(to)) {
+                    Some(format!("# {tag}"))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(comment) = final_comment {
             // Preserve the single space that typically separates value from `#`.
             rewritten.push(' ');
             rewritten.push_str(comment.trim_end());
@@ -1140,6 +1254,15 @@ fn split_line_terminator(raw: &str) -> (&str, &str) {
     } else {
         (raw, "")
     }
+}
+
+/// Heuristic: does `value` look like a git commit SHA? Used by
+/// `rewrite_uses_in_workflow` to decide whether to auto-add a
+/// `# <tag>` comment when transitioning from a tag-pinned ref to a
+/// SHA-pinned one. Recognizes both full (40 char) and short (≥7 char)
+/// SHAs of lowercase hex.
+fn is_likely_commit_sha(value: &str) -> bool {
+    value.len() >= 7 && value.len() <= 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn is_version_char(ch: char) -> bool {
@@ -1999,11 +2122,135 @@ jobs:
         let client = crate::ecosystem::github_actions_api::GitHubApiClient::new().with_binary(
             std::path::PathBuf::from("__assay_test_definitely_not_a_real_binary__"),
         );
-        let proposals = build_action_proposals(&[m], &client);
+        let proposals = build_action_proposals(&[m], &client, false);
         assert!(
             proposals.is_empty(),
             "no proposal should be emitted when API can't resolve"
         );
+    }
+
+    #[test]
+    fn build_action_proposals_emits_sha_pin_for_tag_pinned_action() {
+        // Tag-pinned `actions/checkout@v6` + sha_pin_proposals=true:
+        // the proposer emits BOTH a tag-bump and a SHA-pin proposal.
+        // Test relies on `write_release_cache` to inject a fixed
+        // (tag, sha) pair so the proposer's lookup doesn't go to
+        // the network.
+        let tmp = tempfile::tempdir().unwrap();
+        let client = crate::ecosystem::github_actions_api::GitHubApiClient::new()
+            .with_binary(std::path::PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        let info = crate::ecosystem::github_actions_api::ReleaseInfo {
+            tag_name: "v6.0.2".into(),
+            commit_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".into(),
+        };
+        client
+            .write_release_cache("actions", "checkout", &info)
+            .unwrap();
+
+        let m = manifest_with_uses(
+            ".github/workflows/ci.yml",
+            vec![tag_pinned_ref("actions", "checkout", "v6")],
+        );
+        let proposals = build_action_proposals(&[m], &client, true);
+
+        // Two proposals: tag-bump and SHA-pin. Order: SHA-pin first
+        // (build_action_proposals pushes it before the tag-bump path).
+        let sha_pin = proposals
+            .iter()
+            .find(|p| p.to == info.commit_sha)
+            .expect("expected SHA-pin proposal");
+        assert_eq!(sha_pin.from, "v6");
+        assert_eq!(sha_pin.to, info.commit_sha);
+        assert!(
+            sha_pin
+                .explanation
+                .as_ref()
+                .is_some_and(|e| e.rule == "gha:tag-to-sha-pinning"),
+            "expected gha:tag-to-sha-pinning explanation: {:?}",
+            sha_pin.explanation
+        );
+        assert!(
+            sha_pin.notes.iter().any(|n| n.contains("security:")),
+            "expected security note: {:?}",
+            sha_pin.notes
+        );
+    }
+
+    #[test]
+    fn build_action_proposals_skips_sha_pin_when_flag_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = crate::ecosystem::github_actions_api::GitHubApiClient::new()
+            .with_binary(std::path::PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        let info = crate::ecosystem::github_actions_api::ReleaseInfo {
+            tag_name: "v6.0.2".into(),
+            commit_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".into(),
+        };
+        client
+            .write_release_cache("actions", "checkout", &info)
+            .unwrap();
+
+        let m = manifest_with_uses(
+            ".github/workflows/ci.yml",
+            vec![tag_pinned_ref("actions", "checkout", "v6")],
+        );
+        let proposals = build_action_proposals(&[m], &client, false);
+        assert!(
+            proposals.iter().all(|p| p.to != info.commit_sha),
+            "no SHA-pin proposal should appear when sha_pin_proposals=false"
+        );
+    }
+
+    #[test]
+    fn rewrite_uses_in_workflow_auto_comments_sha_pin_when_no_existing_comment() {
+        // Tag-pinned action with NO comment → SHA pin should get
+        // a fresh `# v6.0.2` comment so the SHA stays human-
+        // readable. Pre-0.6.0 the rewriter only kept/replaced
+        // existing comments; never added one.
+        let original = "      - uses: actions/checkout@v6\n";
+        let rewritten = rewrite_uses_in_workflow(
+            original,
+            "actions/checkout",
+            "v6",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+            Some("v6.0.2"),
+        )
+        .unwrap();
+        assert!(
+            rewritten
+                .contains("actions/checkout@a1b2c3d4e5f60718293a4b5c6d7e8f9012345678 # v6.0.2"),
+            "expected SHA-pin with auto-comment: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_uses_in_workflow_preserves_existing_comment_on_tag_to_tag() {
+        // The auto-comment branch must NOT fire for tag-to-tag
+        // bumps (the new value isn't a SHA). Existing comment
+        // handling is unchanged.
+        let original = "      - uses: actions/checkout@v3 # v3.5.2\n";
+        let rewritten =
+            rewrite_uses_in_workflow(original, "actions/checkout", "v3", "v4", Some("v4.1.0"))
+                .unwrap();
+        assert!(
+            rewritten.contains("actions/checkout@v4 # v4.1.0"),
+            "expected tag-to-tag rewrite to keep comment: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn is_likely_commit_sha_recognizes_full_and_short_shas() {
+        assert!(is_likely_commit_sha(
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+        ));
+        assert!(is_likely_commit_sha("a1b2c3d")); // 7-char short SHA
+        assert!(!is_likely_commit_sha("v6.0.2"));
+        assert!(!is_likely_commit_sha("abc12")); // too short
+        assert!(!is_likely_commit_sha("g1234567")); // non-hex char
+        assert!(!is_likely_commit_sha(""));
     }
 
     #[test]
@@ -2097,7 +2344,7 @@ jobs:
         let client = crate::ecosystem::github_actions_api::GitHubApiClient::new().with_binary(
             std::path::PathBuf::from("__assay_test_definitely_not_a_real_binary__"),
         );
-        let proposals = build_action_proposals(&[m], &client);
+        let proposals = build_action_proposals(&[m], &client, false);
         assert!(proposals.is_empty());
     }
 }

@@ -246,7 +246,7 @@ impl GitHubApiClient {
         })
     }
 
-    fn write_release_cache(
+    pub(crate) fn write_release_cache(
         &self,
         owner: &str,
         repo: &str,

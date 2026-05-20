@@ -154,6 +154,18 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     pub fail_fast: bool,
 
+    /// Suppress SHA-pin hardening proposals for tag-pinned GitHub
+    /// Actions references. By default, every `actions/foo@vN` pin
+    /// also gets a "pin to SHA at `vN.M.P`" proposal so workflows
+    /// can adopt the supply-chain-hardened form
+    /// (`actions/foo@<sha> # vN.M.P`). Set this when an operator
+    /// deliberately prefers tag pins for readability and doesn't
+    /// want the extra proposals in the report. Has no effect on
+    /// actions that are ALREADY SHA-pinned — those get the normal
+    /// SHA-to-SHA bump proposal regardless.
+    #[arg(long = "no-sha-pin-proposals")]
+    pub no_sha_pin_proposals: bool,
+
     /// Suppress the per-ecosystem manifest-detection breadcrumbs
     /// (`[npm] manifests detected: N`, `[cargo] manifests detected:
     /// M`, etc.) and the per-proposal `proposal <id>: ...` lines.
@@ -479,6 +491,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     allow_network: !args.offline,
                     ignored_subjects: resolve_ignore_list(&config, &args.ignore, ecosystem.name()),
                     refresh_cache: args.refresh_cache,
+                    sha_pin_proposals: !args.no_sha_pin_proposals,
                 };
                 let mut proposals = ecosystem.propose_updates(&manifests, scan_root, &context)?;
                 // Enrich each proposal with the list of workspace members
@@ -3512,6 +3525,15 @@ fn populate_proposal_explanations(proposals: &mut [Proposal], ecosystem_name: &s
     use crate::ecosystem::{cargo as cargo_eco, github_actions as gha_eco, npm as npm_eco};
     use crate::model::BumpTier;
     for proposal in proposals.iter_mut() {
+        // Skip proposals that carry their own explanation already —
+        // the GHA SHA-pin proposer attaches `gha:tag-to-sha-pinning`
+        // at construction time because the generic per-tier
+        // classifier would mis-classify a tag → SHA bump as
+        // `gha:unparseable-tag`. Honor what the proposer already
+        // chose to say.
+        if proposal.explanation.is_some() {
+            continue;
+        }
         let explanation = match (ecosystem_name, proposal.bump_tier) {
             ("cargo", BumpTier::LockfileOnly) => Some(cargo_eco::explain_lockfile_only_bump(
                 &proposal.from,
@@ -4420,6 +4442,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -4500,6 +4523,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -4997,6 +5021,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5264,6 +5289,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5339,6 +5365,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5377,6 +5404,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5429,6 +5457,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6724,6 +6753,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6760,6 +6790,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6794,6 +6825,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6830,6 +6862,7 @@ mod tests {
             threads: None,
             fail_fast: false,
             quiet: false,
+            no_sha_pin_proposals: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),

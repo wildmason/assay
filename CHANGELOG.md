@@ -2,6 +2,35 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-20
+
+"SHA-pinning" release. Closes the biggest GitHub-Actions security value-prop gap from the 2026-05-20 dogfood: every floating tag pin (`actions/checkout@v6`) is now ALSO proposed as a SHA pin (`actions/checkout@<sha> # v6.0.2`), the GitHub-recommended supply-chain-hardened form. The cache resolved the SHAs all along — pre-0.6.0 they were sitting unused.
+
+### Added
+
+- **SHA-pin proposals for tag-pinned GitHub Actions.** For every `actions/foo@vN` ref, the proposer now also emits a `Compatible`-tier proposal converting the floating tag to a SHA pin at the resolved tag (`actions/foo@<sha> # vN.M.P`). Each carries an explanation rule `gha:tag-to-sha-pinning`, a `security:` note linking to https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions, and the `from_tag` / `to_sha` / `to_tag` inputs for audit. The tag-bump proposal still emits independently — the operator chooses between version-tracking and security-hardening.
+- **`--no-sha-pin-proposals` CLI flag.** Opt-out for teams that prefer tag pins for readability. Default behavior is "emit SHA-pin proposals" (the security-best-practice default).
+- **`rewrite_uses_in_workflow` auto-comments SHA pins.** When the proposer applies a SHA-pin to a workflow that had no inline comment, the rewriter adds `# <tag>` automatically so the SHA stays human-readable. Existing-comment behavior unchanged (tag-to-tag rewrites keep their `# vN.M.P` comment, replaced with the new tag).
+- **`is_likely_commit_sha` heuristic.** Recognizes 7–40 hex characters as a probable commit SHA; used to gate the auto-comment branch in the workflow rewriter.
+
+### Changed
+
+- **`EcosystemContext` gains `sha_pin_proposals: bool`** (default `true`). The CLI threads `!args.no_sha_pin_proposals` through `propose_updates`. `Default::default()` impl is now hand-written (was `#[derive(Default)]`) so `allow_network` defaults to `true` too instead of being silently `false`.
+- **`populate_proposal_explanations` preserves proposer-supplied explanations.** Previously, every proposal's explanation was overwritten by the generic per-tier classifier in `cli.rs`. Now, when the proposer attaches an explanation at construction time (the SHA-pin path), the populator skips it. The generic classifier would have mis-labeled `tag → SHA` bumps as `gha:unparseable-tag`.
+
+### Internal
+
+- `build_action_proposals(manifests, client)` → `build_action_proposals(manifests, client, sha_pin_proposals)`. Two test call sites updated.
+- New `build_sha_pin_proposal(agg, release, target_tag, client)` helper in `github_actions.rs`.
+- New test coverage: SHA-pin proposal emitted when flag on, suppressed when flag off, auto-comment rewriter for SHA pins, tag-to-tag comment preservation, `is_likely_commit_sha` happy + edge cases.
+- Test count: 646 → 651 (+5).
+
+### Live verification
+
+gha-eventsmith dogfood with `--ecosystem github-actions --explain`:
+- Pre-0.6.0: 1 proposal (`actions/checkout v5 -> v6`, tag bump only; `dtolnay/rust-toolchain@stable` and `wildmason/gha-eventsmith@v1` silently skipped despite cached SHAs).
+- Post-0.6.0: 3 proposals — the original tag bump PLUS two SHA-pin proposals (`actions/checkout v5 -> de0fac2e4...` and self-referential `wildmason/gha-eventsmith v1 -> bb4c5df3...`). Each annotated with `[gha:tag-to-sha-pinning]` and the security rationale.
+
 ## [0.5.0] — 2026-05-20
 
 "Framework cohort" release. Closes the largest UX gap from the 0.4.0 dogfood: Angular / Tiptap / Vue / Next / Nuxt / SvelteKit / Astro / React / Vitest / Storybook / NestJS / Remix / @tauri-apps/* packages all publish in lockstep, but pre-0.5.0 they emitted as N independent proposals. Slate dogfood: 9 separate `@angular/*` proposals + 20 separate `@tiptap/*` proposals (33 lockfile-only lines total) when conceptually each cohort is one upgrade decision.
