@@ -1578,39 +1578,57 @@ fn resolve_npm_consumers(proposal: &Proposal, tree: &Path) -> Result<Vec<Consume
     Ok(consumers)
 }
 
-/// Walk `node_modules/*/package.json` (and the scoped variant
-/// `node_modules/@*/*/package.json`) looking for declarations of
-/// `subject` in the `peerDependencies` block. Returns the list of
-/// package names that declare it. Best-effort — IO errors are
-/// swallowed since the proposer should still ship results when
-/// node_modules is in a half-installed state.
+/// Walk the project's installed-dependency layout looking for
+/// declarations of `subject` in any package's `peerDependencies`.
+/// Returns the deduplicated list of package names that declare it.
+/// Best-effort — IO and parse errors are swallowed since the
+/// proposer should still ship results when the install tree is in
+/// a half-baked state (`pnpm install` interrupted, `yarn install`
+/// without `--immutable`, etc.).
 ///
-/// Handles three layouts:
-/// - npm/yarn1 flat hoisted: `node_modules/foo/`
-/// - scoped: `node_modules/@scope/foo/`
-/// - pnpm virtual store: `node_modules/.pnpm/<id>/node_modules/<pkg>/`
+/// Handles four layouts side-by-side; each project may use one or
+/// more of them:
 ///
-/// pnpm-style monorepos (the dominant flavor in modern Wildmason
-/// projects) put the real install at `.pnpm/<pkg>@<ver>/node_modules/`
-/// while the top-level `node_modules/` only contains symlinks to
-/// declared deps. Without the virtual-store walk, peer-dep coverage
-/// only finds direct first-party consumers — every transitive
-/// declarer that pnpm hoists into its store is invisible.
+/// - **npm / yarn1 flat hoisted:** `node_modules/foo/package.json`
+///   (plus the scoped variant `node_modules/@scope/foo/`).
+/// - **pnpm virtual store:** `node_modules/.pnpm/<id>/node_modules/<pkg>/`.
+///   pnpm-style monorepos (the dominant flavor in modern Wildmason
+///   projects) put the real install under `.pnpm/`; the top-level
+///   `node_modules/` is just symlinks to declared deps.
+/// - **yarn berry unplugged:** `.yarn/unplugged/<pkg>-npm-<ver>-<hash>/
+///   node_modules/<pkg>/package.json`. yarn 2+ ("Berry") in PnP
+///   mode doesn't materialize `node_modules/` — packages either
+///   stay zipped in `.yarn/cache/` (zero-installs) or get
+///   "unplugged" into the directory tree. Unplugged hits the
+///   subset that needs install scripts or has been explicitly
+///   marked; the layout matches pnpm's enough to reuse the same
+///   walker.
+/// - **yarn berry PnP runtime data:** `.pnp.data.json`. Parsed
+///   when present so we catch every registered package — not just
+///   the unplugged subset. The `packagePeers` field on each
+///   registry entry is yarn's authoritative list of peer-dep
+///   subjects, so a direct check there beats walking zips.
 ///
-/// Names are deduplicated: the same library can appear at multiple
-/// versions or with multiple peer-resolution suffixes (e.g.
-/// `@angular+cdk@21.0.0_@angular+core@21.0.0`) and should still be
-/// reported once.
+/// Names are deduplicated globally: the same library can appear at
+/// multiple versions or under multiple peer-resolution suffixes
+/// and should still be reported once.
 fn find_peer_dep_consumers(tree: &Path, subject: &str) -> Vec<String> {
-    let node_modules = tree.join("node_modules");
-    if !node_modules.is_dir() {
-        return Vec::new();
-    }
     let mut out: Vec<String> = Vec::new();
-    walk_flat_node_modules(&node_modules, subject, &mut out);
-    let pnpm_store = node_modules.join(".pnpm");
-    if pnpm_store.is_dir() {
-        walk_pnpm_virtual_store(&pnpm_store, subject, &mut out);
+    let node_modules = tree.join("node_modules");
+    if node_modules.is_dir() {
+        walk_flat_node_modules(&node_modules, subject, &mut out);
+        let pnpm_store = node_modules.join(".pnpm");
+        if pnpm_store.is_dir() {
+            walk_pnpm_virtual_store(&pnpm_store, subject, &mut out);
+        }
+    }
+    let yarn_unplugged = tree.join(".yarn").join("unplugged");
+    if yarn_unplugged.is_dir() {
+        walk_yarn_berry_unplugged(&yarn_unplugged, subject, &mut out);
+    }
+    let pnp_data = tree.join(".pnp.data.json");
+    if pnp_data.is_file() {
+        walk_yarn_berry_pnp_data(&pnp_data, subject, &mut out);
     }
     out.sort();
     out.dedup();
@@ -1679,6 +1697,121 @@ fn walk_pnpm_virtual_store(store: &Path, subject: &str, out: &mut Vec<String>) {
             continue;
         }
         walk_flat_node_modules(&inner_nm, subject, out);
+    }
+}
+
+/// Walk yarn berry's unplugged directory. Each entry is named
+/// `<pkg>-npm-<ver>-<hash>` (yarn's hash-stamped pkg dirname) and
+/// contains `node_modules/<pkg>/package.json` — the same shape as
+/// the pnpm virtual store, so we reuse [`walk_flat_node_modules`]
+/// on the inner `node_modules/`. Best-effort on errors.
+///
+/// Note: `.yarn/unplugged/` only contains the SUBSET of packages
+/// yarn has unzipped — packages with install scripts, native
+/// bindings, or those explicitly marked `unplugged: true` in
+/// `.yarnrc.yml`. For full coverage we also parse `.pnp.data.json`
+/// when available (see [`walk_yarn_berry_pnp_data`]).
+fn walk_yarn_berry_unplugged(unplugged: &Path, subject: &str, out: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(unplugged) {
+        Ok(iter) => iter,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let inner_nm = path.join("node_modules");
+        if !inner_nm.is_dir() {
+            continue;
+        }
+        walk_flat_node_modules(&inner_nm, subject, out);
+    }
+}
+
+/// Parse `.pnp.data.json` and find every registered package whose
+/// `packagePeers` array contains `subject`. yarn berry writes this
+/// file in PnP mode (default for yarn 3+) as a JSON-encoded
+/// snapshot of the package registry. The relevant shape:
+///
+/// ```json
+/// {
+///   "packageRegistryData": [
+///     ["@scope/pkg", [
+///       ["npm:1.0.0", {
+///         "packagePeers": ["@angular/core", "@angular/common"],
+///         "packageDependencies": [...],
+///         ...
+///       }]
+///     ]],
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// The outer pair is `[name, [[version_locator, info], ...]]`.
+/// `null` appears as the name slot for the top-level project
+/// (workspace root) and is skipped. `packagePeers` is yarn's
+/// authoritative list of peer-dep subjects for that resolution —
+/// independent of whether the package is unplugged or still
+/// zipped in `.yarn/cache/`.
+///
+/// Best-effort: a missing, unreadable, or malformed file
+/// contributes no entries.
+fn walk_yarn_berry_pnp_data(pnp_data: &Path, subject: &str, out: &mut Vec<String>) {
+    let text = match std::fs::read_to_string(pnp_data) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(registry) = value.get("packageRegistryData").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for entry in registry {
+        let Some(pair) = entry.as_array() else {
+            continue;
+        };
+        if pair.len() != 2 {
+            continue;
+        }
+        // pair[0] is the package name (or null for the top-level
+        // workspace). pair[1] is an array of [version_locator, info]
+        // pairs — one per resolved version of this package.
+        let Some(name) = pair[0].as_str() else {
+            continue;
+        };
+        if name == subject {
+            // The package itself is not a peer-dep consumer of
+            // itself.
+            continue;
+        }
+        let Some(versions) = pair[1].as_array() else {
+            continue;
+        };
+        let mut declares_peer = false;
+        for version_entry in versions {
+            let Some(ve) = version_entry.as_array() else {
+                continue;
+            };
+            if ve.len() != 2 {
+                continue;
+            }
+            let Some(info) = ve[1].as_object() else {
+                continue;
+            };
+            let Some(peers) = info.get("packagePeers").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            if peers.iter().any(|p| p.as_str() == Some(subject)) {
+                declares_peer = true;
+                break;
+            }
+        }
+        if declares_peer {
+            out.push(name.to_string());
+        }
     }
 }
 
@@ -3171,6 +3304,176 @@ mod tests {
         .unwrap();
         let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
         assert_eq!(consumers, vec!["@ngrx/store", "lucide-angular"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_walks_yarn_berry_unplugged() {
+        // yarn berry layout: .yarn/unplugged/<pkg>-npm-<ver>-<hash>/
+        //   node_modules/<pkg>/package.json
+        let tmp = tempfile::tempdir().unwrap();
+        let unplugged_pkg = tmp
+            .path()
+            .join(".yarn")
+            .join("unplugged")
+            .join("@wildmason-aegis-npm-1.5.4-a1b2c3d4")
+            .join("node_modules")
+            .join("@wildmason")
+            .join("aegis");
+        std::fs::create_dir_all(&unplugged_pkg).unwrap();
+        std::fs::write(
+            unplugged_pkg.join("package.json"),
+            r#"{
+                "name": "@wildmason/aegis",
+                "version": "1.5.4",
+                "peerDependencies": { "@angular/core": ">=21" }
+            }"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["@wildmason/aegis"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_walks_yarn_berry_pnp_data_json() {
+        // yarn berry PnP runtime data — the authoritative source
+        // even when packages remain zipped in .yarn/cache/.
+        let tmp = tempfile::tempdir().unwrap();
+        let pnp_data = serde_json::json!({
+            "__info": ["yarn 4.0.0 pnp data"],
+            "packageRegistryData": [
+                // Top-level workspace (name=null) — must be skipped.
+                [null, [
+                    [null, {
+                        "packageLocation": "./",
+                        "packageDependencies": [["@angular/core", "npm:21.0.0"]],
+                        "linkType": "SOFT"
+                    }]
+                ]],
+                // @wildmason/aegis declares @angular/core as a peer.
+                ["@wildmason/aegis", [
+                    ["npm:1.5.4", {
+                        "packageLocation": "./.yarn/cache/@wildmason-aegis-npm-1.5.4-a1b2c3.zip/node_modules/@wildmason/aegis/",
+                        "packageDependencies": [["@angular/core", "npm:21.0.0"]],
+                        "packagePeers": ["@angular/core", "@angular/common"],
+                        "linkType": "HARD"
+                    }]
+                ]],
+                // lucide-angular ALSO declares @angular/core as a peer.
+                ["lucide-angular", [
+                    ["npm:0.577.0", {
+                        "packageLocation": "./.yarn/cache/lucide-angular-npm-0.577.0-d4e5f6.zip/node_modules/lucide-angular/",
+                        "packageDependencies": [["@angular/core", "npm:21.0.0"]],
+                        "packagePeers": ["@angular/core"],
+                        "linkType": "HARD"
+                    }]
+                ]],
+                // typescript does NOT declare @angular/core as a peer.
+                ["typescript", [
+                    ["npm:5.9.3", {
+                        "packageLocation": "./.yarn/cache/typescript-npm-5.9.3-aabbcc.zip/node_modules/typescript/",
+                        "packageDependencies": [],
+                        "packagePeers": [],
+                        "linkType": "HARD"
+                    }]
+                ]]
+            ]
+        });
+        std::fs::write(
+            tmp.path().join(".pnp.data.json"),
+            serde_json::to_string(&pnp_data).unwrap(),
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["@wildmason/aegis", "lucide-angular"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_yarn_berry_pnp_data_skips_self_consumption() {
+        // @angular/core itself shouldn't appear as a consumer of
+        // @angular/core even if it (hypothetically) listed itself
+        // in packagePeers (defensive against malformed input).
+        let tmp = tempfile::tempdir().unwrap();
+        let pnp_data = serde_json::json!({
+            "packageRegistryData": [
+                ["@angular/core", [
+                    ["npm:21.0.0", {
+                        "packagePeers": ["@angular/core"]
+                    }]
+                ]]
+            ]
+        });
+        std::fs::write(
+            tmp.path().join(".pnp.data.json"),
+            serde_json::to_string(&pnp_data).unwrap(),
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty(), "got: {consumers:?}");
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_yarn_berry_pnp_data_handles_malformed_gracefully() {
+        // Invalid JSON, missing fields, wrong types — all must be
+        // swallowed without crashing the proposer.
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing packageRegistryData.
+        std::fs::write(tmp.path().join(".pnp.data.json"), r#"{"__info":["x"]}"#).unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty());
+        // Malformed JSON.
+        std::fs::write(tmp.path().join(".pnp.data.json"), "not json at all").unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty());
+        // packageRegistryData is the wrong shape.
+        std::fs::write(
+            tmp.path().join(".pnp.data.json"),
+            r#"{"packageRegistryData": "not an array"}"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty());
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_combines_yarn_berry_layouts() {
+        // A yarn berry project with BOTH unplugged AND pnp data.
+        // Different packages contribute through different paths;
+        // results union and dedupe.
+        let tmp = tempfile::tempdir().unwrap();
+        // Unplugged: @wildmason/aegis
+        let unplugged_pkg = tmp
+            .path()
+            .join(".yarn")
+            .join("unplugged")
+            .join("@wildmason-aegis-npm-1.5.4-a1b2c3")
+            .join("node_modules")
+            .join("@wildmason")
+            .join("aegis");
+        std::fs::create_dir_all(&unplugged_pkg).unwrap();
+        std::fs::write(
+            unplugged_pkg.join("package.json"),
+            r#"{"name":"@wildmason/aegis","peerDependencies":{"@angular/core":">=21"}}"#,
+        )
+        .unwrap();
+        // PnP data: @ngrx/store (zipped only) + @wildmason/aegis (same as
+        // unplugged — verifies dedupe across paths).
+        let pnp_data = serde_json::json!({
+            "packageRegistryData": [
+                ["@wildmason/aegis", [
+                    ["npm:1.5.4", { "packagePeers": ["@angular/core"] }]
+                ]],
+                ["@ngrx/store", [
+                    ["npm:21.0.0", { "packagePeers": ["@angular/core"] }]
+                ]]
+            ]
+        });
+        std::fs::write(
+            tmp.path().join(".pnp.data.json"),
+            serde_json::to_string(&pnp_data).unwrap(),
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["@ngrx/store", "@wildmason/aegis"]);
     }
 
     #[test]
