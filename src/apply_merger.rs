@@ -203,18 +203,36 @@ fn merge_with_bisect(
         MergedAttempt::Red { reason, .. } => reason,
         MergedAttempt::Green { .. } => unreachable!(),
     };
-    // Greedy bisect: try every size-(N-1) subset, accept first green.
-    // Drop highest-id-first so the search is deterministic and the
-    // chosen-shipped-set is reproducible across re-runs.
-    let mut sorted: Vec<usize> = green_indices.to_vec();
-    sorted.sort_by(|a, b| runs[*b].proposal.id.cmp(&runs[*a].proposal.id));
+    // Cohort-aware bisect. The unit of drop is a "drop group", not a
+    // single proposal: cohort-lockstep siblings (`@angular/core` +
+    // `@angular/common`, `@tiptap/core` + `@tiptap/starter-kit`,
+    // etc.) MUST move together, so the bisect drops them as a unit.
+    // Dropping a single cohort member alone would either (a) re-
+    // expose the lockstep violation we just dodged or (b) succeed
+    // by accident on a config that doesn't enforce the lockstep,
+    // shipping a partial cohort that pnpm/npm will refuse to
+    // resolve on the host. Both outcomes are unacceptable.
+    //
+    // Drop ordering: highest-id-first within each group, groups
+    // sorted by their max member id descending — keeps the bisect
+    // deterministic across re-runs and matches the existing
+    // "drop biggest id first" intent at the granularity that
+    // respects cohort atomicity.
+    let drop_groups = build_drop_groups(runs, green_indices);
     let mut last_red_reason = reason.clone();
-    for drop_idx in &sorted {
+    for drop_group in &drop_groups {
+        let drop_set: std::collections::BTreeSet<usize> = drop_group.iter().copied().collect();
         let subset: Vec<usize> = green_indices
             .iter()
             .copied()
-            .filter(|i| i != drop_idx)
+            .filter(|i| !drop_set.contains(i))
             .collect();
+        if subset.is_empty() {
+            // Last drop group would empty the merge set; no point
+            // re-running the validator on zero proposals — the
+            // empty merge has nothing to validate.
+            continue;
+        }
         let attempt2 = try_merged_apply_and_validate(
             artifact_root,
             scan_root,
@@ -228,10 +246,22 @@ fn merge_with_bisect(
         )?;
         match attempt2 {
             MergedAttempt::Green { sandbox } => {
-                let dropped = vec![MergedDrop {
-                    run_idx: *drop_idx,
-                    reason: format!("merged set red until dropped: {reason}"),
-                }];
+                let drop_label = if drop_group.len() == 1 {
+                    format!("merged set red until dropped: {reason}")
+                } else {
+                    format!(
+                        "merged set red until cohort dropped ({} members): {reason}",
+                        drop_group.len()
+                    )
+                };
+                let dropped: Vec<MergedDrop> = drop_group
+                    .iter()
+                    .copied()
+                    .map(|idx| MergedDrop {
+                        run_idx: idx,
+                        reason: drop_label.clone(),
+                    })
+                    .collect();
                 return Ok(EcosystemMergeOutcome {
                     eco_idx,
                     scan_root: scan_root.to_path_buf(),
@@ -245,7 +275,7 @@ fn merge_with_bisect(
             }
         }
     }
-    // No size-(N-1) subset greened — ship nothing for this group.
+    // No drop group cleared the merge — ship nothing for this group.
     let dropped: Vec<MergedDrop> = green_indices
         .iter()
         .copied()
@@ -276,6 +306,166 @@ enum MergedAttempt {
         sandbox: PathBuf,
         reason: String,
     },
+}
+
+/// Group `green_indices` into bisect-drop units. A drop unit is
+/// either:
+///
+/// - a single run_idx (the proposal has no cohort, or is the only
+///   cohort member in this green set), OR
+/// - the full set of run_idx values whose proposals share the same
+///   `cohort` id (≥2 members) — cohort siblings MUST drop as one
+///   atomic unit, never alone.
+///
+/// Drop ordering: groups sorted by their highest-id member
+/// descending, so the bisect tries the "newest-feeling" drop
+/// first and stays deterministic across re-runs (matches the
+/// original "drop highest id first" intent at the right
+/// granularity).
+fn build_drop_groups(runs: &[RunRef<'_>], green_indices: &[usize]) -> Vec<Vec<usize>> {
+    use std::collections::BTreeMap;
+    // Bucket greens by their cohort id; non-cohort proposals get
+    // their own singleton bucket via a synthetic key that no real
+    // cohort id collides with.
+    let mut by_cohort: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for &run_idx in green_indices {
+        let proposal = runs[run_idx].proposal;
+        let bucket_key = match proposal.cohort.as_deref() {
+            Some(cohort) => format!("cohort:{cohort}"),
+            // Use the proposal id as a unique solo bucket key.
+            None => format!("solo:{}", proposal.id),
+        };
+        by_cohort.entry(bucket_key).or_default().push(run_idx);
+    }
+    // Each cohort bucket with ≥2 members is one drop unit; cohort
+    // buckets with 1 member, and solo buckets, are singletons.
+    let mut groups: Vec<Vec<usize>> = by_cohort.into_values().collect();
+    // Sort by max member id descending for determinism.
+    groups.sort_by(|a, b| {
+        let a_max = a.iter().map(|i| &runs[*i].proposal.id).max();
+        let b_max = b.iter().map(|i| &runs[*i].proposal.id).max();
+        b_max.cmp(&a_max)
+    });
+    groups
+}
+
+#[cfg(test)]
+mod drop_group_tests {
+    use super::*;
+    use crate::model::{BumpTier, Classification, Proposal, ProposalKind, ValidationOutcome};
+    use std::path::Path;
+
+    fn proposal(id: &str, subject: &str, cohort: Option<&str>) -> Proposal {
+        Proposal {
+            id: id.into(),
+            ecosystem: "npm".into(),
+            kind: ProposalKind::Version,
+            subject: subject.into(),
+            from: "1.0.0".into(),
+            to: "2.0.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+            affected_consumers: vec![],
+            explanation: None,
+            cohort: cohort.map(str::to_string),
+        }
+    }
+
+    fn outcome() -> ValidationOutcome {
+        ValidationOutcome {
+            proposal_id: "p".into(),
+            conclusion: "success".into(),
+            ci_forge_run_ids: vec![],
+            validated_workflows: vec![],
+            classification: Classification::Exact,
+            notes: vec![],
+            failure_details: vec![],
+            cached_workflow_count: 0,
+            total_workflow_count: 0,
+            member_skipped_workflow_count: 0,
+        }
+    }
+
+    fn run_ref<'a>(
+        p: &'a Proposal,
+        sandbox: &'a Path,
+        outcome: &'a ValidationOutcome,
+    ) -> RunRef<'a> {
+        RunRef {
+            eco_idx: 0,
+            proposal: p,
+            sandbox,
+            outcome,
+            scan_root: sandbox,
+        }
+    }
+
+    #[test]
+    fn build_drop_groups_keeps_cohort_members_together() {
+        // Two cohorts: angular-framework (2 members), tiptap (2
+        // members). The bisect must treat each cohort as ONE drop
+        // unit, never bisect within.
+        let p_a1 = proposal("npm-a1", "@angular/core", Some("angular-framework"));
+        let p_a2 = proposal("npm-a2", "@angular/common", Some("angular-framework"));
+        let p_t1 = proposal("npm-t1", "@tiptap/core", Some("tiptap"));
+        let p_t2 = proposal("npm-t2", "@tiptap/starter-kit", Some("tiptap"));
+        let sb = Path::new("/tmp/sb");
+        let oc = outcome();
+        let runs = vec![
+            run_ref(&p_a1, sb, &oc),
+            run_ref(&p_a2, sb, &oc),
+            run_ref(&p_t1, sb, &oc),
+            run_ref(&p_t2, sb, &oc),
+        ];
+        let groups = build_drop_groups(&runs, &[0, 1, 2, 3]);
+        assert_eq!(groups.len(), 2, "two cohorts → two drop groups");
+        let by_size: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        assert_eq!(by_size, vec![2, 2]);
+    }
+
+    #[test]
+    fn build_drop_groups_mixes_solo_and_cohort() {
+        let p_a1 = proposal("npm-a1", "@angular/core", Some("angular-framework"));
+        let p_a2 = proposal("npm-a2", "@angular/common", Some("angular-framework"));
+        let p_ts = proposal("npm-ts", "typescript", None);
+        let p_ld = proposal("npm-ld", "lodash", None);
+        let sb = Path::new("/tmp/sb");
+        let oc = outcome();
+        let runs = vec![
+            run_ref(&p_a1, sb, &oc),
+            run_ref(&p_a2, sb, &oc),
+            run_ref(&p_ts, sb, &oc),
+            run_ref(&p_ld, sb, &oc),
+        ];
+        let groups = build_drop_groups(&runs, &[0, 1, 2, 3]);
+        // Expect 3 drop groups: angular cohort (size 2), typescript
+        // (size 1), lodash (size 1).
+        assert_eq!(groups.len(), 3);
+        let sizes: std::collections::BTreeMap<usize, usize> =
+            groups.iter().fold(Default::default(), |mut acc, g| {
+                *acc.entry(g.len()).or_insert(0) += 1;
+                acc
+            });
+        assert_eq!(sizes.get(&2).copied(), Some(1), "one 2-member group");
+        assert_eq!(sizes.get(&1).copied(), Some(2), "two 1-member groups");
+    }
+
+    #[test]
+    fn build_drop_groups_treats_singleton_cohort_as_solo() {
+        // Only one cohort member in scope — it's a singleton, so it
+        // can be dropped alone (no lockstep partner to break).
+        let p_a1 = proposal("npm-a1", "@angular/core", Some("angular-framework"));
+        let p_ts = proposal("npm-ts", "typescript", None);
+        let sb = Path::new("/tmp/sb");
+        let oc = outcome();
+        let runs = vec![run_ref(&p_a1, sb, &oc), run_ref(&p_ts, sb, &oc)];
+        let groups = build_drop_groups(&runs, &[0, 1]);
+        assert_eq!(groups.len(), 2);
+        // Each is a singleton.
+        assert!(groups.iter().all(|g| g.len() == 1));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

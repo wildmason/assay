@@ -188,6 +188,7 @@ impl DependencyEcosystem for NpmEcosystem {
             .collect();
         let mut proposals = run_npm_proposer(flavor, repo, &manifest_paths)?;
         tag_proposals_with_cohorts(&mut proposals);
+        widen_cohort_tiers(&mut proposals);
         annotate_proposals_with_overrides(&mut proposals, repo);
         Ok(filter_ignored_packages(proposals, &ctx.ignored_subjects))
     }
@@ -1584,20 +1585,48 @@ fn resolve_npm_consumers(proposal: &Proposal, tree: &Path) -> Result<Vec<Consume
 /// swallowed since the proposer should still ship results when
 /// node_modules is in a half-installed state.
 ///
-/// Handles the npm "flat hoisted" layout (`node_modules/foo/`) and
-/// scoped packages (`node_modules/@scope/foo/`). pnpm's virtual
-/// store (`node_modules/.pnpm/<name>@<version>/node_modules/<name>/`)
-/// is out of scope for v0.7.0 — pnpm projects can still get the
-/// workspace-member path; the peer-dep augmentation is npm-shape only.
+/// Handles three layouts:
+/// - npm/yarn1 flat hoisted: `node_modules/foo/`
+/// - scoped: `node_modules/@scope/foo/`
+/// - pnpm virtual store: `node_modules/.pnpm/<id>/node_modules/<pkg>/`
+///
+/// pnpm-style monorepos (the dominant flavor in modern Wildmason
+/// projects) put the real install at `.pnpm/<pkg>@<ver>/node_modules/`
+/// while the top-level `node_modules/` only contains symlinks to
+/// declared deps. Without the virtual-store walk, peer-dep coverage
+/// only finds direct first-party consumers — every transitive
+/// declarer that pnpm hoists into its store is invisible.
+///
+/// Names are deduplicated: the same library can appear at multiple
+/// versions or with multiple peer-resolution suffixes (e.g.
+/// `@angular+cdk@21.0.0_@angular+core@21.0.0`) and should still be
+/// reported once.
 fn find_peer_dep_consumers(tree: &Path, subject: &str) -> Vec<String> {
     let node_modules = tree.join("node_modules");
     if !node_modules.is_dir() {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();
-    let entries = match std::fs::read_dir(&node_modules) {
+    walk_flat_node_modules(&node_modules, subject, &mut out);
+    let pnpm_store = node_modules.join(".pnpm");
+    if pnpm_store.is_dir() {
+        walk_pnpm_virtual_store(&pnpm_store, subject, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Walk a flat `node_modules`-style directory looking for
+/// `peerDependencies[subject]` declarations. Handles both unscoped
+/// (`<root>/foo/`) and scoped (`<root>/@scope/foo/`) entries. Skips
+/// dotted entries like `.bin`, `.cache`, and `.pnpm` (the virtual
+/// store has its own walker). Pushes matches into `out` without
+/// deduplication; the caller is responsible for sort+dedup.
+fn walk_flat_node_modules(root: &Path, subject: &str, out: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(root) {
         Ok(iter) => iter,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1605,12 +1634,10 @@ fn find_peer_dep_consumers(tree: &Path, subject: &str) -> Vec<String> {
             Ok(s) => s,
             Err(_) => continue,
         };
-        // Skip pnpm virtual-store, npm cache, and dotted entries.
         if name.starts_with('.') {
             continue;
         }
         if name.starts_with('@') {
-            // Scoped: walk @scope/<name>/package.json.
             let scope_entries = match std::fs::read_dir(&path) {
                 Ok(iter) => iter,
                 Err(_) => continue,
@@ -1621,13 +1648,38 @@ fn find_peer_dep_consumers(tree: &Path, subject: &str) -> Vec<String> {
                     Err(_) => continue,
                 };
                 let full = format!("{name}/{sub_name}");
-                check_peer_dep(&sub.path(), subject, &full, &mut out);
+                check_peer_dep(&sub.path(), subject, &full, out);
             }
         } else {
-            check_peer_dep(&path, subject, &name, &mut out);
+            check_peer_dep(&path, subject, &name, out);
         }
     }
-    out
+}
+
+/// Walk pnpm's virtual store. Each entry under `.pnpm/` is named
+/// `<pkg>@<ver>(_<peer-resolution>)?` (with scoped slashes escaped
+/// to `+`) and contains a `node_modules/` directory holding the
+/// hoisted install plus any peer-linked siblings. We delegate each
+/// `<entry>/node_modules/` to [`walk_flat_node_modules`] — the
+/// layout inside is structurally identical to a flat hoisted tree.
+/// Best-effort on errors; partial pnpm installs do not crash the
+/// proposer.
+fn walk_pnpm_virtual_store(store: &Path, subject: &str, out: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(store) {
+        Ok(iter) => iter,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let inner_nm = path.join("node_modules");
+        if !inner_nm.is_dir() {
+            continue;
+        }
+        walk_flat_node_modules(&inner_nm, subject, out);
+    }
 }
 
 /// Parse `<pkg_dir>/package.json` and append `pkg_name` to `out` if
@@ -1894,6 +1946,94 @@ pub(crate) fn tag_proposals_with_cohorts(proposals: &mut [Proposal]) {
         if let Some(c) = super::npm_cohorts::match_cohort(&p.subject) {
             p.cohort = Some(c.id.to_string());
         }
+    }
+}
+
+/// Multi-cohort lockstep tier widening. When two or more proposals
+/// share a cohort id, the lockstep nature of framework upgrades
+/// (e.g. `@angular/core` + `@angular/common` must move together)
+/// means the *effective* tier of every member is the most invasive
+/// tier among them. A `@angular/core` Breaking bump bundled with a
+/// `@angular/common` Compatible bump can NOT be applied as
+/// "Compatible for common, Breaking for core" — pnpm/npm will
+/// refuse to resolve the lockfile that way, and even if it did, the
+/// runtime contract demands both at the same major.
+///
+/// This function raises each lockstep member's `bump_tier` to the
+/// cohort's max tier (Breaking > Compatible > LockfileOnly) so that
+/// downstream gating, reporting, and apply decisions treat the
+/// whole group consistently. Members that were already at the max
+/// tier are untouched. Widened members get a structured note
+/// (`cohort-lockstep: widened from <orig> to <max> to match
+/// <cohort>`) so the operator can see at a glance why a normally
+/// Compatible bump is being flagged as Breaking.
+///
+/// Single-member cohorts (a `@angular/core` proposal with no
+/// `@angular/common` peer in the same run) are NOT widened — there
+/// is no lockstep to enforce when only one member of the group is
+/// in scope. The function is a no-op on proposal sets without
+/// cohorts.
+///
+/// Order of operations matters: this MUST run AFTER
+/// [`tag_proposals_with_cohorts`] (so `cohort` is populated) and
+/// BEFORE [`annotate_proposals_with_overrides`] (so the override
+/// note appears alongside any widening note rather than being
+/// shoved off by a later mutation pass).
+pub(crate) fn widen_cohort_tiers(proposals: &mut [Proposal]) {
+    use std::collections::BTreeMap;
+
+    let mut max_tier_by_cohort: BTreeMap<String, BumpTier> = BTreeMap::new();
+    let mut cohort_member_count: BTreeMap<String, usize> = BTreeMap::new();
+    for p in proposals.iter() {
+        let Some(cohort) = p.cohort.as_deref() else {
+            continue;
+        };
+        *cohort_member_count.entry(cohort.to_string()).or_insert(0) += 1;
+        let entry = max_tier_by_cohort
+            .entry(cohort.to_string())
+            .or_insert(BumpTier::LockfileOnly);
+        if tier_severity(p.bump_tier) > tier_severity(*entry) {
+            *entry = p.bump_tier;
+        }
+    }
+    for p in proposals.iter_mut() {
+        let Some(cohort) = p.cohort.as_deref() else {
+            continue;
+        };
+        let count = cohort_member_count.get(cohort).copied().unwrap_or(0);
+        if count < 2 {
+            continue;
+        }
+        let max = max_tier_by_cohort
+            .get(cohort)
+            .copied()
+            .unwrap_or(BumpTier::LockfileOnly);
+        if tier_severity(max) > tier_severity(p.bump_tier) {
+            let orig = p.bump_tier;
+            p.bump_tier = max;
+            p.notes.push(format!(
+                "cohort-lockstep: widened from {} to {} to match {} (lockstep with {} member{})",
+                orig.as_str(),
+                max.as_str(),
+                cohort,
+                count,
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+    }
+}
+
+/// Severity ranking for [`BumpTier`] — higher = more invasive.
+/// Used by cohort lockstep widening to pick the dominant tier
+/// across cohort members. Kept as a local helper rather than
+/// `impl Ord` on `BumpTier` so the public enum stays free of
+/// implicit ordering semantics (a future tier reorder would
+/// otherwise silently change behavior).
+fn tier_severity(t: BumpTier) -> u8 {
+    match t {
+        BumpTier::LockfileOnly => 0,
+        BumpTier::Compatible => 1,
+        BumpTier::Breaking => 2,
     }
 }
 
@@ -2921,6 +3061,307 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
         assert!(consumers.is_empty());
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_walks_pnpm_virtual_store() {
+        // pnpm layout: node_modules/.pnpm/<pkg>@<ver>/node_modules/<pkg>/package.json
+        let tmp = tempfile::tempdir().unwrap();
+        let virt = tmp
+            .path()
+            .join("node_modules")
+            .join(".pnpm")
+            .join("@wildmason+aegis@1.5.4_@angular+core@21.0.0")
+            .join("node_modules")
+            .join("@wildmason")
+            .join("aegis");
+        std::fs::create_dir_all(&virt).unwrap();
+        std::fs::write(
+            virt.join("package.json"),
+            r#"{
+                "name": "@wildmason/aegis",
+                "version": "1.5.4",
+                "peerDependencies": { "@angular/core": ">=21" }
+            }"#,
+        )
+        .unwrap();
+        // Also add an unscoped entry to confirm the unscoped path
+        // through walk_flat_node_modules works inside the virtual
+        // store too.
+        let unscoped = tmp
+            .path()
+            .join("node_modules")
+            .join(".pnpm")
+            .join("lucide-angular@0.577.0_@angular+core@21.0.0")
+            .join("node_modules")
+            .join("lucide-angular");
+        std::fs::create_dir_all(&unscoped).unwrap();
+        std::fs::write(
+            unscoped.join("package.json"),
+            r#"{
+                "name": "lucide-angular",
+                "version": "0.577.0",
+                "peerDependencies": { "@angular/core": "13.x - 21.x" }
+            }"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["@wildmason/aegis", "lucide-angular"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_dedupes_across_virtual_store_versions() {
+        // Same package at two different peer-resolution suffixes in
+        // .pnpm — both declare the subject as a peer. The result
+        // should report the package name once, not twice.
+        let tmp = tempfile::tempdir().unwrap();
+        for suffix in [
+            "@wildmason+aegis@1.5.4_@angular+core@21.0.0",
+            "@wildmason+aegis@1.5.4_@angular+core@22.0.0",
+        ] {
+            let pkg = tmp
+                .path()
+                .join("node_modules")
+                .join(".pnpm")
+                .join(suffix)
+                .join("node_modules")
+                .join("@wildmason")
+                .join("aegis");
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                r#"{
+                    "name": "@wildmason/aegis",
+                    "version": "1.5.4",
+                    "peerDependencies": { "@angular/core": ">=21" }
+                }"#,
+            )
+            .unwrap();
+        }
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["@wildmason/aegis"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_combines_flat_and_virtual_store() {
+        // A pnpm-style hybrid: top-level symlinks/installs at
+        // node_modules/foo/ AND the real installs in .pnpm/. Both
+        // should be searched, results combined and deduped.
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        // Flat: top-level direct dep
+        std::fs::create_dir_all(nm.join("lucide-angular")).unwrap();
+        std::fs::write(
+            nm.join("lucide-angular").join("package.json"),
+            r#"{"name":"lucide-angular","peerDependencies":{"@angular/core":">=21"}}"#,
+        )
+        .unwrap();
+        // Virtual store: transitive consumer not hoisted to top
+        let virt = nm
+            .join(".pnpm")
+            .join("@ngrx+store@21.0.0_@angular+core@21.0.0")
+            .join("node_modules")
+            .join("@ngrx")
+            .join("store");
+        std::fs::create_dir_all(&virt).unwrap();
+        std::fs::write(
+            virt.join("package.json"),
+            r#"{"name":"@ngrx/store","peerDependencies":{"@angular/core":">=21"}}"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["@ngrx/store", "lucide-angular"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_ignores_pnpm_entries_without_inner_node_modules() {
+        // Some pnpm temp/cache entries inside .pnpm/ don't have the
+        // expected node_modules/ middle layer. They must be skipped
+        // gracefully — no crash, no false positives.
+        let tmp = tempfile::tempdir().unwrap();
+        let stray = tmp.path().join("node_modules").join(".pnpm").join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(
+            stray.join("package.json"),
+            r#"{"name":"stray","peerDependencies":{"@angular/core":">=21"}}"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty(), "got: {consumers:?}");
+    }
+
+    #[test]
+    fn widen_cohort_tiers_promotes_compatible_member_to_breaking_when_lockstep_partner_is_breaking()
+    {
+        let mut breaking = sample_proposal("@angular/core");
+        breaking.bump_tier = BumpTier::Breaking;
+        breaking.cohort = Some("angular-framework".into());
+        let mut compatible = sample_proposal("@angular/common");
+        compatible.bump_tier = BumpTier::Compatible;
+        compatible.cohort = Some("angular-framework".into());
+        let mut proposals = vec![breaking, compatible];
+
+        widen_cohort_tiers(&mut proposals);
+
+        let common = proposals
+            .iter()
+            .find(|p| p.subject == "@angular/common")
+            .unwrap();
+        let core = proposals
+            .iter()
+            .find(|p| p.subject == "@angular/core")
+            .unwrap();
+        assert_eq!(
+            common.bump_tier,
+            BumpTier::Breaking,
+            "@angular/common should be widened to Breaking to lockstep with @angular/core"
+        );
+        assert_eq!(
+            core.bump_tier,
+            BumpTier::Breaking,
+            "@angular/core retains its original Breaking tier (no downgrade)"
+        );
+        assert!(
+            common
+                .notes
+                .iter()
+                .any(|n| n.contains("cohort-lockstep") && n.contains("compatible to breaking")),
+            "widened proposal should record a cohort-lockstep note; got: {:?}",
+            common.notes
+        );
+        assert!(
+            !core.notes.iter().any(|n| n.contains("cohort-lockstep")),
+            "unwidened (already-at-max) members must not get a widening note; got: {:?}",
+            core.notes
+        );
+    }
+
+    #[test]
+    fn widen_cohort_tiers_skips_single_member_cohorts() {
+        // Only one @angular/core proposal in the run — nothing to
+        // lockstep with, so no widening note even though it's
+        // tagged with a cohort.
+        let mut alone = sample_proposal("@angular/core");
+        alone.bump_tier = BumpTier::Compatible;
+        alone.cohort = Some("angular-framework".into());
+        let mut proposals = vec![alone];
+
+        widen_cohort_tiers(&mut proposals);
+
+        let core = &proposals[0];
+        assert_eq!(core.bump_tier, BumpTier::Compatible);
+        assert!(
+            !core.notes.iter().any(|n| n.contains("cohort-lockstep")),
+            "single-member cohort must not trigger a widening note; got: {:?}",
+            core.notes
+        );
+    }
+
+    #[test]
+    fn widen_cohort_tiers_promotes_lockfile_only_to_compatible_when_partner_is_compatible() {
+        // The dominant tier in a 2-member cohort is Compatible —
+        // the LockfileOnly member widens to Compatible, but the
+        // Compatible member is unchanged.
+        let mut lf = sample_proposal("@angular/core");
+        lf.bump_tier = BumpTier::LockfileOnly;
+        lf.cohort = Some("angular-framework".into());
+        let mut compat = sample_proposal("@angular/common");
+        compat.bump_tier = BumpTier::Compatible;
+        compat.cohort = Some("angular-framework".into());
+        let mut proposals = vec![lf, compat];
+
+        widen_cohort_tiers(&mut proposals);
+
+        let core = proposals
+            .iter()
+            .find(|p| p.subject == "@angular/core")
+            .unwrap();
+        assert_eq!(core.bump_tier, BumpTier::Compatible);
+    }
+
+    #[test]
+    fn widen_cohort_tiers_isolates_separate_cohorts() {
+        // Two independent cohorts in the same run. Widening must
+        // only happen within a cohort — the lodash proposal (no
+        // cohort) is left alone, and the @tiptap/* breaking bump
+        // does NOT propagate to @angular/*.
+        let mut angular_a = sample_proposal("@angular/core");
+        angular_a.bump_tier = BumpTier::LockfileOnly;
+        angular_a.cohort = Some("angular-framework".into());
+        let mut angular_b = sample_proposal("@angular/common");
+        angular_b.bump_tier = BumpTier::LockfileOnly;
+        angular_b.cohort = Some("angular-framework".into());
+        let mut tiptap_a = sample_proposal("@tiptap/core");
+        tiptap_a.bump_tier = BumpTier::Breaking;
+        tiptap_a.cohort = Some("tiptap".into());
+        let mut tiptap_b = sample_proposal("@tiptap/starter-kit");
+        tiptap_b.bump_tier = BumpTier::Compatible;
+        tiptap_b.cohort = Some("tiptap".into());
+        let mut lodash = sample_proposal("lodash");
+        lodash.bump_tier = BumpTier::Compatible;
+        let mut proposals = vec![angular_a, angular_b, tiptap_a, tiptap_b, lodash];
+
+        widen_cohort_tiers(&mut proposals);
+
+        let by_subject: std::collections::BTreeMap<_, _> = proposals
+            .iter()
+            .map(|p| (p.subject.as_str(), p.bump_tier))
+            .collect();
+        // Angular cohort: both stay LockfileOnly (no member above
+        // that tier).
+        assert_eq!(
+            by_subject.get("@angular/core").copied(),
+            Some(BumpTier::LockfileOnly)
+        );
+        assert_eq!(
+            by_subject.get("@angular/common").copied(),
+            Some(BumpTier::LockfileOnly)
+        );
+        // Tiptap cohort: the Compatible member widens to Breaking.
+        assert_eq!(
+            by_subject.get("@tiptap/starter-kit").copied(),
+            Some(BumpTier::Breaking)
+        );
+        assert_eq!(
+            by_subject.get("@tiptap/core").copied(),
+            Some(BumpTier::Breaking)
+        );
+        // Cohort-free proposal: untouched.
+        assert_eq!(
+            by_subject.get("lodash").copied(),
+            Some(BumpTier::Compatible)
+        );
+    }
+
+    #[test]
+    fn widen_cohort_tiers_is_idempotent() {
+        // Running widening twice must produce the same proposal
+        // set — no duplicate notes, no further mutations.
+        let mut breaking = sample_proposal("@angular/core");
+        breaking.bump_tier = BumpTier::Breaking;
+        breaking.cohort = Some("angular-framework".into());
+        let mut compatible = sample_proposal("@angular/common");
+        compatible.bump_tier = BumpTier::Compatible;
+        compatible.cohort = Some("angular-framework".into());
+        let mut proposals = vec![breaking, compatible];
+
+        widen_cohort_tiers(&mut proposals);
+        let notes_after_first = proposals
+            .iter()
+            .find(|p| p.subject == "@angular/common")
+            .unwrap()
+            .notes
+            .clone();
+        widen_cohort_tiers(&mut proposals);
+        let notes_after_second = &proposals
+            .iter()
+            .find(|p| p.subject == "@angular/common")
+            .unwrap()
+            .notes;
+        assert_eq!(
+            &notes_after_first, notes_after_second,
+            "second pass must not append duplicate widening notes"
+        );
     }
 
     #[test]

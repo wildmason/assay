@@ -591,15 +591,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         let validator = build_validator(&args, &args.repo)?
             .with_workflow_filter(workflow_filter_from_args(&args));
 
-        let units: Vec<WorkUnit> = all_proposals
-            .iter()
-            .map(|(eco_idx, scan_root, proposal)| WorkUnit {
-                eco_idx: *eco_idx,
-                ecosystem_name: registry[*eco_idx].name(),
-                proposal: proposal.clone(),
-                scan_root: scan_root.clone(),
-            })
-            .collect();
+        let units: Vec<WorkUnit> = build_work_units(&all_proposals, &registry);
 
         let pool = WorkerPool {
             threads: args.threads.unwrap_or_else(WorkerPool::default_threads),
@@ -654,6 +646,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         outcome,
                         WorkerOutcome::Completed { outcome, .. } if outcome.conclusion != "success"
                     )
+                    || matches!(
+                        outcome,
+                        WorkerOutcome::CohortCompleted { outcome, .. } if outcome.conclusion != "success"
+                    )
             },
             |unit| unit.ecosystem_name,
         );
@@ -706,6 +702,36 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         outcome,
                         scan_root,
                     });
+                }
+                WorkerOutcome::CohortCompleted {
+                    eco_idx,
+                    members,
+                    sandbox,
+                    outcome,
+                    provenance: pr_records,
+                    scan_root,
+                } => {
+                    // The shared outcome attributes to EVERY member.
+                    // One per-member ProposalRun is pushed, all
+                    // sharing the same sandbox path — the merger's
+                    // shared-sandbox detection skips the redundant
+                    // re-merge for cohort groups.
+                    provenance.records.extend(pr_records);
+                    let n = members.len();
+                    match outcome.conclusion.as_str() {
+                        "success" => proposals_passed += n,
+                        "unvalidated" => proposals_unvalidated += n,
+                        _ => proposals_failed += n,
+                    }
+                    for member in members {
+                        completed_runs.push(ProposalRun {
+                            eco_idx,
+                            proposal: member,
+                            sandbox: sandbox.clone(),
+                            outcome: outcome.clone(),
+                            scan_root: scan_root.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1018,6 +1044,17 @@ struct WorkUnit {
     /// Cached for the worker pool's per-ecosystem semaphore lookup.
     ecosystem_name: &'static str,
     proposal: Proposal,
+    /// Cohort lockstep siblings to apply atomically alongside
+    /// `proposal`. Empty for stand-alone proposals (the common case).
+    /// When non-empty this unit represents a multi-member cohort
+    /// (`@angular/*`, `@tiptap/*`, etc.) — the worker applies
+    /// `proposal` + every member to the SAME sandbox via
+    /// `apply_merged`, validates once, and the aggregator expands
+    /// the shared outcome into one `ProposalRun` per member. This
+    /// prevents partial-cohort applies (e.g. `@angular/core@22`
+    /// without `@angular/common@22`, which pnpm/npm would refuse to
+    /// resolve).
+    lockstep_members: Vec<Proposal>,
     /// The scan_root this proposal originated from. For Tauri-style
     /// polyglot layouts, sibling ecosystems live in different
     /// subdirectories under the artifact root — apply/validate must
@@ -1071,6 +1108,101 @@ enum WorkerOutcome {
         /// multiple sub-projects (Tauri polyglot).
         scan_root: PathBuf,
     },
+    /// All members of a multi-member cohort group validated together
+    /// in ONE sandbox. The shared `outcome` applies atomically to
+    /// every proposal in `members` (primary + lockstep siblings).
+    /// The aggregator expands this into one `ProposalRun` per
+    /// member; the merger detects the shared-sandbox signature and
+    /// skips redundant re-merge, and the bisect step treats the
+    /// cohort as one drop unit so partial applies are impossible.
+    CohortCompleted {
+        eco_idx: usize,
+        /// All cohort members (primary + siblings) in deterministic
+        /// order. Every entry shares `sandbox` and `outcome`.
+        members: Vec<Proposal>,
+        sandbox: PathBuf,
+        outcome: crate::model::ValidationOutcome,
+        provenance: Vec<ProvenanceRecord>,
+        scan_root: PathBuf,
+    },
+}
+
+/// Group `all_proposals` into work units honoring cohort lockstep.
+///
+/// Within each `(eco_idx, scan_root, cohort_id)` triple where the
+/// cohort has ≥2 members, ALL members merge into a single
+/// `WorkUnit` whose worker will apply them atomically to one
+/// sandbox and validate the combined state. Other proposals (no
+/// cohort, or singleton cohorts) get one `WorkUnit` each — existing
+/// behavior unchanged.
+///
+/// Determinism: cohort members are sorted by proposal id so the
+/// "primary" (`unit.proposal`) is stable across re-runs; sibling
+/// order is also stable. The output unit list is in deterministic
+/// scan order.
+fn build_work_units(
+    all_proposals: &[(usize, PathBuf, Proposal)],
+    registry: &[Box<dyn DependencyEcosystem>],
+) -> Vec<WorkUnit> {
+    use std::collections::BTreeMap;
+
+    // Bucket by (eco_idx, scan_root, cohort) — non-cohort entries
+    // get a unique synthetic bucket key so they remain individual
+    // work units.
+    type Key = (usize, PathBuf, Option<String>);
+    let mut buckets: BTreeMap<Key, Vec<(usize, &Proposal)>> = BTreeMap::new();
+    for (idx, (eco_idx, scan_root, proposal)) in all_proposals.iter().enumerate() {
+        let cohort = proposal.cohort.clone();
+        let key = if cohort.is_some() {
+            (*eco_idx, scan_root.clone(), cohort)
+        } else {
+            // Synthetic per-proposal bucket key so each non-cohort
+            // proposal stays in its own unit. Use the proposal index
+            // to guarantee uniqueness; the cohort slot carries a
+            // synthesized "__solo:<idx>" marker that no real cohort
+            // id can collide with (real cohort ids match
+            // `[a-z][a-z0-9-]+`).
+            (*eco_idx, scan_root.clone(), Some(format!("__solo:{idx}")))
+        };
+        buckets.entry(key).or_default().push((idx, proposal));
+    }
+
+    let mut units: Vec<WorkUnit> = Vec::new();
+    for ((eco_idx, scan_root, cohort_slot), mut entries) in buckets {
+        // Stable order: sort by proposal id so primary selection is
+        // deterministic. (Buckets are already BTreeMap-ordered;
+        // entries within a bucket may have been pushed in any
+        // order.)
+        entries.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+        let is_solo_bucket = cohort_slot
+            .as_deref()
+            .is_some_and(|s| s.starts_with("__solo:"));
+        if is_solo_bucket || entries.len() < 2 {
+            for (_, proposal) in entries {
+                units.push(WorkUnit {
+                    eco_idx,
+                    ecosystem_name: registry[eco_idx].name(),
+                    proposal: proposal.clone(),
+                    lockstep_members: Vec::new(),
+                    scan_root: scan_root.clone(),
+                });
+            }
+        } else {
+            // Multi-member real cohort: first is primary, rest are
+            // lockstep_members. The worker applies all atomically.
+            let mut iter = entries.into_iter();
+            let primary = iter.next().unwrap().1.clone();
+            let siblings: Vec<Proposal> = iter.map(|(_, p)| p.clone()).collect();
+            units.push(WorkUnit {
+                eco_idx,
+                ecosystem_name: registry[eco_idx].name(),
+                proposal: primary,
+                lockstep_members: siblings,
+                scan_root: scan_root.clone(),
+            });
+        }
+    }
+    units
 }
 
 /// Returns `(lockfile_only, compatible, breaking)` counts from a stream of
@@ -1328,7 +1460,21 @@ fn process_proposal_unit(
         }
     };
 
-    if let Err(err) = ecosystem.apply_proposal(&unit.proposal, &apply_tree) {
+    // Cohort lockstep: apply primary + every sibling to the SAME
+    // sandbox. Single-proposal units (the common case) flow through
+    // the `apply_proposal` path; multi-member cohort units use
+    // `apply_merged` so the per-bump state is composed atomically.
+    let apply_result = if unit.lockstep_members.is_empty() {
+        ecosystem.apply_proposal(&unit.proposal, &apply_tree)
+    } else {
+        let mut all: Vec<&Proposal> = Vec::with_capacity(1 + unit.lockstep_members.len());
+        all.push(&unit.proposal);
+        for sibling in &unit.lockstep_members {
+            all.push(sibling);
+        }
+        ecosystem.apply_merged(&all, &apply_tree)
+    };
+    if let Err(err) = apply_result {
         let summary = format!("apply failed: {err}");
         records.push(ProvenanceRecord {
             tool: "assay".into(),
@@ -1340,6 +1486,25 @@ fn process_proposal_unit(
             artifact_path: None,
             details: None,
         });
+        // For cohort lockstep failures, surface a PreValidationFailure
+        // for EACH member so the reporter accounts for them all.
+        // The simple variant only carries one `proposal`; we keep the
+        // primary in this slot and append additional records for each
+        // sibling so the receipt has full provenance.
+        if !unit.lockstep_members.is_empty() {
+            for sibling in &unit.lockstep_members {
+                records.push(ProvenanceRecord {
+                    tool: "assay".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    stage: format!("applier.{}", ecosystem.name()),
+                    subject: sibling.id.clone(),
+                    status: Classification::Unsupported,
+                    summary: format!("cohort-lockstep apply failed: {err}"),
+                    artifact_path: None,
+                    details: None,
+                });
+            }
+        }
         return WorkerOutcome::PreValidationFailure {
             eco_idx: unit.eco_idx,
             proposal: unit.proposal,
@@ -1347,16 +1512,43 @@ fn process_proposal_unit(
             summary,
         };
     }
-    records.push(ProvenanceRecord {
-        tool: "assay".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        stage: format!("applier.{}", ecosystem.name()),
-        subject: unit.proposal.id.clone(),
-        status: Classification::Exact,
-        summary: "applied to sandbox worktree".into(),
-        artifact_path: None,
-        details: Some(serde_json::json!({ "sandbox": apply_tree })),
-    });
+    if unit.lockstep_members.is_empty() {
+        records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: format!("applier.{}", ecosystem.name()),
+            subject: unit.proposal.id.clone(),
+            status: Classification::Exact,
+            summary: "applied to sandbox worktree".into(),
+            artifact_path: None,
+            details: Some(serde_json::json!({ "sandbox": apply_tree })),
+        });
+    } else {
+        let member_ids: Vec<String> = std::iter::once(unit.proposal.id.clone())
+            .chain(unit.lockstep_members.iter().map(|p| p.id.clone()))
+            .collect();
+        records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: format!("applier.{}.cohort-lockstep", ecosystem.name()),
+            subject: format!(
+                "{} + {} sibling(s)",
+                unit.proposal.subject,
+                unit.lockstep_members.len()
+            ),
+            status: Classification::Exact,
+            summary: format!(
+                "applied {} cohort member(s) atomically to sandbox worktree",
+                1 + unit.lockstep_members.len()
+            ),
+            artifact_path: None,
+            details: Some(serde_json::json!({
+                "sandbox": apply_tree,
+                "cohort": unit.proposal.cohort,
+                "members": member_ids,
+            })),
+        });
+    }
 
     let workflow_paths = ecosystem
         .gate_workflows(&unit.proposal, &apply_tree)
@@ -1433,13 +1625,31 @@ fn process_proposal_unit(
         artifact_path: None,
         details: serde_json::to_value(&outcome).ok(),
     });
-    WorkerOutcome::Completed {
-        eco_idx: unit.eco_idx,
-        proposal: unit.proposal,
-        sandbox: apply_tree,
-        outcome,
-        provenance: records,
-        scan_root,
+    if unit.lockstep_members.is_empty() {
+        WorkerOutcome::Completed {
+            eco_idx: unit.eco_idx,
+            proposal: unit.proposal,
+            sandbox: apply_tree,
+            outcome,
+            provenance: records,
+            scan_root,
+        }
+    } else {
+        // Same outcome attaches to every cohort member. The
+        // aggregator expands this into N `ProposalRun`s — one per
+        // member, all sharing the same sandbox so the merger's
+        // shared-sandbox check skips the redundant re-merge step.
+        let mut members: Vec<Proposal> = Vec::with_capacity(1 + unit.lockstep_members.len());
+        members.push(unit.proposal);
+        members.extend(unit.lockstep_members);
+        WorkerOutcome::CohortCompleted {
+            eco_idx: unit.eco_idx,
+            members,
+            sandbox: apply_tree,
+            outcome,
+            provenance: records,
+            scan_root,
+        }
     }
 }
 
@@ -3762,6 +3972,200 @@ mod tests {
             },
             scan_root: std::path::PathBuf::new(),
         }
+    }
+
+    // ----- build_work_units (cohort-aware grouping) ----------------------
+
+    fn sample_proposal_for_unit(id: &str, subject: &str, cohort: Option<&str>) -> Proposal {
+        use crate::model::{BumpTier, ProposalKind};
+        Proposal {
+            id: id.into(),
+            ecosystem: "npm".into(),
+            kind: ProposalKind::Version,
+            subject: subject.into(),
+            from: "1.0.0".into(),
+            to: "2.0.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+            affected_consumers: vec![],
+            explanation: None,
+            cohort: cohort.map(str::to_string),
+        }
+    }
+
+    fn npm_eco_idx_in(registry: &[Box<dyn DependencyEcosystem>]) -> usize {
+        registry
+            .iter()
+            .position(|e| e.name() == "npm")
+            .expect("default_registry should include npm")
+    }
+
+    #[test]
+    fn build_work_units_collapses_multi_member_cohort_into_one_unit() {
+        let registry = default_registry();
+        let npm_idx = npm_eco_idx_in(&registry);
+        let scan_root = PathBuf::from("/repo");
+        let all_proposals = vec![
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-1", "@angular/core", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-2", "@angular/common", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-3", "@angular/router", Some("angular-framework")),
+            ),
+        ];
+        let units = build_work_units(&all_proposals, &registry);
+        assert_eq!(
+            units.len(),
+            1,
+            "three lockstep members should collapse into ONE work unit"
+        );
+        let unit = &units[0];
+        // Primary is the proposal with the lowest id (deterministic).
+        assert_eq!(unit.proposal.id, "npm-1");
+        assert_eq!(unit.lockstep_members.len(), 2);
+        let sibling_ids: Vec<&str> = unit
+            .lockstep_members
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(sibling_ids, vec!["npm-2", "npm-3"]);
+    }
+
+    #[test]
+    fn build_work_units_keeps_non_cohort_proposals_individual() {
+        let registry = default_registry();
+        let npm_idx = npm_eco_idx_in(&registry);
+        let scan_root = PathBuf::from("/repo");
+        let all_proposals = vec![
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-ts", "typescript", None),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-lo", "lodash", None),
+            ),
+        ];
+        let units = build_work_units(&all_proposals, &registry);
+        assert_eq!(units.len(), 2);
+        for unit in &units {
+            assert!(
+                unit.lockstep_members.is_empty(),
+                "non-cohort proposals must not carry lockstep_members"
+            );
+        }
+    }
+
+    #[test]
+    fn build_work_units_singleton_cohort_stays_individual() {
+        let registry = default_registry();
+        let npm_idx = npm_eco_idx_in(&registry);
+        let scan_root = PathBuf::from("/repo");
+        let all_proposals = vec![(
+            npm_idx,
+            scan_root.clone(),
+            sample_proposal_for_unit("npm-1", "@angular/core", Some("angular-framework")),
+        )];
+        let units = build_work_units(&all_proposals, &registry);
+        assert_eq!(units.len(), 1);
+        assert!(
+            units[0].lockstep_members.is_empty(),
+            "singleton cohort has no lockstep partner — must be individual"
+        );
+    }
+
+    #[test]
+    fn build_work_units_isolates_different_scan_roots() {
+        // Same cohort id in two different scan_roots (Tauri-style
+        // polyglot: ui/ and admin/) must NOT collapse — each scan
+        // root is its own apply target and gets its own work unit.
+        let registry = default_registry();
+        let npm_idx = npm_eco_idx_in(&registry);
+        let scan_ui = PathBuf::from("/repo/ui");
+        let scan_admin = PathBuf::from("/repo/admin");
+        let all_proposals = vec![
+            (
+                npm_idx,
+                scan_ui.clone(),
+                sample_proposal_for_unit("npm-ui-1", "@angular/core", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_ui.clone(),
+                sample_proposal_for_unit("npm-ui-2", "@angular/common", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_admin.clone(),
+                sample_proposal_for_unit("npm-ad-1", "@angular/core", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_admin.clone(),
+                sample_proposal_for_unit("npm-ad-2", "@angular/common", Some("angular-framework")),
+            ),
+        ];
+        let units = build_work_units(&all_proposals, &registry);
+        assert_eq!(units.len(), 2, "two scan_roots → two cohort units");
+        for unit in &units {
+            assert_eq!(unit.lockstep_members.len(), 1, "two-member cohort per root");
+        }
+    }
+
+    #[test]
+    fn build_work_units_isolates_different_cohorts_in_same_scan_root() {
+        let registry = default_registry();
+        let npm_idx = npm_eco_idx_in(&registry);
+        let scan_root = PathBuf::from("/repo");
+        let all_proposals = vec![
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-1", "@angular/core", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-2", "@angular/common", Some("angular-framework")),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-3", "@tiptap/core", Some("tiptap")),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-4", "@tiptap/starter-kit", Some("tiptap")),
+            ),
+            (
+                npm_idx,
+                scan_root.clone(),
+                sample_proposal_for_unit("npm-ts", "typescript", None),
+            ),
+        ];
+        let units = build_work_units(&all_proposals, &registry);
+        // Expect 3 units: angular cohort (2 members → 1 unit),
+        // tiptap cohort (2 members → 1 unit), typescript (solo).
+        assert_eq!(units.len(), 3);
+        let lockstep_sizes: Vec<usize> =
+            units.iter().map(|u| 1 + u.lockstep_members.len()).collect();
+        let mut sizes_sorted = lockstep_sizes.clone();
+        sizes_sorted.sort();
+        assert_eq!(sizes_sorted, vec![1, 2, 2]);
     }
 
     fn green_run_with_cache_counts(id: &str, cached: usize, total: usize) -> ProposalRun {
