@@ -547,8 +547,9 @@ pub fn propose_from_cargo_dry_run(
     let mut proposals = Vec::new();
     for line in &diffed {
         let id = format!(
-            "cargo-{}-{}",
+            "cargo-{}-{}-to-{}",
             sanitize_id_segment(&line.crate_name),
+            sanitize_id_segment(&line.from),
             sanitize_id_segment(&line.to),
         );
         proposals.push(Proposal {
@@ -1007,8 +1008,9 @@ pub fn propose_unchanged_from_cargo_stdout(
     for line in &parsed {
         let tier = classify_unchanged_bump(&line.from, &line.to);
         let id = format!(
-            "cargo-{}-{}",
+            "cargo-{}-{}-to-{}",
             sanitize_id_segment(&line.crate_name),
+            sanitize_id_segment(&line.from),
             sanitize_id_segment(&line.to),
         );
         let mut notes = Vec::new();
@@ -1044,8 +1046,9 @@ pub fn propose_from_cargo_stdout(
     let mut proposals = Vec::new();
     for line in &parsed {
         let id = format!(
-            "cargo-{}-{}",
+            "cargo-{}-{}-to-{}",
             sanitize_id_segment(&line.crate_name),
+            sanitize_id_segment(&line.from),
             sanitize_id_segment(&line.to),
         );
         proposals.push(Proposal {
@@ -1538,7 +1541,7 @@ warning: not updating lockfile due to dry run
         let serde = proposals.iter().find(|p| p.subject == "serde").unwrap();
         assert_eq!(serde.from, "1.0.200");
         assert_eq!(serde.to, "1.0.215");
-        assert_eq!(serde.id, "cargo-serde-1-0-215");
+        assert_eq!(serde.id, "cargo-serde-1-0-200-to-1-0-215");
         assert_eq!(serde.manifest_paths, vec![PathBuf::from("Cargo.lock")]);
         assert!(
             proposals.iter().any(|p| p.subject == "tokio"),
@@ -2213,5 +2216,49 @@ warning: not updating lockfile due to dry run
             format!("{err}").contains("no manifest carried a matching dep entry"),
             "error should explain the missing target: {err}"
         );
+    }
+
+    #[test]
+    fn propose_from_cargo_stdout_id_disambiguates_by_source_version() {
+        // `cargo update` against a transitive crate present at two
+        // different versions in the lockfile (helm/mortar dogfood
+        // case: reqwest 0.12.28 AND 0.13.2 both bumping to 0.13.3)
+        // must produce distinct proposal IDs so apply-pr's branch-
+        // per-proposal flow doesn't clobber one branch with another.
+        // The fix wedges the `from` segment between the crate name
+        // and the target version: `cargo-reqwest-0-12-28-to-0-13-3`.
+        let stdout = "    Updating reqwest v0.12.28 -> v0.13.3\n\
+                      Updating reqwest v0.13.2 -> v0.13.3\n";
+        let manifest_paths = vec![PathBuf::from("Cargo.toml")];
+        let proposals = propose_from_cargo_stdout(stdout, &manifest_paths).unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert_ne!(
+            proposals[0].id, proposals[1].id,
+            "same-target multi-version transitive bumps must produce distinct IDs"
+        );
+        for p in &proposals {
+            assert!(
+                p.id.starts_with("cargo-reqwest-") && p.id.contains("-to-0-13-3"),
+                "id should include both from and to segments: {}",
+                p.id
+            );
+        }
+    }
+
+    #[test]
+    fn filter_ignored_crates_drops_matching_subject() {
+        let proposals = vec![
+            Proposal {
+                subject: "reqwest".into(),
+                ..proposal_with_tier("reqwest", BumpTier::Compatible)
+            },
+            Proposal {
+                subject: "tokio".into(),
+                ..proposal_with_tier("tokio", BumpTier::Compatible)
+            },
+        ];
+        let kept = filter_ignored_crates(proposals, &["reqwest".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].subject, "tokio");
     }
 }

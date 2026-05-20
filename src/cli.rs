@@ -3774,6 +3774,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_ignore_list_routes_cli_npm_entries_to_npm_ecosystem() {
+        // Regression for the wildmason.dev dogfood finding: --ignore
+        // npm:typescript was a silent no-op because the npm proposer
+        // didn't honor `ctx.ignored_subjects`. The proposer-side fix
+        // lives in npm.rs; this asserts the CLI wiring delivers the
+        // subject to the npm ecosystem (and ONLY the npm ecosystem).
+        let cfg = crate::config::AssayConfig::default();
+        let cli = vec!["npm:typescript".to_string()];
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "npm"),
+            vec!["typescript".to_string()]
+        );
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "cargo"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "github-actions"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_ignore_list_passes_through_scoped_npm_subject() {
+        // `@angular/core` contains a slash and a `@`. The CLI parser
+        // takes the FIRST colon as the eco/subject separator, leaving
+        // the scoped name intact for the npm proposer's exact-match
+        // filter to use.
+        let cfg = crate::config::AssayConfig::default();
+        let cli = vec!["npm:@angular/core".to_string()];
+        assert_eq!(
+            resolve_ignore_list(&cfg, &cli, "npm"),
+            vec!["@angular/core".to_string()]
+        );
+    }
+
     // ----- consumer suffix integration in red section --------------------
 
     #[test]

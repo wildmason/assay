@@ -157,7 +157,7 @@ impl DependencyEcosystem for NpmEcosystem {
         &self,
         manifests: &[Manifest],
         repo: &Path,
-        _ctx: &EcosystemContext,
+        ctx: &EcosystemContext,
     ) -> Result<Vec<Proposal>> {
         let has_package_json = manifests
             .iter()
@@ -178,7 +178,8 @@ impl DependencyEcosystem for NpmEcosystem {
             })
             .map(|m| m.path.clone())
             .collect();
-        run_npm_proposer(flavor, repo, &manifest_paths)
+        let proposals = run_npm_proposer(flavor, repo, &manifest_paths)?;
+        Ok(filter_ignored_packages(proposals, &ctx.ignored_subjects))
     }
 
     fn gate_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
@@ -494,8 +495,9 @@ pub(crate) fn build_npm_proposals(
             classify_npm_bump(current, &row.latest)
         };
         let id = format!(
-            "npm-{}-{}",
+            "npm-{}-{}-to-{}",
             sanitize_id_segment(&row.name),
+            sanitize_id_segment(current),
             sanitize_id_segment(&row.latest),
         );
         proposals.push(Proposal {
@@ -1774,6 +1776,25 @@ fn sanitize_id_segment(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Drop proposals whose `subject` exactly matches an entry in the
+/// per-ecosystem ignore list. Mirrors `filter_ignored_crates`
+/// ([`crate::ecosystem::cargo`]) and `filter_ignored_actions`
+/// ([`crate::ecosystem::github_actions`]) so `--ignore npm:<name>`
+/// behaves the same way across ecosystems. Scoped subjects like
+/// `@angular/core` work because the comparison is byte-for-byte.
+pub(crate) fn filter_ignored_packages(
+    proposals: Vec<Proposal>,
+    ignored: &[String],
+) -> Vec<Proposal> {
+    if ignored.is_empty() {
+        return proposals;
+    }
+    proposals
+        .into_iter()
+        .filter(|p| !ignored.iter().any(|i| i == &p.subject))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2560,6 +2581,71 @@ mod tests {
         let kept = filter_to_direct_deps(proposals, &direct);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].subject, "lodash");
+    }
+
+    #[test]
+    fn filter_ignored_packages_drops_matching_subject() {
+        let proposals = vec![sample_proposal("typescript"), sample_proposal("lodash")];
+        let kept = filter_ignored_packages(proposals, &["typescript".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].subject, "lodash");
+    }
+
+    #[test]
+    fn filter_ignored_packages_handles_scoped_subjects() {
+        // `@angular/core` and `@angular/common` differ — only the named
+        // one is dropped. Scoped npm packages are subject-matched
+        // byte-for-byte (no glob expansion).
+        let proposals = vec![
+            sample_proposal("@angular/core"),
+            sample_proposal("@angular/common"),
+        ];
+        let kept = filter_ignored_packages(proposals, &["@angular/core".to_string()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].subject, "@angular/common");
+    }
+
+    #[test]
+    fn filter_ignored_packages_empty_list_is_identity() {
+        let proposals = vec![sample_proposal("lodash"), sample_proposal("typescript")];
+        let before = proposals.len();
+        let kept = filter_ignored_packages(proposals, &[]);
+        assert_eq!(kept.len(), before);
+    }
+
+    #[test]
+    fn build_npm_proposals_id_disambiguates_by_source_version() {
+        // Two `npm outdated` rows for the same package at different
+        // currently-installed versions must produce distinct proposal
+        // IDs so a downstream apply-pr branch-per-proposal flow doesn't
+        // collide. Same shape as the cargo multi-version transitive
+        // case that surfaced in helm/mortar dogfood.
+        let manifest_paths = vec![PathBuf::from("package.json")];
+        let row_a = NpmOutdatedRow {
+            name: "left-pad".into(),
+            current: Some("1.0.0".into()),
+            wanted: "1.0.0".into(),
+            latest: "1.3.0".into(),
+        };
+        let row_b = NpmOutdatedRow {
+            name: "left-pad".into(),
+            current: Some("1.1.0".into()),
+            wanted: "1.1.0".into(),
+            latest: "1.3.0".into(),
+        };
+        let p_a = build_npm_proposals(&[row_a], &manifest_paths);
+        let p_b = build_npm_proposals(&[row_b], &manifest_paths);
+        assert_eq!(p_a.len(), 1);
+        assert_eq!(p_b.len(), 1);
+        assert_ne!(
+            p_a[0].id, p_b[0].id,
+            "different `from` versions must produce distinct proposal IDs"
+        );
+        assert!(
+            p_a[0].id.contains("1-0-0") && p_a[0].id.contains("to-1-3-0"),
+            "expected from-1-0-0 + to-1-3-0 segments: id={}",
+            p_a[0].id
+        );
     }
 
     fn sample_proposal(name: &str) -> Proposal {
