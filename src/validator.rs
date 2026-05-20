@@ -1308,13 +1308,13 @@ impl Validator {
         // and Timeout reflect the environment and a re-run may produce
         // a different result; writing them would lock in transient
         // breakage.
-        if let Some(entry) = outcome_to_cache_entry(&outcome, &key, &inputs) {
-            if let Err(err) = cache.write(&key, &entry) {
-                eprintln!(
-                    "[verdict-cache] failed to persist entry for `{}`: {err}",
-                    workflow.display()
-                );
-            }
+        if let Some(entry) = outcome_to_cache_entry(&outcome, &key, &inputs)
+            && let Err(err) = cache.write(&key, &entry)
+        {
+            eprintln!(
+                "[verdict-cache] failed to persist entry for `{}`: {err}",
+                workflow.display()
+            );
         }
         Ok(outcome)
     }

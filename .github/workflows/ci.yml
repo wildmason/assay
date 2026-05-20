@@ -7,15 +7,15 @@ on:
 
 jobs:
   msrv:
-    name: Rust 1.85 MSRV
+    name: Rust 1.88 MSRV
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Check MSRV build
         run: cargo check --locked --all-targets

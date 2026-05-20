@@ -346,18 +346,19 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     // Safety: mutating modes refuse on a dirty tree unless --force.
     // Validate runs the validator without touching the host so a
     // dirty tree is fine.
-    if mode.mutates_host() && !args.force {
-        if let Some(dirty_path) = working_tree_dirty_path(&args.repo)? {
-            let mode_label = if matches!(mode, ApplyMode::ApplyLocal) {
-                "--apply-local"
-            } else {
-                "--apply-pr"
-            };
-            return Err(Error::other(format!(
-                "refusing to {mode_label} against a dirty working tree (uncommitted changes at {dirty_path}). \
-                 Commit or stash, or pass --force to override."
-            )));
-        }
+    if mode.mutates_host()
+        && !args.force
+        && let Some(dirty_path) = working_tree_dirty_path(&args.repo)?
+    {
+        let mode_label = if matches!(mode, ApplyMode::ApplyLocal) {
+            "--apply-local"
+        } else {
+            "--apply-pr"
+        };
+        return Err(Error::other(format!(
+            "refusing to {mode_label} against a dirty working tree (uncommitted changes at {dirty_path}). \
+             Commit or stash, or pass --force to override."
+        )));
     }
     // Apply-pr preflight: $CI must not be set (we don't open PRs inside CI runs
     // unless the operator explicitly overrides via --force).

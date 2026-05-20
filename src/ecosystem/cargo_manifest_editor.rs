@@ -332,7 +332,7 @@ fn preserve_constraint_prefix(existing: &str, new_version: &str) -> String {
 /// deterministic across runs.
 ///
 /// `workspace_root` is the path that contains the top-level Cargo.toml.
-/// This is what the [`crate::cli::ProjectScope::resolve`] flow already
+/// This is what the `crate::cli::ProjectScope::resolve` flow already
 /// hands the applier — for a Tauri project with `src-tauri/Cargo.toml`
 /// that's `<project>/src-tauri`, NOT the git root.
 pub fn apply_constraint_widening_to_workspace(

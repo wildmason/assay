@@ -112,7 +112,7 @@ pub trait DependencyEcosystem: Send + Sync {
 
     /// Apply multiple proposals against the **same** sandbox tree.
     ///
-    /// The default impl loops [`apply_proposal`] in order. Each ecosystem's
+    /// The default impl loops [`Self::apply_proposal`] in order. Each ecosystem's
     /// per-proposal apply is assumed to compose additively against a tree
     /// that already contains earlier proposals' edits (cargo widens
     /// constraints in distinct crate names and re-runs `cargo update`; npm
@@ -141,7 +141,7 @@ pub trait DependencyEcosystem: Send + Sync {
     /// — they're all the same shape anyway.
     ///
     /// Default: false (always merge — safe everywhere). Cargo overrides to
-    /// `true` when every proposal in the set is [`BumpTier::LockfileOnly`]
+    /// `true` when every proposal in the set is `BumpTier::LockfileOnly`
     /// because `cargo update --workspace` is deterministic and comprehensive:
     /// every per-proposal sandbox lands on the same `Cargo.lock`, and no
     /// proposal touches `Cargo.toml`, so last-write-wins is byte-correct.
@@ -166,7 +166,7 @@ pub trait DependencyEcosystem: Send + Sync {
 
     /// Copy a merged sandbox's accumulated change-set back to host.
     ///
-    /// Default impl runs [`copy_back`] per proposal in order and dedups
+    /// Default impl runs [`Self::copy_back`] per proposal in order and dedups
     /// returned paths. Ecosystems whose `copy_back` ships bulk artifacts
     /// (cargo: whole `Cargo.lock` + workspace manifests; npm: whole
     /// `package.json` + lockfile) override to copy ONCE — calling the

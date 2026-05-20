@@ -330,7 +330,7 @@ fn compat_group(v: &semver::Version) -> (u64, u64, u64) {
     }
 }
 
-/// Build a structured [`BumpExplanation`] for a cargo manifest-edit
+/// Build a structured `BumpExplanation` for a cargo manifest-edit
 /// bump, paralleling [`classify_unchanged_bump`]. The returned
 /// explanation captures the same decision logic in audit-friendly form:
 /// caller passes `from` / `to` versions, the helper resolves the
@@ -1034,7 +1034,7 @@ pub fn propose_unchanged_from_cargo_stdout(
 }
 
 /// Build proposals from `cargo update --dry-run` stdout without the
-/// lockfile-diff cross-check. Used by [`run_cargo_proposer`] which can't
+/// lockfile-diff cross-check. Used by `run_cargo_proposer` which can't
 /// generate an after-lockfile without a mutating cargo invocation.
 pub fn propose_from_cargo_stdout(
     stdout: &str,

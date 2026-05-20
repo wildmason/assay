@@ -55,7 +55,7 @@ impl Redactor {
     }
 
     /// Register a secret value to be scrubbed on every future `redact`
-    /// call. Values shorter than [`MIN_LITERAL_LEN`] are silently dropped
+    /// call. Values shorter than `MIN_LITERAL_LEN` are silently dropped
     /// because replacing very short strings has more false-positive risk
     /// than masking value.
     pub fn register(&self, value: impl Into<String>) {

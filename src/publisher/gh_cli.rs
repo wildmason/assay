@@ -270,14 +270,13 @@ pub fn parse_owner_repo_from_url(remote_url: &str) -> Option<(String, String)> {
     let stem = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
     // SSH form: `git@host:owner/repo` — the URL has a `:` but no `://`.
-    if !stem.contains("://") {
-        if let Some((_, after)) = stem.split_once(':') {
-            if let Some((owner, repo)) = after.rsplit_once('/') {
-                if !owner.is_empty() && !repo.is_empty() {
-                    return Some((owner.to_string(), repo.to_string()));
-                }
-            }
-        }
+    if !stem.contains("://")
+        && let Some((_, after)) = stem.split_once(':')
+        && let Some((owner, repo)) = after.rsplit_once('/')
+        && !owner.is_empty()
+        && !repo.is_empty()
+    {
+        return Some((owner.to_string(), repo.to_string()));
     }
 
     // URL form (https://, ssh://, git://): take the last two `/`-separated

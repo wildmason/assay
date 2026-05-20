@@ -28,7 +28,7 @@
 //!   manifest constraint must be widened.
 //!
 //! Yarn 1 emits a different NDJSON shape (`{"type":"table","data":{...}}`)
-//! which the proposer parses via [`parse_yarn1_outdated_output`]. The
+//! which the proposer parses via `parse_yarn1_outdated_output`. The
 //! applier shells out to `yarn upgrade <pkg>@<v> --exact` with the same
 //! snapshot/restore wrapper used for npm LockfileOnly bumps. Yarn 2+
 //! ("Berry") offers `yarn npm outdated --json` in the npm shape and
@@ -1455,10 +1455,11 @@ pub(crate) fn detect_workspace_members(tree_path: &Path) -> Result<Vec<Workspace
             let normalized = pattern_str.replace('\\', "/");
             if let Ok(walker) = glob::glob(&normalized) {
                 for entry in walker.flatten() {
-                    if entry.is_dir() && entry.join("package.json").is_file() {
-                        if let Ok(rel) = entry.strip_prefix(tree_path) {
-                            resolved_dirs.insert(rel.to_path_buf());
-                        }
+                    if entry.is_dir()
+                        && entry.join("package.json").is_file()
+                        && let Ok(rel) = entry.strip_prefix(tree_path)
+                    {
+                        resolved_dirs.insert(rel.to_path_buf());
                     }
                 }
             }
@@ -1675,15 +1676,15 @@ fn preserve_constraint_prefix(existing: &str, new_version: &str) -> String {
         let new_inner = preserve_constraint_prefix(inner, new_version);
         return format!("npm:{target}@{new_inner}");
     }
-    if let Some(rest) = existing.strip_prefix('^') {
-        if rest.contains(|c: char| c.is_ascii_digit()) {
-            return format!("^{new_version}");
-        }
+    if let Some(rest) = existing.strip_prefix('^')
+        && rest.contains(|c: char| c.is_ascii_digit())
+    {
+        return format!("^{new_version}");
     }
-    if let Some(rest) = existing.strip_prefix('~') {
-        if rest.contains(|c: char| c.is_ascii_digit()) {
-            return format!("~{new_version}");
-        }
+    if let Some(rest) = existing.strip_prefix('~')
+        && rest.contains(|c: char| c.is_ascii_digit())
+    {
+        return format!("~{new_version}");
     }
     if existing.starts_with('=') {
         return format!("={new_version}");
