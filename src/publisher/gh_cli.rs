@@ -453,23 +453,44 @@ mod tests {
     fn fixture_gh_script(tmp: &Path, response: &str) -> PathBuf {
         // Cross-platform fixture: on Unix write a shell script that
         // echoes `response`; on Windows write a `.cmd`.
+        //
+        // The Unix path uses explicit `File::create` + `write_all` +
+        // `sync_all` + drop instead of `std::fs::write` because under
+        // heavy parallel test load on Linux CI runners, executing a
+        // file that was just written can race against the kernel's
+        // `ETXTBSY` guard (`Text file busy` errno 26). `sync_all`
+        // forces a write barrier so the file descriptor is fully
+        // closed before exec; an empirical fix from the gh_cli test
+        // flake on the v1.1.0 release CI run.
         if cfg!(windows) {
             let path = tmp.join("gh.cmd");
             std::fs::write(&path, format!("@echo off\necho {response}\nexit /b 0\n")).unwrap();
             path
         } else {
             let path = tmp.join("gh");
-            std::fs::write(
-                &path,
-                format!("#!/bin/sh\nprintf '%s\\n' '{response}'\nexit 0\n"),
-            )
-            .unwrap();
             #[cfg(unix)]
             {
+                use std::io::Write;
                 use std::os::unix::fs::PermissionsExt;
+                {
+                    let mut file = std::fs::File::create(&path).unwrap();
+                    file.write_all(
+                        format!("#!/bin/sh\nprintf '%s\\n' '{response}'\nexit 0\n").as_bytes(),
+                    )
+                    .unwrap();
+                    file.sync_all().unwrap();
+                }
                 let mut perms = std::fs::metadata(&path).unwrap().permissions();
                 perms.set_mode(0o755);
                 std::fs::set_permissions(&path, perms).unwrap();
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(
+                    &path,
+                    format!("#!/bin/sh\nprintf '%s\\n' '{response}'\nexit 0\n"),
+                )
+                .unwrap();
             }
             path
         }
