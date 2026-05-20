@@ -823,11 +823,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         let eco_phrase = if active_eco_count == registry.len() {
             format!("{} ecosystem(s)", active_eco_count)
         } else {
-            format!(
-                "{} of {} ecosystem(s)",
-                active_eco_count,
-                registry.len()
-            )
+            format!("{} of {} ecosystem(s)", active_eco_count, registry.len())
         };
         println!(
             "assay: scanned {} manifest(s) across {}; {} proposal(s) (mode={:?})",
@@ -3552,7 +3548,6 @@ fn missing_cargo_lock_warning(name: &str, manifests: &[Manifest]) -> Option<Stri
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4772,7 +4767,11 @@ mod tests {
         let config = crate::config::AssayConfig::default();
         let scope = ProjectScope::resolve(&args, &config).expect("scope resolves");
         assert_eq!(scope.scan_roots.len(), 2);
-        assert!(scope.scan_roots.contains(&repo_root.join("apps").join("web")));
+        assert!(
+            scope
+                .scan_roots
+                .contains(&repo_root.join("apps").join("web"))
+        );
     }
 
     #[test]

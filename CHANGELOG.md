@@ -2,6 +2,50 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-20
+
+"Polish & correctness" release. A seven-target dogfood tour across the Wildmason fleet (`ci-forge`, `gha-eventsmith`, `aegis`, `slate`, `mortar`, `helm`, `wildmason.dev`, plus the `nlg` smoke) surfaced two real correctness bugs, three significant UX gaps, and a long tail of receipt-schema papercuts. All addressed.
+
+### Fixed (correctness)
+
+- **`--ignore npm:<subject>` is a silent no-op.** `NpmEcosystem::propose_updates` took the `EcosystemContext` as `_ctx` (deliberately ignored) and never applied the per-ecosystem ignore filter that cargo + github-actions both honored. New `filter_ignored_packages` mirroring the existing `filter_ignored_crates` / `filter_ignored_actions` helpers, plumbed into the proposer. Confirmed live on aegis: `--ignore npm:typescript` now drops the `typescript 5.9.3 -> 6.0.3` proposal (count 10 → 9, breaking-tier 1 → 0).
+- **Duplicate proposal IDs on multi-version transitive deps.** Two `reqwest` proposals (`0.12.28 -> 0.13.3` AND `0.13.2 -> 0.13.3`) both got ID `cargo-reqwest-0-13-3` because the format only included `subject` + `to`. Under `--apply-pr` the branch-per-proposal flow would clobber one branch with another. Cargo + npm proposal IDs now wedge the `from` version between subject and target (`cargo-reqwest-0-12-28-to-0-13-3`, `npm-left-pad-1-0-0-to-1-3-0`). Pre-1.0 ID format change; verdict cache is content-addressed, not ID-keyed, so existing caches are unaffected.
+- **`--project <dir>` returned 0 manifests for every polyglot layout.** The `--project <dir>` branch of `ProjectScope::resolve` returned EARLY without invoking `detect_polyglot_subdirs`. Auto-detect only fired on the legacy `--repo` path. Slate (`--project slate` missed `ui/`), ci-forge (`--project ci-forge` missed `apps/web/`), and mortar (`--project mortar` missed BOTH `src-tauri/` AND `ui/`) all silently dropped the majority of their actionable proposals. Mortar's case dropped 49/52 (94%). Extracted the polyglot block into a shared `augment_with_polyglot_subdirs` helper called from both `ProjectScope::resolve` branches. Live verification: mortar 3 → 52 proposals, ci-forge 6 → 13, slate 0 → 37.
+- **Polyglot detection skipped the entire repo when root had ANY manifest.** ci-forge's shape — Cargo workspace at root + Vite/React frontend at `apps/web/` — fell through the gate. New per-ecosystem gating: root `Cargo.toml` suppresses the cargo subdir probe (workspace covers members) but does NOT block the npm subdir probe. Inverse holds for root `package.json`. The npm probe also walks one level into `apps/<name>/` and `packages/<name>/` so monorepo-style nested frontends are reachable.
+- **`--format json` produced invalid JSON.** Output was a stream of concatenated top-level JSON objects (one per ecosystem-scan_root pair from inline `report_json` calls) AND omitted proposals entirely — the payload contained only manifest-detection records. `JSON.parse(stdout)` failed with "Extra data"; `jq` saw only manifest scans. Confirmed across 4 of 7 dogfood agents. Fix: suppress inline per-ecosystem JSON during the scan phase, emit ONE valid JSON document at end-of-run mirroring the receipt 1:1, plus a sibling `receipt_path` field for callers who want to drop into the on-disk artifact.
+
+### Fixed (UX)
+
+- **Summary line honors `--ecosystem` filter.** Pre-fix: "across 3 ecosystem(s)" regardless of how the filter narrowed the active set. Post-fix: "across N of M ecosystem(s)" when filtered. Three dogfood agents flagged this.
+- **`--member-gate` paired with DryRun emits a hint.** The flag only affects the validator stage; DryRun (the default) doesn't run the validator, so `--member-gate` had no observable effect. New `[member-gate] note: ...` one-liner explains the no-op and points at `--validate` / `--apply-local` / `--apply-pr`.
+- **`--offline` rustdoc matches behavior.** Pre-fix doc said network-bound ecosystems "emit no proposals" under `--offline`; actual behavior falls back to the action-store cache and emits cache-served proposals annotated with `source:offline-cache`. Help text + behavior now agree.
+- **Zero-manifest hint when `--ecosystem <name>` returns nothing.** Per-ecosystem remediation line surfaces the most common cause: GHA repos without `.github/workflows/`, cargo crates without a manifest at the scan root, npm projects in a subdirectory.
+- **npm orphan-lockfile suppression.** `package-lock.json` (or `pnpm-lock.yaml`, `yarn.lock`) without a sibling `package.json` is no longer reported as a detected manifest. Mortar dogfood: empty root-level `package-lock.json` short-circuited polyglot traversal AND looked like a successful "1 manifest, 0 proposals" scan.
+- **`--quiet` flag** suppresses the per-ecosystem manifest-detection breadcrumbs and the per-proposal `proposal <id>: ...` lines during the scan. Bottom-of-run summary + tier breakdown + per-tier detail section still print. No effect on `--format json` (already batches).
+
+### Fixed (receipt schema)
+
+- **`run_context` block** (new, top-level, optional): captures `cli_args`, `tool_version`, `host` (os/arch) for reproducibility audits. Saves walking every provenance record for "what version on what machine."
+- **Lazy `logs/` + `receipts/` subdirs.** Pre-creating both in `write_run_receipt` made every DryRun receipt directory contain two empty subdirs that read as "the run aborted partway." Stage writers (`write_stage_receipt`, log handlers) materialize them lazily now.
+- **`repository.path` canonicalization + forward-slash normalization.** Drops the `\.` artifact when `--project .` was used (visible in the nlg smoke), strips the Windows `\\?\` extended-length prefix that `canonicalize()` emits, and replaces backslashes with forward slashes so cross-platform receipt consumers don't have to special-case Windows. The "receipt written to ..." log line and the `[project] auto-detected polyglot scan root:` breadcrumb get the same treatment.
+- **Tighter npm bump explanations with implied manifest-edit hint.** `npm:caret-major-crossed` no longer restates the rule + boundary in slightly different words; it surfaces the boundary once AND names the implied caret-constraint widening (`widens `^5.9.3` -> `^6.0.3``). Same pattern applied to the other 3 npm tier-explanation rules.
+
+### Deferred to v0.4.1 / v0.5.0
+
+These dogfood findings are real but represent feature work rather than fixes:
+
+- **SHA-pinning proposals for floating GHA tags** despite resolved SHAs in the cache (gha-eventsmith biggest value-prop gap)
+- **Framework cohort awareness** — @angular/*, @tiptap/*, @sveltejs/* emit as N independent proposals violating lockstep
+- **npm peer-dep cross-reference** — `affected_consumers` empty for all npm proposals; no peer-dep awareness for library projects
+- **npm `overrides` block** ignored (slate)
+- **Tag cache stores `exists:true` but not the resolved SHA** — bundle with SHA-pinning
+- **Provenance records for skipped GHA refs** (`@stable`, `@nightly`, self-ref) — bundle with SHA-pinning
+
+### Internal
+
+- Test count: 618 → 629 (+11 net).
+- The `RunContext` struct + `forward_slash_path` / `strip_extended_length_prefix` helpers are new shared utilities.
+
 ## [0.3.0] — 2026-05-20
 
 Four `--apply-pr` polish items surfaced by the 0.2.0 dogfood against `wildmason/safe-bundle`, all addressed:

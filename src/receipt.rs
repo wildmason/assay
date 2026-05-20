@@ -133,7 +133,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let receipt = sample_receipt("assay-test-lazy");
         write_run_receipt(tmp.path(), &receipt).unwrap();
-        let run_dir = tmp.path().join(".assay").join("runs").join("assay-test-lazy");
+        let run_dir = tmp
+            .path()
+            .join(".assay")
+            .join("runs")
+            .join("assay-test-lazy");
         assert!(!run_dir.join("receipts").exists());
         write_stage_receipt(
             tmp.path(),

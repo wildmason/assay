@@ -151,9 +151,7 @@ impl DependencyEcosystem for NpmEcosystem {
         // `package-lock.json` short-circuited polyglot traversal AND
         // looked like a successful scan). Polyglot detection still
         // discovers the real `ui/package.json` separately.
-        if package_json_present
-            && let Some(flavor) = detect_flavor(repo)
-        {
+        if package_json_present && let Some(flavor) = detect_flavor(repo) {
             found.push(Manifest {
                 path: PathBuf::from(flavor.lockfile_name()),
                 kind: ManifestKind::NpmLockfile,
