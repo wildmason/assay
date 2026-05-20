@@ -13,16 +13,29 @@
 pub mod args;
 mod apply_local;
 mod apply_pr;
+mod config_resolve;
 mod git_ops;
 mod paths;
 mod polyglot;
+mod project_scope;
 mod reporting;
 mod run_state;
+mod text_report;
 mod time_utils;
 
 pub use args::*;
+pub use config_resolve::parse_cache_ttl;
+
 use apply_local::perform_apply_local_commit;
 use apply_pr::{perform_apply_pr, preflight_apply_pr_gh_auth, preflight_apply_pr_insteadof};
+use config_resolve::{
+    build_validator, ecosystem_enabled, populate_proposal_explanations, resolve_ignore_list,
+    workflow_filter_from_args, zero_manifest_hint,
+};
+#[cfg(test)]
+use config_resolve::parse_cli_ignore;
+#[cfg(test)]
+use text_report::missing_cargo_lock_warning;
 use git_ops::{prepare_apply_local_tree, working_tree_dirty_path};
 #[cfg(test)]
 use apply_pr::{
@@ -31,11 +44,8 @@ use apply_pr::{
 };
 #[cfg(test)]
 use git_ops::{partition_stageable_paths, porcelain_line_is_assay_artifact};
-use paths::{
-    anchor_artifact_root_at_git_root, forward_slash_path, relative_prefix, same_path,
-    strip_extended_length_prefix,
-};
-use polyglot::augment_with_polyglot_subdirs;
+use paths::{forward_slash_path, relative_prefix, strip_extended_length_prefix};
+use project_scope::{ProjectScope, capture_run_context};
 use reporting::{
     aggregate_cache_counts, aggregate_member_skipped_count, format_red_proposal_section,
     print_discovered_section, ship_counts, tier_counts,
@@ -45,6 +55,7 @@ use reporting::format_consumers_suffix;
 use run_state::{
     ApplyPrSummary, CommitSummary, PreValidationFailureRow, ProposalRun, WorkUnit, WorkerOutcome,
 };
+use text_report::report_text;
 use time_utils::{generate_run_id, iso8601_now};
 
 use std::path::{Path, PathBuf};
@@ -53,14 +64,15 @@ use std::process::ExitCode;
 use crate::ecosystem::{DependencyEcosystem, EcosystemContext, default_registry};
 use crate::error::{Error, Result};
 use crate::model::{
-    AssayRunReceipt, Classification, Manifest, ManifestKind, Proposal, Provenance,
-    ProvenanceRecord, RepositoryRef, RunSummary,
+    AssayRunReceipt, Classification, Proposal, Provenance, ProvenanceRecord, RepositoryRef,
+    RunSummary,
 };
+#[cfg(test)]
+use crate::model::{Manifest, ManifestKind};
 use crate::publisher::gh_cli::GhCliBackend;
 use crate::receipt::write_run_receipt;
-use crate::validator::{CustomBackend, Validator, ValidatorExecutor};
+use crate::validator::Validator;
 use crate::worker_pool::{Semaphore, WorkerContext, WorkerPool};
-use crate::workflow_filter::WorkflowFilter;
 
 use clap::Parser;
 use std::sync::{Arc, Mutex};
@@ -1311,434 +1323,6 @@ fn cohort_display_name(cohort_id: &str) -> String {
     cohort_id.to_string()
 }
 
-
-
-/// Resolved scope for one `analyze` invocation. Carries the artifact
-/// root (where `.assay/` lives + where git operations anchor) plus the
-/// list of scan roots (directories where ecosystems detect manifests).
-///
-/// **Single-root case** (no `--project`, no `[project] roots` in config):
-/// `artifact_root` = `scan_roots[0]` = `args.repo`. Single element.
-///
-/// **`--project <path>`**: `artifact_root` and the sole scan root are
-/// derived from the path. May restrict to one ecosystem when path is
-/// a manifest file. Config `[project] roots` is ignored in this mode —
-/// `--project` is the explicit "single sub-project" entry point.
-///
-/// **`[project] roots = [...]` in `.assay.toml`** (polyglot Tauri / mixed
-/// repos): `artifact_root` = `args.repo`; `scan_roots` = `args.repo`
-/// plus each config-declared root (deduplicated). The repo root stays
-/// in scan_roots so root-level manifests (`.github/workflows/`) are
-/// still discovered.
-#[derive(Debug, Clone)]
-struct ProjectScope {
-    /// Where `.assay/` is written and where git operations anchor.
-    artifact_root: PathBuf,
-    /// Every directory to scan for ecosystem manifests. Always
-    /// non-empty.
-    scan_roots: Vec<PathBuf>,
-    ecosystem_restriction: Option<EcosystemSelector>,
-}
-
-impl ProjectScope {
-    fn resolve(args: &AnalyzeArgs, config: &crate::config::AssayConfig) -> Result<Self> {
-        if let Some(path) = args.project.as_deref() {
-            if !path.exists() {
-                return Err(Error::other(format!(
-                    "--project path `{}` does not exist",
-                    path.display()
-                )));
-            }
-            if path.is_dir() {
-                let (artifact_root, scan_root) = anchor_artifact_root_at_git_root(path);
-                let mut scan_roots: Vec<PathBuf> = vec![scan_root.clone()];
-                // Polyglot auto-detect ALSO applies when --project points
-                // at a directory — without this, `assay analyze --project
-                // mortar` (Tauri: src-tauri/ + ui/) misses every Cargo
-                // and npm manifest because the root has neither at top
-                // level. Pre-fix dogfood: 49/52 actionable proposals
-                // (94%) silently dropped on mortar. Per-ecosystem gate
-                // honored so a single-cargo / single-npm repo doesn't
-                // also probe for subdirs (a root workspace covers its
-                // members already).
-                augment_with_polyglot_subdirs(&mut scan_roots, &scan_root, config);
-                return Ok(ProjectScope {
-                    artifact_root,
-                    scan_roots,
-                    ecosystem_restriction: None,
-                });
-            }
-            let (eco, scan_root_initial) =
-                infer_project_scope_from_manifest(path).ok_or_else(|| {
-                    Error::other(format!(
-                        "--project file `{}` is not a recognized manifest. \
-                         Supported: Cargo.toml (cargo), .github/workflows/*.yml \
-                         (github-actions).",
-                        path.display()
-                    ))
-                })?;
-            let (artifact_root, scan_root) = anchor_artifact_root_at_git_root(&scan_root_initial);
-            return Ok(ProjectScope {
-                artifact_root,
-                scan_roots: vec![scan_root],
-                ecosystem_restriction: Some(eco),
-            });
-        }
-        // No --project: artifact root = --repo. scan_roots = repo + any
-        // config-declared roots (resolved relative to repo). Repo root
-        // is ALWAYS scanned so root-level manifests like
-        // `.github/workflows/` aren't missed when the config lists
-        // subdirectory roots.
-        let artifact_root = args.repo.clone();
-        let mut scan_roots: Vec<PathBuf> = vec![artifact_root.clone()];
-        for cfg_root in &config.project.roots {
-            let resolved = if cfg_root.is_absolute() {
-                cfg_root.clone()
-            } else {
-                artifact_root.join(cfg_root)
-            };
-            if !scan_roots.iter().any(|p| same_path(p, &resolved)) {
-                scan_roots.push(resolved);
-            }
-        }
-        augment_with_polyglot_subdirs(&mut scan_roots, &artifact_root, config);
-        Ok(ProjectScope {
-            artifact_root,
-            scan_roots,
-            ecosystem_restriction: None,
-        })
-    }
-}
-
-/// Capture the reproducibility context (argv + tool version + host
-/// OS/arch) at the top of every analyze run. Falls into the
-/// receipt's `run_context` field so a downstream CI consumer can
-/// scan one place for "what version on what machine". The dogfood
-/// (ci-forge agent) flagged the absence of this top-level block as
-/// the main missing piece for reproducibility audits.
-fn capture_run_context() -> crate::model::RunContext {
-    let cli_args: Vec<String> = std::env::args().collect();
-    let mut host = std::collections::BTreeMap::new();
-    host.insert("os".to_string(), std::env::consts::OS.to_string());
-    host.insert("arch".to_string(), std::env::consts::ARCH.to_string());
-    crate::model::RunContext {
-        cli_args,
-        tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        host,
-    }
-}
-
-
-/// Per-ecosystem remediation hint when `--ecosystem <name>` returns
-/// no manifests. Each branch points at the most common reason from
-/// the 2026-05-20 dogfood: gha repos that don't have
-/// `.github/workflows/`, cargo crates without a lockfile, npm
-/// projects without a `package.json`.
-fn zero_manifest_hint(eco_name: &str) -> &'static str {
-    match eco_name {
-        "github-actions" => {
-            " (no `.github/workflows/*.yml` present — github-actions runs only against \
-             workflow files)"
-        }
-        "cargo" => {
-            " (no `Cargo.toml` at the scan root; pass --project <member> to target a \
-             workspace member directly)"
-        }
-        "npm" => {
-            " (no `package.json` at the scan root; pass --project <subdir> if the npm \
-             project lives in a subdirectory)"
-        }
-        _ => "",
-    }
-}
-
-
-fn infer_project_scope_from_manifest(path: &Path) -> Option<(EcosystemSelector, PathBuf)> {
-    let filename = path.file_name()?.to_str()?;
-    if filename.eq_ignore_ascii_case("Cargo.toml") {
-        let parent = path.parent()?.to_path_buf();
-        return Some((EcosystemSelector::Cargo, parent));
-    }
-    if filename.eq_ignore_ascii_case("package.json") {
-        let parent = path.parent()?.to_path_buf();
-        return Some((EcosystemSelector::Npm, parent));
-    }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(ext.as_str(), "yml" | "yaml") {
-        // Walk parents to find `.github` then take its parent as repo root.
-        let mut cursor = path.parent();
-        while let Some(dir) = cursor {
-            if dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.eq_ignore_ascii_case(".github"))
-            {
-                return Some((
-                    EcosystemSelector::GithubActions,
-                    dir.parent()?.to_path_buf(),
-                ));
-            }
-            cursor = dir.parent();
-        }
-    }
-    None
-}
-
-/// Construct the [`Validator`] for this run.
-///
-/// `--gate-cmd` / `--gate-file` short-circuit auto-selection by wrapping
-/// the operator-supplied command in a [`CustomBackend`]; otherwise we
-/// defer to [`Validator::auto`] to pick `forge-run` (when `forge` and
-/// `.github/workflows/` are both present) or `build-test` (manifest-
-/// inferred fallback).
-///
-/// The verdict cache is wired in when `!args.no_cache`. Cache entries
-/// live under `<artifact_root>/.assay/verdict-cache/` so every
-/// (workspace, workflow) pair has a content-addressed verdict file. The
-/// cache TTL comes from `args.cache_ttl` (parsed via
-/// [`parse_cache_ttl`]).
-fn build_validator(args: &AnalyzeArgs, artifact_root: &Path) -> Result<Validator> {
-    let base = if let Some(cmd) = args.gate_cmd.as_deref() {
-        Validator::with_backend(Box::new(CustomBackend::from_gate_cmd(cmd)))
-    } else if let Some(file) = args.gate_file.as_deref() {
-        Validator::with_backend(Box::new(CustomBackend::from_gate_file(file)))
-    } else {
-        let validator_executor = match args.executor {
-            ExecutorChoice::Host => ValidatorExecutor::Host,
-            ExecutorChoice::Docker => ValidatorExecutor::Docker,
-        };
-        Validator::auto(&args.repo, validator_executor)?
-    };
-
-    if args.no_cache {
-        return Ok(base);
-    }
-
-    let ttl = parse_cache_ttl(&args.cache_ttl).map_err(|msg| {
-        Error::other(format!(
-            "--cache-ttl `{}` is not a valid duration: {}. \
-             Accepts `<n>s`, `<n>m`, `<n>h`, `<n>d`, or `<n>w`.",
-            args.cache_ttl, msg
-        ))
-    })?;
-    let cache_dir = artifact_root.join(".assay").join("verdict-cache");
-    let cache = crate::verdict_cache::VerdictCache::new(cache_dir, ttl);
-    Ok(base.with_cache(cache))
-}
-
-/// Parse a `--cache-ttl` value (e.g. `7d`, `30m`, `2h`, `1w`, `300s`)
-/// into a `Duration`. Accepts integer-valued suffixed forms only — no
-/// fractions, no compound expressions like `1h30m`. Returns a
-/// human-readable error string on failure.
-pub fn parse_cache_ttl(s: &str) -> std::result::Result<std::time::Duration, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty value".into());
-    }
-    let (num_part, unit_part): (&str, &str) = match s.find(|c: char| !c.is_ascii_digit()) {
-        Some(idx) => (&s[..idx], &s[idx..]),
-        None => (s, "s"),
-    };
-    if num_part.is_empty() {
-        return Err(format!("missing number in `{s}`"));
-    }
-    let n: u64 = num_part
-        .parse()
-        .map_err(|_| format!("`{num_part}` is not a non-negative integer"))?;
-    let secs = match unit_part.trim() {
-        "s" => n,
-        "m" => n.saturating_mul(60),
-        "h" => n.saturating_mul(60 * 60),
-        "d" => n.saturating_mul(60 * 60 * 24),
-        "w" => n.saturating_mul(60 * 60 * 24 * 7),
-        other => return Err(format!("unknown unit `{other}`")),
-    };
-    Ok(std::time::Duration::from_secs(secs))
-}
-
-/// Build the [`WorkflowFilter`] from the parsed CLI args.
-///
-/// Defaults to [`WorkflowFilter::pull_request_default`]; flipped to
-/// [`WorkflowFilter::accept_all`] when `--no-workflow-filter` is set.
-/// Include/exclude globs are layered on top of either base.
-fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
-    let base = if args.no_workflow_filter {
-        WorkflowFilter::accept_all()
-    } else {
-        WorkflowFilter::pull_request_default()
-    };
-    WorkflowFilter {
-        include_globs: args.include_workflows.clone(),
-        exclude_globs: args.exclude_workflows.clone(),
-        ..base
-    }
-}
-
-/// Populate `proposal.explanation` for each proposal in `proposals`
-/// by dispatching to the matching ecosystem's explainer. Called only
-/// when `--explain` is set; otherwise proposals retain their default
-/// `explanation: None`.
-///
-/// The dispatch keys on the ecosystem name (matching the strings
-/// `ecosystem.name()` returns: `"cargo"`, `"github-actions"`,
-/// `"npm"`). Proposals from a future ecosystem without a registered
-/// explainer fall through with `None` rather than panic — the
-/// reporter handles that gracefully (no rationale line printed).
-fn populate_proposal_explanations(proposals: &mut [Proposal], ecosystem_name: &str) {
-    use crate::ecosystem::{cargo as cargo_eco, github_actions as gha_eco, npm as npm_eco};
-    use crate::model::BumpTier;
-    for proposal in proposals.iter_mut() {
-        // Skip proposals that carry their own explanation already —
-        // the GHA SHA-pin proposer attaches `gha:tag-to-sha-pinning`
-        // at construction time because the generic per-tier
-        // classifier would mis-classify a tag → SHA bump as
-        // `gha:unparseable-tag`. Honor what the proposer already
-        // chose to say.
-        if proposal.explanation.is_some() {
-            continue;
-        }
-        let explanation = match (ecosystem_name, proposal.bump_tier) {
-            ("cargo", BumpTier::LockfileOnly) => Some(cargo_eco::explain_lockfile_only_bump(
-                &proposal.from,
-                &proposal.to,
-                None,
-            )),
-            ("cargo", _) => Some(cargo_eco::explain_unchanged_bump(
-                &proposal.from,
-                &proposal.to,
-            )),
-            ("github-actions", _) => Some(gha_eco::explain_action_bump(
-                Some(&proposal.from),
-                &proposal.to,
-            )),
-            ("npm", BumpTier::LockfileOnly) => Some(npm_eco::explain_npm_lockfile_only_bump(
-                &proposal.from,
-                &proposal.to,
-                None,
-            )),
-            ("npm", _) => Some(npm_eco::explain_npm_bump(&proposal.from, &proposal.to)),
-            _ => None,
-        };
-        proposal.explanation = explanation;
-    }
-}
-
-/// Return the `.assay.toml` ignore list for `ecosystem_name`. When the
-/// config has no entry for this ecosystem, returns an empty Vec.
-///
-/// npm and yarn1 share the npm ecosystem entry (both use the
-/// `NpmEcosystem` impl). Other ecosystems get their own section in
-/// the config.
-fn resolve_ignore_list(
-    config: &crate::config::AssayConfig,
-    cli_ignores: &[String],
-    ecosystem_name: &str,
-) -> Vec<String> {
-    let mut out: Vec<String> = match ecosystem_name {
-        "cargo" => config.ecosystems.cargo.ignore.clone(),
-        "github-actions" => config.ecosystems.github_actions.ignore.clone(),
-        // npm/yarn1/pnpm aren't represented in the .assay.toml today;
-        // a future config rev can add an `npm` section. For now return
-        // an empty list (no ignores), matching the no-config default.
-        _ => Vec::new(),
-    };
-    for entry in cli_ignores {
-        if let Some((eco, subject)) = parse_cli_ignore(entry)
-            && eco == ecosystem_name
-            && !out.iter().any(|s| s == subject)
-        {
-            out.push(subject.to_string());
-        }
-    }
-    out
-}
-
-/// Parse a `--ignore <eco>:<subject>` argument into its two halves.
-/// Returns `None` for malformed input (no colon, empty halves), which
-/// the caller silently drops — clap's value parsing handled the
-/// repeat-and-collect, and a typo'd entry shouldn't crash the run.
-fn parse_cli_ignore(raw: &str) -> Option<(&str, &str)> {
-    let (eco, subject) = raw.split_once(':')?;
-    let eco = eco.trim();
-    let subject = subject.trim();
-    if eco.is_empty() || subject.is_empty() {
-        return None;
-    }
-    Some((eco, subject))
-}
-
-fn ecosystem_enabled(args: &AnalyzeArgs, ecosystem: &dyn DependencyEcosystem) -> bool {
-    let Some(selector) = args.ecosystem else {
-        return true;
-    };
-    matches!(
-        (selector, ecosystem.name()),
-        (EcosystemSelector::All, _)
-            | (EcosystemSelector::Cargo, "cargo")
-            | (EcosystemSelector::GithubActions, "github-actions")
-            | (EcosystemSelector::Npm, "npm")
-    )
-}
-
-fn report_text(name: &str, scan_root_rel: Option<&Path>, manifests: &[Manifest]) {
-    // Suppress (ecosystem, scan_root) pairs with no manifests — they're
-    // dominant in multi-root layouts (cargo in `ui`, npm in `src-tauri`,
-    // etc.) and add noise without signal.
-    if manifests.is_empty() {
-        return;
-    }
-    match scan_root_rel {
-        Some(rel) if !rel.as_os_str().is_empty() => {
-            println!(
-                "[{name}] {}: {} manifest(s)",
-                rel.display(),
-                manifests.len()
-            );
-        }
-        _ => println!("[{name}] manifests detected: {}", manifests.len()),
-    }
-    for manifest in manifests {
-        println!("  - {}", manifest.path.display());
-    }
-    if let Some(warning) = missing_cargo_lock_warning(name, manifests) {
-        eprintln!("{warning}");
-    }
-}
-
-/// Build the warning text shown when a Cargo workspace has `Cargo.toml`
-/// but no `Cargo.lock`. Returns `None` when no warning is warranted.
-///
-/// The proposer compares the committed lockfile against the registry to
-/// find available bumps — without one it cannot find any, and the run
-/// silently reports "0 proposals." That mode of failure misleads the
-/// user into thinking nothing needs upgrading; in reality the analyzer
-/// just had no anchor to compare against. Library crates routinely
-/// don't commit `Cargo.lock`, so this case is common in OSS targets.
-fn missing_cargo_lock_warning(name: &str, manifests: &[Manifest]) -> Option<String> {
-    if name != "cargo" {
-        return None;
-    }
-    let has_toml = manifests
-        .iter()
-        .any(|m| matches!(m.kind, ManifestKind::CargoToml));
-    let has_lock = manifests
-        .iter()
-        .any(|m| matches!(m.kind, ManifestKind::CargoLock));
-    if has_toml && !has_lock {
-        Some(
-            "[cargo] warning: Cargo.lock not found — assay needs a lockfile to detect upgrades. \
-             Run `cargo generate-lockfile` once to materialize one (library crates typically \
-             don't commit Cargo.lock; the file you generate stays untracked)."
-                .to_string(),
-        )
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 mod tests {
