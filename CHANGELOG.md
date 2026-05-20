@@ -2,6 +2,21 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-05-20
+
+Yarn berry (yarn 2+) PnP support for peer-dependency cross-reference. Closes the v1.1 dogfood gap: monorepos using yarn berry's Plug'n'Play resolution were invisible to the consumer-search step because PnP doesn't materialize `node_modules/`.
+
+### Added
+
+- **Yarn berry `.yarn/unplugged/` walker.** Walks `.yarn/unplugged/<pkg>-npm-<ver>-<hash>/node_modules/<pkg>/package.json` (the subset yarn has unzipped for install-script or native-binding reasons). Layout mirrors pnpm's virtual store, so the same `walk_flat_node_modules` reusable walker handles it.
+- **Yarn berry `.pnp.data.json` parser.** Reads yarn's structured PnP runtime data and checks each registry entry's `packagePeers` array — yarn's authoritative list of peer-dep subjects for that resolution. Catches every registered package, not just the unplugged subset (the zipped-only deps in `.yarn/cache/` are visible through this path even in zero-installs setups). Best-effort: missing, unreadable, or malformed PnP data contributes no entries, never crashes the proposer.
+- Skip-self-consumption defensive check (a registry entry's own name is never reported as a peer-dep consumer of itself).
+
+### Internal
+
+- 5 new tests covering yarn berry unplugged walk (1), PnP data JSON parse (1), self-consumption guard (1), malformed-input robustness (1), and union-with-dedupe across unplugged + PnP data paths (1). Test count: 677 (up from 672).
+- `find_peer_dep_consumers` now handles four layouts: npm/yarn1 flat, pnpm virtual store, yarn berry unplugged, yarn berry PnP data.
+
 ## [1.1.0] — 2026-05-20
 
 Three additive features that close the cohort + monorepo gaps surfaced by the 1.0 dogfood tour. All changes are minor-version-safe under the 1.0 stability promise.
