@@ -2,6 +2,27 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-05-20
+
+Cargo workspace cohort awareness — the Cargo analog of the npm cohort work shipped in 1.1.0. Crate families that MUST move together (`tokio` + `tokio-util`, `serde` + `serde_derive`, `tracing` + `tracing-core` + `tracing-subscriber`, `tauri` + `tauri-build` + `tauri-plugin-*`, `prost` family, `tonic` family, `axum` family, `hyper` family, `tower` family, `clap` family, `reqwest` + `reqwest-middleware`, `bevy_*`) now apply + validate + bisect atomically — partial cohort applies (e.g. `tokio@1.45` without `tokio-util` paired to that major+minor) are eliminated.
+
+### Added
+
+- **`ecosystem::cargo_cohorts` module** with 12 hardcoded cargo cohort definitions covering tokio, serde, tracing, clap, axum, tower, prost, hyper, tonic, reqwest, tauri, and bevy families.
+- **`tag_proposals_with_cargo_cohorts`** in `ecosystem::cargo` hooks the registry into the cargo proposer pipeline. Pure annotation pass; ecosystem-agnostic widening then runs.
+- **`ecosystem::cohort_pipeline`** is a new shared (`pub(crate)`) module that hosts `widen_cohort_tiers` + `tier_severity`. Both ecosystems now use the same widening logic, keeping cohort behavior consistent across cargo + npm.
+
+### Internal
+
+- 12 new tests in `cargo_cohorts` (exact + prefix matches, lookalike guards, duplicate-id + non-empty registry invariants). Test count: 689 (up from 677).
+- `widen_cohort_tiers` moved out of `ecosystem::npm` into the shared `cohort_pipeline` module; npm.rs re-exports the symbol so existing callers don't break.
+
+### Live dogfood (mortar src-tauri)
+
+- **tauri cohort**: 3 packages collapsed (`tauri`, `tauri-build`, `tauri-plugin-dialog`) under one Compatible-tier header.
+- **prost cohort**: 3 packages collapsed (`prost`, `prost-reflect`, `prost-types`) under one Breaking-tier header.
+- **reqwest cohort with tier widening**: the second `reqwest` entry (at a different version) shows `[cohort-lockstep: widened from compatible to breaking to match reqwest (lockstep with 2 members)]` — the lockstep widening rule firing on real data.
+
 ## [1.2.0] — 2026-05-20
 
 Yarn berry (yarn 2+) PnP support for peer-dependency cross-reference. Closes the v1.1 dogfood gap: monorepos using yarn berry's Plug'n'Play resolution were invisible to the consumer-search step because PnP doesn't materialize `node_modules/`.
