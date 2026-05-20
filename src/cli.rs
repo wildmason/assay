@@ -256,8 +256,30 @@ pub enum ExecutorChoice {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
+    /// Human-readable text. Default. Per-tier sections, cohort headers,
+    /// red proposal details, verdict cache summary — designed for a
+    /// terminal reader.
     Text,
+    /// Single JSON document emitted at end of run, mirroring
+    /// `.assay/runs/<id>/run.json` with a `receipt_path` sibling.
+    /// One valid JSON object per invocation; `JSON.parse(stdout)`
+    /// succeeds. Suitable for scripted consumers that want the full
+    /// receipt without re-reading the on-disk artifact.
     Json,
+    /// Newline-delimited JSON event stream emitted in real time as
+    /// the run progresses. One JSON object per line; each has a
+    /// `type` discriminator. Events: `run_started`,
+    /// `proposal_discovered`, `cohort_grouped`, `proposal_validating`,
+    /// `proposal_completed`, `cohort_validating`, `cohort_completed`,
+    /// `run_completed`. Suppresses all text output (no per-tier
+    /// section, no human summary) so the stream is parseable
+    /// without prefixes. Stable schema under the 1.0 promise:
+    /// new event types and fields are additive minor changes;
+    /// existing types and required fields don't change shape
+    /// within a major version. Designed for GUIs (e.g. assay-gui)
+    /// and live-progress sidecars that want to update UI state as
+    /// each proposal flows through the worker pool.
+    Ndjson,
 }
 
 /// Parse a vector of CLI arguments without running anything. Exposed for tests.
@@ -580,6 +602,29 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         }
     }
 
+    // Build the event sink up-front so RunStarted can fire before
+    // the worker pool spins. The sink is a no-op for Text/Json
+    // formats, so pipeline code can always call emit() without
+    // branching on output format.
+    let ndjson_sink = crate::events::NdjsonStdoutSink::new();
+    let noop_sink = crate::events::NoopEventSink;
+    let event_sink_ref: &dyn crate::events::EventSink =
+        if matches!(args.format, OutputFormat::Ndjson) {
+            &ndjson_sink
+        } else {
+            &noop_sink
+        };
+    if matches!(args.format, OutputFormat::Ndjson) {
+        emit_run_started_event(
+            event_sink_ref,
+            &run_id,
+            &started_at,
+            &args,
+            &registry,
+            &all_proposals,
+        );
+    }
+
     let mut proposals_passed = 0usize;
     let mut proposals_failed = 0usize;
     let mut pre_validation_failure_rows: Vec<PreValidationFailureRow> = Vec::new();
@@ -625,6 +670,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             semaphores,
             git_mutex: &git_mutex,
             member_gate: args.member_gate,
+            event_sink: event_sink_ref,
         };
 
         let validator_ref = &validator;
@@ -824,6 +870,20 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         provenance,
     };
     let run_json_path = write_run_receipt(&args.repo, &receipt)?;
+
+    if matches!(args.format, OutputFormat::Ndjson) {
+        event_sink_ref.emit(crate::events::Event::RunCompleted {
+            summary: crate::events::EventSummary {
+                proposals_total: receipt.summary.proposals_total,
+                proposals_passed: receipt.summary.proposals_passed,
+                proposals_failed: receipt.summary.proposals_failed,
+                proposals_unvalidated: receipt.summary.proposals_unvalidated,
+                proposals_shipped: receipt.summary.proposals_shipped,
+            },
+            run_json_path: run_json_path.display().to_string(),
+            finished_at: receipt.finished_at.clone(),
+        });
+    }
 
     if matches!(args.format, OutputFormat::Json) {
         // Single end-of-run JSON document. Mirrors the on-disk
@@ -1427,6 +1487,31 @@ fn process_proposal_unit(
 ) -> WorkerOutcome {
     let mut records: Vec<ProvenanceRecord> = Vec::new();
     let ecosystem = registry[unit.eco_idx].as_ref();
+    // Emit the work-starting event so the GUI flips the row(s)
+    // from `pending` to `in_progress`. Cohort lockstep groups
+    // emit `CohortValidating` with the full member list; single-
+    // proposal units emit `ProposalValidating`. The `Completed`
+    // counterpart fires at the bottom of this function with
+    // duration_ms so the GUI can render elapsed times.
+    let worker_started = std::time::Instant::now();
+    if unit.lockstep_members.is_empty() {
+        ctx.event_sink
+            .emit(crate::events::Event::ProposalValidating {
+                id: unit.proposal.id.clone(),
+                subject: unit.proposal.subject.clone(),
+            });
+    } else {
+        let cohort_id = unit.proposal.cohort.clone().unwrap_or_default();
+        let display = cohort_display_name(&cohort_id);
+        let member_ids: Vec<String> = std::iter::once(unit.proposal.id.clone())
+            .chain(unit.lockstep_members.iter().map(|p| p.id.clone()))
+            .collect();
+        ctx.event_sink.emit(crate::events::Event::CohortValidating {
+            cohort: cohort_id,
+            display,
+            member_ids,
+        });
+    }
 
     // Conc-2: `git worktree add` is serialized across workers to avoid
     // .git/index.lock races. The sandbox is set up against the unit's
@@ -1625,7 +1710,15 @@ fn process_proposal_unit(
         artifact_path: None,
         details: serde_json::to_value(&outcome).ok(),
     });
+    let duration_ms = u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if unit.lockstep_members.is_empty() {
+        ctx.event_sink
+            .emit(crate::events::Event::ProposalCompleted {
+                id: unit.proposal.id.clone(),
+                subject: unit.proposal.subject.clone(),
+                conclusion: outcome.conclusion.clone(),
+                duration_ms,
+            });
         WorkerOutcome::Completed {
             eco_idx: unit.eco_idx,
             proposal: unit.proposal,
@@ -1642,6 +1735,14 @@ fn process_proposal_unit(
         let mut members: Vec<Proposal> = Vec::with_capacity(1 + unit.lockstep_members.len());
         members.push(unit.proposal);
         members.extend(unit.lockstep_members);
+        let cohort_id = members[0].cohort.clone().unwrap_or_default();
+        let member_ids: Vec<String> = members.iter().map(|p| p.id.clone()).collect();
+        ctx.event_sink.emit(crate::events::Event::CohortCompleted {
+            cohort: cohort_id,
+            conclusion: outcome.conclusion.clone(),
+            member_ids,
+            duration_ms,
+        });
         WorkerOutcome::CohortCompleted {
             eco_idx: unit.eco_idx,
             members,
@@ -1651,6 +1752,106 @@ fn process_proposal_unit(
             scan_root,
         }
     }
+}
+
+/// Map a cohort id to its display name by consulting both ecosystem
+/// cohort registries. Returns the id itself when not found (rare —
+/// only happens if someone constructs a proposal with a cohort id
+/// outside the known registry). The dual-registry lookup is fine
+/// because cohort ids are namespaced by ecosystem-flavor convention
+/// (npm uses `@scope`-style/`-framework` suffixes; cargo uses bare
+/// crate-family names) and don't collide in practice.
+/// Emit the `RunStarted` NDJSON event with the full proposal
+/// inventory + cohort groupings. The GUI uses this to render the
+/// pending list before any validation begins, including the visual
+/// affordance grouping cohort members under one container. Called
+/// only when `args.format == Ndjson`; otherwise the sink would be
+/// a no-op anyway, but skipping the construction avoids the
+/// per-proposal cloning when the data is destined for `/dev/null`.
+fn emit_run_started_event(
+    sink: &dyn crate::events::EventSink,
+    run_id: &str,
+    started_at: &str,
+    args: &AnalyzeArgs,
+    registry: &[Box<dyn DependencyEcosystem>],
+    all_proposals: &[(usize, std::path::PathBuf, Proposal)],
+) {
+    use std::collections::BTreeMap;
+
+    let ecosystems: Vec<String> = registry
+        .iter()
+        .filter(|eco| ecosystem_enabled(args, eco.as_ref()))
+        .map(|eco| eco.name().to_string())
+        .collect();
+
+    let proposals: Vec<crate::events::EventProposal> = all_proposals
+        .iter()
+        .map(|(_, _, p)| crate::events::EventProposal {
+            id: p.id.clone(),
+            subject: p.subject.clone(),
+            from: p.from.clone(),
+            to: p.to.clone(),
+            tier: p.bump_tier.as_str().to_string(),
+            ecosystem: p.ecosystem.clone(),
+            cohort: p.cohort.clone(),
+        })
+        .collect();
+
+    // Cohort groupings: bucket proposals by cohort id, keep only
+    // multi-member buckets (singleton-cohort proposals don't form
+    // a lockstep unit).
+    let mut by_cohort: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (_, _, p) in all_proposals {
+        if let Some(c) = p.cohort.as_deref() {
+            by_cohort
+                .entry(c.to_string())
+                .or_default()
+                .push(p.id.clone());
+        }
+    }
+    let cohorts: Vec<crate::events::EventCohort> = by_cohort
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .map(|(id, member_ids)| crate::events::EventCohort {
+            display: cohort_display_name(&id),
+            id,
+            member_ids,
+        })
+        .collect();
+
+    let repository = args
+        .repo
+        .canonicalize()
+        .map(strip_extended_length_prefix)
+        .map(forward_slash_path)
+        .unwrap_or_else(|_| args.repo.clone())
+        .display()
+        .to_string();
+
+    sink.emit(crate::events::Event::RunStarted {
+        run_id: run_id.to_string(),
+        started_at: started_at.to_string(),
+        repository,
+        ecosystems,
+        proposals,
+        cohorts,
+    });
+}
+
+fn cohort_display_name(cohort_id: &str) -> String {
+    if let Some(c) = crate::ecosystem::npm_cohorts::KNOWN_COHORTS
+        .iter()
+        .find(|c| c.id == cohort_id)
+    {
+        return c.display.to_string();
+    }
+    if let Some(c) = crate::ecosystem::cargo_cohorts::KNOWN_COHORTS
+        .iter()
+        .find(|c| c.id == cohort_id)
+    {
+        return c.display.to_string();
+    }
+    cohort_id.to_string()
 }
 
 /// One proposal's full lifecycle through the apply-local pipeline:

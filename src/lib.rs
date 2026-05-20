@@ -53,6 +53,7 @@ pub mod cli;
 pub mod config;
 pub mod ecosystem;
 pub mod error;
+pub mod events;
 #[doc(hidden)]
 pub mod external_deps;
 #[doc(hidden)]

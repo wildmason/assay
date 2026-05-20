@@ -193,6 +193,14 @@ pub struct WorkerContext<'a> {
     /// member precision before invoking the validator (`--member-gate`
     /// CLI flag).
     pub member_gate: bool,
+    /// Event sink for real-time progress notifications. Workers
+    /// emit `ProposalValidating` + `ProposalCompleted` (or
+    /// `CohortValidating` + `CohortCompleted` for cohort lockstep
+    /// units) at the boundaries of their work. The default
+    /// `NoopEventSink` drops events when the user didn't request
+    /// `--format ndjson`. Borrowed for the worker scope; the sink
+    /// must be `Send + Sync`.
+    pub event_sink: &'a (dyn crate::events::EventSink + 'a),
 }
 
 #[cfg(test)]
@@ -282,6 +290,7 @@ mod tests {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
             member_gate: false,
+            event_sink: &crate::events::NoopEventSink,
         };
         let pool = WorkerPool {
             threads: 4,
@@ -308,6 +317,7 @@ mod tests {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
             member_gate: false,
+            event_sink: &crate::events::NoopEventSink,
         };
         let pool = WorkerPool {
             threads: 8,
@@ -327,6 +337,7 @@ mod tests {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
             member_gate: false,
+            event_sink: &crate::events::NoopEventSink,
         };
         let pool = WorkerPool {
             threads: 1,
@@ -353,6 +364,7 @@ mod tests {
             semaphores: vec![],
             git_mutex: &Mutex::new(()),
             member_gate: false,
+            event_sink: &crate::events::NoopEventSink,
         };
         let pool = WorkerPool {
             threads: 4,
@@ -377,6 +389,7 @@ mod tests {
             semaphores: vec![("cargo", cargo_sem.clone())],
             git_mutex: &Mutex::new(()),
             member_gate: false,
+            event_sink: &crate::events::NoopEventSink,
         };
         let pool = WorkerPool {
             threads: 4,
@@ -419,6 +432,7 @@ mod tests {
             semaphores: vec![("cargo", cargo_sem.clone())],
             git_mutex: &Mutex::new(()),
             member_gate: false,
+            event_sink: &crate::events::NoopEventSink,
         };
         let pool = WorkerPool {
             threads: 4,
