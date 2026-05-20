@@ -32,7 +32,11 @@ jobs:
         shell: bash
         run: |
           tag="${GITHUB_REF#refs/tags/v}"
-          manifest=$(cargo pkgid | sed 's/.*#//')
+          # `cargo pkgid` shape varies:
+          #   - bare crate: `path+file:///...#0.2.0`
+          #   - renamed crate: `path+file:///...#dep-assay@0.2.0`
+          # Strip everything up to AND including the last `#` or `@`.
+          manifest=$(cargo pkgid | sed -E 's/^.*[#@]//')
           echo "tag: $tag"
           echo "manifest version: $manifest"
           if [ "$tag" != "$manifest" ]; then
