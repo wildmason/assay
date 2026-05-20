@@ -2,6 +2,34 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-05-20
+
+Internal refactor: break up the godfiles. No behavior changes; no public-API changes; identical CLI surface, receipt schema, and event stream. 693 tests still pass; clippy still clean under `-D warnings`.
+
+### Internal
+
+- **`cli.rs` (7484 lines) → `cli/` module tree** with 14 focused submodules organized by concern:
+  - `cli/args.rs` — clap-derived flag types (`Cli`, `AnalyzeArgs`, `EcosystemSelector`, `ExecutorChoice`, `OutputFormat`, `ApplyMode`)
+  - `cli/time_utils.rs` — ISO 8601 + run-id helpers, chrono-free
+  - `cli/paths.rs` — path-shape helpers (extended-length prefix strip, forward-slash normalize, relative-prefix, same-path, enclosing git root)
+  - `cli/polyglot.rs` — auto-detection of polyglot/monorepo scan roots
+  - `cli/git_ops.rs` — git plumbing for the apply pipelines + worktree prep
+  - `cli/run_state.rs` — cross-module data types (`WorkUnit`, `WorkerOutcome`, `ProposalRun`, `PreValidationFailureRow`, `CommitSummary`, `MergedDropInfo`, `ApplyPrSummary`)
+  - `cli/reporting.rs` — text-mode rendering (`tier_counts`, `print_discovered_section` + cohort/single helpers, `format_*`, `aggregate_*`, `format_red_proposal_section`, `ship_counts`)
+  - `cli/apply_local.rs` — `perform_apply_local_commit` + `build_commit_body` + `build_ship_plan_from_runs` (shared with apply_pr)
+  - `cli/apply_pr.rs` — `perform_apply_pr` + all its preflight / label / reviewer / branch-name / `PartialApplyState` RAII helpers
+  - `cli/project_scope.rs` — `ProjectScope` + `resolve` decision rule, `capture_run_context`, `infer_project_scope_from_manifest`
+  - `cli/config_resolve.rs` — validator construction, `parse_cache_ttl` (still publicly re-exported), workflow filter, explanation injection, ignore-list merging, ecosystem enablement, zero-manifest hints
+  - `cli/text_report.rs` — per-ecosystem `[<eco>] manifests detected: N` breadcrumb + `Cargo.lock`-missing warning
+  - `cli/work_unit.rs` — `build_work_units` cohort-aware bucketing, `process_proposal_unit` worker body, `emit_run_started_event` NDJSON event, `cohort_display_name`
+  - `cli/mod.rs` — orchestrator only: `run` / `dispatch` / `parse_cli` + `analyze_command` driver + the test module
+- **`ecosystem/npm.rs` (4120 lines) → `ecosystem/npm/` module tree** — started:
+  - `ecosystem/npm/peer_walk.rs` — peer-dependency walker across four install layouts (flat `node_modules`, pnpm virtual store, yarn berry unplugged, yarn berry `.pnp.data.json`)
+
+### Why
+
+A 7484-line file is hard to load into LLM context and friction-y for humans navigating it. The new layout means a change to (say) the `--apply-pr` preflight checks lives in one ~700-line file with focused tests, not buried among 3000 lines of unrelated orchestration. Public stability promise is preserved via re-exports at `cli/mod.rs` (`Cli`, `Command`, `AnalyzeArgs`, `parse_cli`, `run`, `parse_cache_ttl`).
+
 ## [1.4.0] — 2026-05-20
 
 NDJSON streaming events for real-time GUI consumption. The new `--format ndjson` output mode emits one JSON object per line as the run progresses, designed for a Tauri-based progress GUI (`assay-gui`, separate repo) and other live-progress sidecars that update UI state as proposals flow through the worker pool.
