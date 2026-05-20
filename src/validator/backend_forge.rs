@@ -11,6 +11,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::failure_parser::{EcosystemHint, parse as parse_failure};
 use crate::process_runner::{RunResult, run_with_timeout};
 
 use super::{
@@ -77,6 +78,14 @@ impl ForgeRunBackend {
                 )
             }
         };
+        // ForgeRunBackend doesn't know whether the workflow it ran
+        // was cargo or npm — `forge run`'s sandbox executes whatever
+        // the workflow steps say. Use the Auto hint to try cargo
+        // first, then npm, then fall back to generic.
+        let failure_context = match &result {
+            WorkflowResult::Pass => None,
+            WorkflowResult::Fail(_) => Some(parse_failure(&stderr_tail, EcosystemHint::Auto)),
+        };
         WorkflowOutcome {
             workflow: workflow.to_path_buf(),
             backend: self.name(),
@@ -86,6 +95,7 @@ impl ForgeRunBackend {
             stderr_tail,
             log_path: log_path.to_path_buf(),
             cached_at_unix_secs: None,
+            failure_context,
         }
     }
 }
@@ -134,16 +144,21 @@ impl ValidatorBackend for ForgeRunBackend {
                 duration.as_millis(),
                 log_path,
             )),
-            RunResult::TimedOut { duration, .. } => Ok(WorkflowOutcome {
-                workflow: workflow.to_path_buf(),
-                backend: self.name(),
-                result: WorkflowResult::Fail(FailureFlavor::Timeout),
-                forge_run_id: None,
-                duration_ms: duration.as_millis(),
-                stderr_tail: stderr_tail(&stderr, 4096),
-                log_path: log_path.to_path_buf(),
-                cached_at_unix_secs: None,
-            }),
+            RunResult::TimedOut { duration, .. } => {
+                let stderr_tail_str = stderr_tail(&stderr, 4096);
+                let failure_context = Some(parse_failure(&stderr_tail_str, EcosystemHint::Auto));
+                Ok(WorkflowOutcome {
+                    workflow: workflow.to_path_buf(),
+                    backend: self.name(),
+                    result: WorkflowResult::Fail(FailureFlavor::Timeout),
+                    forge_run_id: None,
+                    duration_ms: duration.as_millis(),
+                    stderr_tail: stderr_tail_str,
+                    log_path: log_path.to_path_buf(),
+                    cached_at_unix_secs: None,
+                    failure_context,
+                })
+            }
         }
     }
 }

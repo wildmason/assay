@@ -229,6 +229,13 @@ pub struct FailureDetail {
     pub stderr_tail: String,
     /// Subprocess wall-clock duration in milliseconds.
     pub duration_ms: u128,
+    /// Structured failure context extracted from `stderr_tail`. Shipped
+    /// in 1.6.0 — receipts written by earlier versions don't carry this
+    /// field, so `#[serde(default)]` keeps them parseable. Always
+    /// `Some(_)` for receipts written by 1.6.0+ (even unparseable
+    /// stderr produces a `rule:"generic:unstructured"` context).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_context: Option<crate::failure_context::FailureContext>,
 }
 
 /// Outcome of validating a proposal by running its affected workflows.

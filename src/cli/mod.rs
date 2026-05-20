@@ -50,8 +50,9 @@ use git_ops::{partition_stageable_paths, porcelain_line_is_assay_artifact};
 use paths::{forward_slash_path, relative_prefix, strip_extended_length_prefix};
 use project_scope::{ProjectScope, capture_run_context};
 use reporting::{
-    aggregate_cache_counts, aggregate_member_skipped_count, format_red_proposal_section,
-    print_discovered_section, ship_counts, tier_counts,
+    aggregate_cache_counts, aggregate_member_skipped_count, build_failure_clusters,
+    format_failure_clusters_section, format_red_proposal_section, print_discovered_section,
+    ship_counts, tier_counts,
 };
 #[cfg(test)]
 use reporting::format_consumers_suffix;
@@ -656,6 +657,12 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     };
     let run_json_path = write_run_receipt(&args.repo, &receipt)?;
 
+    // Compute root-cause clusters across the failed proposals so the
+    // NDJSON `run_completed` event and the text report can both
+    // surface "N proposals share this failure". cluster_failures
+    // drops singletons by design.
+    let failure_clusters = build_failure_clusters(&completed_runs);
+
     if matches!(args.format, OutputFormat::Ndjson) {
         event_sink_ref.emit(crate::events::Event::RunCompleted {
             summary: crate::events::EventSummary {
@@ -667,6 +674,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             },
             run_json_path: run_json_path.display().to_string(),
             finished_at: receipt.finished_at.clone(),
+            failure_clusters: failure_clusters.clone(),
         });
     }
 
@@ -768,6 +776,12 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 format_red_proposal_section(&completed_runs, &pre_validation_failure_rows)
             {
                 print!("{red_section}");
+            }
+            // 1.6.0: surface root-cause clusters at the end of the
+            // run when two or more proposals failed for the same
+            // reason. Singletons are excluded by `cluster_failures`.
+            if let Some(cluster_section) = format_failure_clusters_section(&failure_clusters) {
+                print!("{cluster_section}");
             }
         }
         if matches!(mode, ApplyMode::Validate) && !all_proposals.is_empty() {
@@ -944,6 +958,10 @@ mod tests {
                     flavor: flavor.into(),
                     stderr_tail: stderr.into(),
                     duration_ms: 1234,
+                    failure_context: Some(crate::failure_parser::parse(
+                        stderr,
+                        crate::failure_parser::EcosystemHint::Auto,
+                    )),
                 }],
                 cached_workflow_count: 0,
                 total_workflow_count: 1,
@@ -1654,6 +1672,54 @@ mod tests {
     }
 
     #[test]
+    fn build_failure_clusters_groups_runs_with_shared_root_cause() {
+        // Two proposals failing with the same rustc error → one
+        // cluster covering both. A third proposal failing for a
+        // distinct reason stays out (singletons dropped).
+        let shared_stderr =
+            "error[E0277]: the trait `Foo` is not implemented\n  --> src/a.rs:1:1\n";
+        let runs = vec![
+            red_run("p-a", "x", "1.0", "2.0", "REGRESSION", shared_stderr),
+            red_run("p-b", "y", "1.0", "2.0", "REGRESSION", shared_stderr),
+            red_run(
+                "p-c",
+                "z",
+                "1.0",
+                "2.0",
+                "REGRESSION",
+                "error[E0308]: mismatched types\n  --> src/c.rs:99:1\n",
+            ),
+        ];
+        let clusters = build_failure_clusters(&runs);
+        assert_eq!(clusters.len(), 1, "expected one cluster; got {clusters:?}");
+        assert_eq!(clusters[0].proposal_ids, vec!["p-a", "p-b"]);
+    }
+
+    #[test]
+    fn build_failure_clusters_returns_empty_when_no_shared_failures() {
+        // Three distinct failures → no clusters (singletons dropped).
+        let runs = vec![
+            red_run("p-a", "x", "1", "2", "REGRESSION", "error[E0277]: a"),
+            red_run("p-b", "y", "1", "2", "REGRESSION", "error[E0308]: b"),
+            red_run("p-c", "z", "1", "2", "REGRESSION", "error[E0599]: c"),
+        ];
+        let clusters = build_failure_clusters(&runs);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn build_failure_clusters_skips_passing_and_unvalidated_runs() {
+        let runs = vec![
+            green_run("p-green-1"),
+            green_run("p-green-2"),
+            red_run("p-red", "x", "1", "2", "REGRESSION", "error[E0277]: alone"),
+        ];
+        let clusters = build_failure_clusters(&runs);
+        // One red, no shared fingerprints → no clusters.
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
     fn red_section_renders_validation_failure_with_flavor_and_stderr() {
         let runs = vec![red_run(
             "cargo-sha2-0-11-0",
@@ -1667,8 +1733,17 @@ mod tests {
         let out = format_red_proposal_section(&runs, &pre_val).expect("non-empty");
         assert!(out.contains("red proposals (1)"));
         assert!(out.contains("cargo-sha2-0-11-0 sha2 0.10.9 → 0.11.0 [REGRESSION]"));
-        assert!(out.contains("last stderr (custom):"));
+        // 1.6.0: raw stderr lives under "raw log (...)" — the
+        // structured failure context renders above it. The E0599
+        // code shows up in both renderings.
+        assert!(out.contains("raw log (custom):"));
         assert!(out.contains("E0599"));
+        // The structured context line lifts the rule name +
+        // summary so the operator sees the parsed error inline.
+        assert!(
+            out.contains("[cargo:rustc-error]"),
+            "expected structured rule line; got: {out}"
+        );
     }
 
     #[test]

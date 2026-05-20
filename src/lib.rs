@@ -54,6 +54,9 @@ pub mod config;
 pub mod ecosystem;
 pub mod error;
 pub mod events;
+pub mod failure_context;
+#[doc(hidden)]
+pub mod failure_parser;
 #[doc(hidden)]
 pub mod external_deps;
 #[doc(hidden)]
@@ -83,6 +86,7 @@ pub use ecosystem::{
     github_actions::GitHubActionsEcosystem,
 };
 pub use error::{Error, Result};
+pub use failure_context::{FailureCluster, FailureContext, FailureFinding, cluster_failures};
 pub use model::{
     AssayRunReceipt, Classification, Manifest, ManifestKind, Proposal, ProposalKind,
     ValidationOutcome,

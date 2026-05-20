@@ -2,6 +2,52 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] — 2026-05-20
+
+Structured failure-context extraction. When a validator gate fails (e.g. `cargo test` errors after a sandboxed bump), the text report used to dump a raw 4 KB `stderr_tail` and the operator had to read that to figure out what broke. 1.6.0 parses that tail into a structured `FailureContext` with the canonical rule, summary, and per-error findings — so the operator sees `error[E0277]: trait Send is not implemented for SerdeBar at src/lib.rs:42` inline, plus a "N proposals share this root cause" grouping when multiple proposals fail for the same reason. The `assay-gui` front-end is being built against the new schema in parallel.
+
+### Added
+
+- **`FailureContext` + `FailureFinding` + `FailureCluster` types** in the new public `failure_context` module. `FailureContext` carries `rule` (e.g. `"cargo:rustc-error"`, `"npm:eresolve"`), `summary`, `findings: Vec<FailureFinding>`, and a `fingerprint` (SHA-256 truncated to 16 lowercase hex chars over the canonicalized sorted-findings JSON). Re-exported at the crate root.
+- **Per-ecosystem parsers in the new `failure_parser` module:**
+  - `cargo.rs` — handles rustc canonical (`error[E####]: msg` + `--> file:line:col`), build-script failures (`failed to run custom build command for ...`), linker errors (`linking with ... failed: exit code: N`), `could not compile ...` synthesis, and bare `error: ...` lines. Linker errors take precedence when both rustc and linker errors appear in the same log.
+  - `npm.rs` — handles ERESOLVE blocks (multi-line, synthesizes `Found: X — Could not resolve: Y`), `peer dep missing: X, required by Y`, tsc modern (`path:line:col - error TS####: msg`), tsc legacy (`path(line,col): error TS####: msg`), and bare `npm ERR! ...` lines. `npm WARN ERESOLVE` is explicitly skipped (it's a warning, not an error).
+  - `generic.rs` — fallback for unparseable stderr: `rule:"generic:unstructured"`, first non-empty line as summary, empty findings, stable empty-hash fingerprint so unstructured failures still cluster together rather than each being a singleton.
+- **`cluster_failures` grouper** that groups proposals by shared fingerprint, drops singletons (a cluster of one isn't a cluster), and returns clusters sorted deterministically by the lex-smallest member id.
+- **`WorkflowOutcome.failure_context: Option<FailureContext>`** populated by every backend on every Fail variant (Regression, SetupFailure, Timeout). The Pass case keeps `None`. Threaded through `BuildTestBackend`, `CustomBackend`, and `ForgeRunBackend`; the build-test and custom backends pass an ecosystem hint derived from their argv (`cargo` → Cargo, `npm`/`pnpm`/`yarn`/`tsc` → Npm), while forge-run uses Auto.
+- **`FailureDetail.failure_context: Option<FailureContext>`** on the receipt. Marked `#[serde(default, skip_serializing_if = "Option::is_none")]` so receipts written by 1.5.0 and earlier still deserialize cleanly.
+- **NDJSON event additions (additive per the 1.0 stability promise):**
+  - `proposal_completed.failure_context: Option<FailureContext>` — populated on every `failure` conclusion, elided on `success` / `unvalidated`.
+  - `run_completed.failure_clusters: Vec<FailureCluster>` — empty (and elided from the wire format) when no two proposals share a fingerprint.
+- **Text report rewrite under each red proposal:**
+  - Structured line: `[<rule>] <summary>` (e.g. `[cargo:rustc-error] E0277: trait not impl at src/lib.rs:42`).
+  - Per-finding line: `- <code> <message> at <file>:<line>:<col>` (omitted fields skipped).
+  - `raw log (<backend>):` appendix below, indented further — the original `stderr_tail` lines preserved so the operator can audit when the parser missed something.
+- **New "Root-cause clusters" section** at the end of the run when any cluster has more than one member: `cluster <fingerprint> (<rule>): N proposals share this failure / representative finding: ... / proposal ids: ...`. Singletons stay out.
+- **Cached-failure rehydration** re-parses the cached `stderr_tail` to produce a `FailureContext` on the fly. The on-disk verdict-cache schema is intentionally NOT bumped — re-parsing is cheap, deterministic, and avoids invalidating every existing cache entry on upgrade.
+
+### Tests
+
+- **+45 new tests** (712 → 757). New coverage:
+  - 8 tests on `failure_context` (fingerprint determinism, finding-order independence, content sensitivity, empty-findings stability, serde round-trip, cluster grouping with shared/distinct fingerprints, singleton dropping, deterministic ordering).
+  - 8 tests on `failure_parser::cargo` (canonical rustc error with location, multiple errors → multi-finding, missing `-->` location, build-script failure, linker error with exit code, linker precedence over rustc, `could not compile` synthesis, bare `error:`, unparseable returns None).
+  - 9 tests on `failure_parser::npm` (canonical ERESOLVE block, `npm WARN ERESOLVE` skipped, multi-block ERESOLVE, peer-dep missing, tsc modern + legacy, multi-finding tsc, bare `npm ERR!`, unparseable returns None).
+  - 3 tests on `failure_parser::generic` (first-nonempty-line summary, empty stderr, all-whitespace stderr).
+  - 3 tests on the parser entry point (Auto falls through to generic, Auto prefers cargo when both match, `hint_from_command` recognizes the standard binaries).
+  - 4 tests on event wire-format (proposal_completed round-trips with failure_context, omits the field when None, run_completed carries clusters, elides empty cluster vec).
+  - 3 tests on `format_failure_clusters_section` (none when empty, renders count/ids, multiple clusters).
+  - 3 tests on `build_failure_clusters` (groups shared root causes, returns empty when no singletons share, skips passing/unvalidated runs).
+
+### End-to-end verification (dogfooded)
+
+A deliberately-broken Cargo project (`dogfood-victim` with `serde = "=1.0.100"` and `log = "=0.4.20"`, both outdated) plus a `--gate-file fake-gate.bat` that emits a fixed rustc-style `error[E0277]` and exits 101 was used to exercise the full path.
+
+**Text format** correctly renders both red proposals with the structured `[cargo:rustc-error] E0277: ...` line plus the per-finding `- E0277 the trait \`Send\` is not implemented for \`SerdeBar\` at src/lib.rs:42:7` under each, the raw stderr appendix below, and the new "root-cause clusters (1)" section at the end pointing out that both proposals share fingerprint `2613eb584ca08954`.
+
+**NDJSON format** ships the full `failure_context` block on each `proposal_completed` event (same `rule`, `summary`, `findings[]`, `fingerprint`) and the full `failure_clusters` array on `run_completed` (one cluster, two proposal ids, full representative `FailureContext` embedded). Singleton runs correctly elide `failure_clusters` from the wire format.
+
+757 tests pass (up from 712 in 1.5.0); clippy clean under `-D warnings`.
+
 ## [1.5.0] — 2026-05-20
 
 Targeted single-dep validation — the canonical "I just heard about a CVE in foo, validate moving to foo@1.5.3" workflow finally has a first-class flag.

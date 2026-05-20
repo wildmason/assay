@@ -351,12 +351,21 @@ pub(super) fn process_proposal_unit(
     });
     let duration_ms = u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if unit.lockstep_members.is_empty() {
+        // Lift the first failure's structured context onto the
+        // `proposal_completed` event. `failure_details` is empty
+        // for greens and `unvalidated` outcomes, so this leaves the
+        // event field `None` in those cases (skipped on the wire).
+        let failure_context = outcome
+            .failure_details
+            .first()
+            .and_then(|d| d.failure_context.clone());
         ctx.event_sink
             .emit(crate::events::Event::ProposalCompleted {
                 id: unit.proposal.id.clone(),
                 subject: unit.proposal.subject.clone(),
                 conclusion: outcome.conclusion.clone(),
                 duration_ms,
+                failure_context,
             });
         WorkerOutcome::Completed {
             eco_idx: unit.eco_idx,

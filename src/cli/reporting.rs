@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::failure_context::{FailureCluster, cluster_failures};
 use crate::model::Proposal;
 
 use super::run_state::{
@@ -245,6 +246,69 @@ pub(super) fn aggregate_member_skipped_count(completed_runs: &[ProposalRun]) -> 
         .sum()
 }
 
+/// Walk every completed run, harvest the first `failure_context`
+/// from each red proposal, and group them by shared fingerprint.
+/// Returns the deterministic cluster list (singletons excluded) used
+/// by both the text report and the NDJSON `run_completed` event.
+pub(super) fn build_failure_clusters(completed_runs: &[ProposalRun]) -> Vec<FailureCluster> {
+    let mut pairs: Vec<(String, crate::failure_context::FailureContext)> = Vec::new();
+    for run in completed_runs {
+        if run.outcome.conclusion == "success" || run.outcome.conclusion == "unvalidated" {
+            continue;
+        }
+        if let Some(ctx) = run
+            .outcome
+            .failure_details
+            .first()
+            .and_then(|d| d.failure_context.clone())
+        {
+            pairs.push((run.proposal.id.clone(), ctx));
+        }
+    }
+    cluster_failures(&pairs)
+}
+
+/// Render the root-cause cluster block appended to the text report
+/// when any cluster has more than one member. Returns `None` when
+/// `clusters` is empty (callers don't print a header for nothing).
+pub(super) fn format_failure_clusters_section(clusters: &[FailureCluster]) -> Option<String> {
+    if clusters.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "assay: root-cause clusters ({}):\n",
+        clusters.len()
+    ));
+    for cluster in clusters {
+        let n = cluster.proposal_ids.len();
+        let first_finding_msg = cluster
+            .representative
+            .findings
+            .first()
+            .map(|f| f.message.as_str())
+            .unwrap_or_else(|| cluster.representative.summary.as_str());
+        let code = cluster
+            .representative
+            .findings
+            .first()
+            .and_then(|f| f.code.as_deref());
+        let code_str = code.map(|c| format!("{c}: ")).unwrap_or_default();
+        out.push_str(&format!(
+            "  cluster {} ({}): {n} proposals share this failure\n",
+            cluster.fingerprint, cluster.representative.rule,
+        ));
+        out.push_str(&format!(
+            "    representative finding: {code_str}{first_finding_msg}\n",
+        ));
+        out.push_str(&format!(
+            "    proposal ids: {}\n",
+            cluster.proposal_ids.join(", ")
+        ));
+    }
+    Some(out)
+}
+
 /// Render the "why did these proposals fail" block for the human
 /// reporter. Returns `None` when no proposals failed — caller skips
 /// the section entirely (no empty header).
@@ -292,21 +356,50 @@ pub(super) fn format_red_proposal_section(
             format_consumers_suffix(&run.proposal.affected_consumers),
         ));
         for detail in &run.outcome.failure_details {
+            // 1.6.0: structured failure context renders first —
+            // operators see the parsed error inline rather than
+            // hunting through a raw stderr tail.
+            if let Some(ctx) = &detail.failure_context {
+                out.push_str(&format!(
+                    "    [{}] {}\n",
+                    ctx.rule, ctx.summary,
+                ));
+                for finding in &ctx.findings {
+                    let code = finding.code.as_deref().unwrap_or("");
+                    let loc = match (&finding.file, finding.line, finding.column) {
+                        (Some(f), Some(l), Some(c)) => format!(" at {f}:{l}:{c}"),
+                        (Some(f), Some(l), None) => format!(" at {f}:{l}"),
+                        (Some(f), None, _) => format!(" at {f}"),
+                        _ => String::new(),
+                    };
+                    let code_prefix = if code.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{code} ")
+                    };
+                    out.push_str(&format!(
+                        "      - {code_prefix}{}{loc}\n",
+                        finding.message,
+                    ));
+                }
+            }
+            // Raw log appendix — kept for the "trust but verify"
+            // case where the parser missed something interesting.
             if detail.stderr_tail.trim().is_empty() {
                 continue;
             }
-            out.push_str(&format!("    last stderr ({}):\n", detail.backend));
+            out.push_str(&format!("    raw log ({}):\n", detail.backend));
             let lines: Vec<&str> = detail.stderr_tail.lines().collect();
             let total_lines = lines.len();
             let start = total_lines.saturating_sub(REPORTER_STDERR_LINE_LIMIT);
             if start > 0 {
                 out.push_str(&format!(
-                    "      [... {} earlier line(s) elided; see receipt for full tail ...]\n",
+                    "        [... {} earlier line(s) elided; see receipt for full tail ...]\n",
                     start
                 ));
             }
             for line in &lines[start..] {
-                out.push_str("      ");
+                out.push_str("        ");
                 out.push_str(line);
                 out.push('\n');
             }
@@ -364,5 +457,56 @@ pub(super) fn ship_counts(
         ) => (*bump_count, merged_drops.len()),
         (_, Some(ApplyPrSummary::AllDroppedByMerge { drops })) => (0, drops.len()),
         _ => (0, 0),
+    }
+}
+
+#[cfg(test)]
+mod failure_cluster_tests {
+    use super::*;
+    use crate::failure_context::{FailureContext, FailureFinding};
+
+    fn cluster(rule: &str, msg: &str, ids: &[&str]) -> FailureCluster {
+        let ctx = FailureContext::new(
+            rule,
+            format!("{rule}: {msg}"),
+            vec![FailureFinding {
+                code: Some("E0277".into()),
+                message: msg.into(),
+                file: None,
+                line: None,
+                column: None,
+            }],
+        );
+        FailureCluster {
+            fingerprint: ctx.fingerprint.clone(),
+            proposal_ids: ids.iter().map(|s| s.to_string()).collect(),
+            representative: ctx,
+        }
+    }
+
+    #[test]
+    fn format_failure_clusters_section_returns_none_when_empty() {
+        assert!(format_failure_clusters_section(&[]).is_none());
+    }
+
+    #[test]
+    fn format_failure_clusters_section_renders_cluster_count_and_ids() {
+        let c = cluster("cargo:rustc-error", "trait not impl", &["p-1", "p-2", "p-3"]);
+        let out = format_failure_clusters_section(std::slice::from_ref(&c)).unwrap();
+        assert!(out.contains("root-cause clusters (1)"));
+        assert!(out.contains(&c.fingerprint));
+        assert!(out.contains("3 proposals share this failure"));
+        assert!(out.contains("p-1, p-2, p-3"));
+        assert!(out.contains("trait not impl"));
+    }
+
+    #[test]
+    fn format_failure_clusters_section_renders_multiple_clusters() {
+        let a = cluster("cargo:rustc-error", "alpha", &["a-1", "a-2"]);
+        let b = cluster("npm:eresolve", "beta", &["b-1", "b-2"]);
+        let out = format_failure_clusters_section(&[a, b]).unwrap();
+        assert!(out.contains("root-cause clusters (2)"));
+        assert!(out.contains("cargo:rustc-error"));
+        assert!(out.contains("npm:eresolve"));
     }
 }

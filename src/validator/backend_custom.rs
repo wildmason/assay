@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
+use crate::failure_parser::{EcosystemHint, hint_from_command, parse as parse_failure};
 use crate::process_runner::{RunResult, run_with_timeout};
 use crate::verdict_cache::fingerprint_commands;
 
@@ -81,6 +82,7 @@ impl CustomBackend {
                     stderr_tail: stderr_tail(&stderr_str, 4096),
                     log_path: log_path.to_path_buf(),
                     cached_at_unix_secs: None,
+                    failure_context: None,
                 }
             }
             Ok(RunResult::Completed { status, stderr, .. }) => {
@@ -89,6 +91,9 @@ impl CustomBackend {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".into());
                 let stderr_str = String::from_utf8_lossy(&stderr);
+                let stderr_tail_str = stderr_tail(&stderr_str, 4096);
+                let hint = hint_from_command(&self.argv);
+                let failure_context = Some(parse_failure(&stderr_tail_str, hint));
                 WorkflowOutcome {
                     workflow: workflow.to_path_buf(),
                     backend: self.label,
@@ -97,22 +102,27 @@ impl CustomBackend {
                     }),
                     forge_run_id: None,
                     duration_ms,
-                    stderr_tail: stderr_tail(&stderr_str, 4096),
+                    stderr_tail: stderr_tail_str,
                     log_path: log_path.to_path_buf(),
                     cached_at_unix_secs: None,
+                    failure_context,
                 }
             }
             Ok(RunResult::TimedOut { stderr, .. }) => {
                 let stderr_str = String::from_utf8_lossy(&stderr);
+                let stderr_tail_str = stderr_tail(&stderr_str, 4096);
+                let hint = hint_from_command(&self.argv);
+                let failure_context = Some(parse_failure(&stderr_tail_str, hint));
                 WorkflowOutcome {
                     workflow: workflow.to_path_buf(),
                     backend: self.label,
                     result: WorkflowResult::Fail(FailureFlavor::Timeout),
                     forge_run_id: None,
                     duration_ms,
-                    stderr_tail: stderr_tail(&stderr_str, 4096),
+                    stderr_tail: stderr_tail_str,
                     log_path: log_path.to_path_buf(),
                     cached_at_unix_secs: None,
+                    failure_context,
                 }
             }
             Err(err) => {
@@ -122,6 +132,7 @@ impl CustomBackend {
                 } else {
                     format!("custom gate failed to spawn `{bin}`: {err}")
                 };
+                let failure_context = Some(parse_failure(&reason, EcosystemHint::Auto));
                 WorkflowOutcome {
                     workflow: workflow.to_path_buf(),
                     backend: self.label,
@@ -131,6 +142,7 @@ impl CustomBackend {
                     stderr_tail: String::new(),
                     log_path: log_path.to_path_buf(),
                     cached_at_unix_secs: None,
+                    failure_context,
                 }
             }
         }
@@ -164,17 +176,18 @@ impl ValidatorBackend for CustomBackend {
         log_path: &Path,
     ) -> Result<WorkflowOutcome> {
         if self.argv.is_empty() {
+            let reason = "custom backend invoked with empty argv".to_string();
+            let failure_context = Some(parse_failure(&reason, EcosystemHint::Auto));
             return Ok(WorkflowOutcome {
                 workflow: workflow.to_path_buf(),
                 backend: self.label,
-                result: WorkflowResult::Fail(FailureFlavor::SetupFailure {
-                    reason: "custom backend invoked with empty argv".into(),
-                }),
+                result: WorkflowResult::Fail(FailureFlavor::SetupFailure { reason }),
                 forge_run_id: None,
                 duration_ms: 0,
                 stderr_tail: String::new(),
                 log_path: log_path.to_path_buf(),
                 cached_at_unix_secs: None,
+                failure_context,
             });
         }
         let started = Instant::now();

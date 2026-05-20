@@ -18,6 +18,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
+use crate::failure_context::FailureContext;
 use crate::model::{Classification, Proposal, ValidationOutcome};
 #[cfg(test)]
 use crate::verdict_cache::DEFAULT_CACHE_TTL;
@@ -145,6 +146,12 @@ pub struct WorkflowOutcome {
     /// outcomes with a distinct tag so operators can distinguish
     /// cache reuse from real CI runs.
     pub cached_at_unix_secs: Option<u64>,
+    /// Structured replacement for the raw `stderr_tail` dump under a
+    /// failed proposal. `None` on `Pass`; `Some(_)` on every `Fail`
+    /// variant — even the "couldn't parse anything" case, which
+    /// produces a `FailureContext` with `rule:"generic:unstructured"`.
+    /// Shipped in 1.6.0; additive on the receipt + NDJSON wire format.
+    pub failure_context: Option<FailureContext>,
 }
 
 // =============================================================================
@@ -481,6 +488,7 @@ impl Validator {
                         flavor: flavor_short,
                         stderr_tail: outcome.stderr_tail.clone(),
                         duration_ms: outcome.duration_ms,
+                        failure_context: outcome.failure_context.clone(),
                     });
                 }
             }
@@ -649,6 +657,7 @@ impl Validator {
                     flavor: flavor_short,
                     stderr_tail: outcome.stderr_tail.clone(),
                     duration_ms: outcome.duration_ms,
+                    failure_context: outcome.failure_context.clone(),
                 });
                 (Classification::Unsupported, "failure".to_string())
             }
@@ -678,10 +687,22 @@ fn rehydrate_outcome_from_cache(
     log_path: &Path,
     entry: CacheEntry,
 ) -> WorkflowOutcome {
-    let result = match entry.verdict {
-        CachedVerdict::Pass => WorkflowResult::Pass,
+    let (result, failure_context) = match entry.verdict {
+        CachedVerdict::Pass => (WorkflowResult::Pass, None),
         CachedVerdict::Regression { details } => {
-            WorkflowResult::Fail(FailureFlavor::Regression { details })
+            // Re-parse the cached stderr_tail to produce the 1.6.0
+            // structured context. The cache entry on-disk schema is
+            // intentionally NOT bumped — re-running the parser is
+            // cheap, deterministic, and avoids invalidating every
+            // existing cache on upgrade.
+            let ctx = crate::failure_parser::parse(
+                &entry.stderr_tail,
+                crate::failure_parser::EcosystemHint::Auto,
+            );
+            (
+                WorkflowResult::Fail(FailureFlavor::Regression { details }),
+                Some(ctx),
+            )
         }
     };
     WorkflowOutcome {
@@ -693,6 +714,7 @@ fn rehydrate_outcome_from_cache(
         stderr_tail: entry.stderr_tail,
         log_path: log_path.to_path_buf(),
         cached_at_unix_secs: Some(entry.cached_at_unix_secs),
+        failure_context,
     }
 }
 
@@ -1105,6 +1127,13 @@ mod tests {
             _timeout: Duration,
             log_path: &Path,
         ) -> Result<WorkflowOutcome> {
+            let failure_context = match &self.result {
+                WorkflowResult::Pass => None,
+                WorkflowResult::Fail(_) => Some(crate::failure_parser::parse(
+                    &self.stderr_tail,
+                    crate::failure_parser::EcosystemHint::Auto,
+                )),
+            };
             Ok(WorkflowOutcome {
                 workflow: workflow.to_path_buf(),
                 backend: self.name(),
@@ -1114,6 +1143,7 @@ mod tests {
                 stderr_tail: self.stderr_tail.clone(),
                 log_path: log_path.to_path_buf(),
                 cached_at_unix_secs: None,
+                failure_context,
             })
         }
     }
@@ -1247,15 +1277,24 @@ mod tests {
                         details: format!("workflow #{i} regressed"),
                     })
                 };
+                let stderr_tail_str = format!("stderr for workflow #{i}");
+                let failure_context = match &result {
+                    WorkflowResult::Pass => None,
+                    WorkflowResult::Fail(_) => Some(crate::failure_parser::parse(
+                        &stderr_tail_str,
+                        crate::failure_parser::EcosystemHint::Auto,
+                    )),
+                };
                 Ok(WorkflowOutcome {
                     workflow: workflow.to_path_buf(),
                     backend: self.name(),
                     result,
                     forge_run_id: None,
                     duration_ms: 1,
-                    stderr_tail: format!("stderr for workflow #{i}"),
+                    stderr_tail: stderr_tail_str,
                     log_path: log_path.to_path_buf(),
                     cached_at_unix_secs: None,
+                    failure_context,
                 })
             }
         }
@@ -1317,6 +1356,11 @@ mod tests {
                 _timeout: Duration,
                 log_path: &Path,
             ) -> Result<WorkflowOutcome> {
+                let stderr_tail_str = "tree-mode cargo check failed".to_string();
+                let failure_context = Some(crate::failure_parser::parse(
+                    &stderr_tail_str,
+                    crate::failure_parser::EcosystemHint::Auto,
+                ));
                 Ok(WorkflowOutcome {
                     workflow: workflow.to_path_buf(),
                     backend: self.name(),
@@ -1325,9 +1369,10 @@ mod tests {
                     }),
                     forge_run_id: None,
                     duration_ms: 999,
-                    stderr_tail: "tree-mode cargo check failed".into(),
+                    stderr_tail: stderr_tail_str,
                     log_path: log_path.to_path_buf(),
                     cached_at_unix_secs: None,
+                    failure_context,
                 })
             }
             fn needs_workflow_file(&self) -> bool {
@@ -1838,6 +1883,13 @@ mod tests {
             log_path: &Path,
         ) -> Result<WorkflowOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let failure_context = match &self.result {
+                WorkflowResult::Pass => None,
+                WorkflowResult::Fail(_) => Some(crate::failure_parser::parse(
+                    "",
+                    crate::failure_parser::EcosystemHint::Auto,
+                )),
+            };
             Ok(WorkflowOutcome {
                 workflow: workflow.to_path_buf(),
                 backend: self.name(),
@@ -1847,6 +1899,7 @@ mod tests {
                 stderr_tail: String::new(),
                 log_path: log_path.to_path_buf(),
                 cached_at_unix_secs: None,
+                failure_context,
             })
         }
     }

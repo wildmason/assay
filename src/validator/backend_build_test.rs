@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use std::process::Command;
 
 use crate::error::Result;
+use crate::failure_parser::{EcosystemHint, hint_from_command, parse as parse_failure};
 use crate::process_runner::{RunResult, run_with_timeout};
 use crate::verdict_cache::fingerprint_commands;
 
@@ -97,6 +98,8 @@ impl BuildTestBackend {
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "signal".into());
                         let stderr_tail_str = stderr_tail(&combined_stderr, 4096);
+                        let hint = hint_from_command(cmd);
+                        let failure_context = Some(parse_failure(&stderr_tail_str, hint));
                         return WorkflowOutcome {
                             workflow: workflow.to_path_buf(),
                             backend: self.label,
@@ -108,20 +111,25 @@ impl BuildTestBackend {
                             stderr_tail: stderr_tail_str,
                             log_path: log_path.to_path_buf(),
                             cached_at_unix_secs: None,
+                            failure_context,
                         };
                     }
                 }
                 BuildTestStepOutcome::TimedOut { stderr, .. } => {
                     let stderr_str = String::from_utf8_lossy(stderr).into_owned();
+                    let stderr_tail_str = stderr_tail(&stderr_str, 4096);
+                    let hint = hint_from_command(cmd);
+                    let failure_context = Some(parse_failure(&stderr_tail_str, hint));
                     return WorkflowOutcome {
                         workflow: workflow.to_path_buf(),
                         backend: self.label,
                         result: WorkflowResult::Fail(FailureFlavor::Timeout),
                         forge_run_id: None,
                         duration_ms,
-                        stderr_tail: stderr_tail(&stderr_str, 4096),
+                        stderr_tail: stderr_tail_str,
                         log_path: log_path.to_path_buf(),
                         cached_at_unix_secs: None,
+                        failure_context,
                     };
                 }
                 BuildTestStepOutcome::SpawnFailed { error } => {
@@ -131,6 +139,10 @@ impl BuildTestBackend {
                     } else {
                         format!("couldn't spawn `{bin}`: {error}")
                     };
+                    // SetupFailure: no captured stderr, so the
+                    // structured context just echoes the reason as
+                    // the summary under `generic:unstructured`.
+                    let failure_context = Some(parse_failure(&reason, EcosystemHint::Auto));
                     return WorkflowOutcome {
                         workflow: workflow.to_path_buf(),
                         backend: self.label,
@@ -140,6 +152,7 @@ impl BuildTestBackend {
                         stderr_tail: String::new(),
                         log_path: log_path.to_path_buf(),
                         cached_at_unix_secs: None,
+                        failure_context,
                     };
                 }
             }
@@ -153,6 +166,7 @@ impl BuildTestBackend {
             stderr_tail: String::new(),
             log_path: log_path.to_path_buf(),
             cached_at_unix_secs: None,
+            failure_context: None,
         }
     }
 }
@@ -235,15 +249,19 @@ impl ValidatorBackend for BuildTestBackend {
                     let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
                     let _ = std::fs::write(log_path, log_content);
                     let stderr_combined = combined_stderr(&results);
+                    let stderr_tail_str = stderr_tail(&stderr_combined, 4096);
+                    let hint = hint_from_command(cmd);
+                    let failure_context = Some(parse_failure(&stderr_tail_str, hint));
                     return Ok(WorkflowOutcome {
                         workflow: workflow.to_path_buf(),
                         backend: self.label,
                         result: WorkflowResult::Fail(FailureFlavor::Timeout),
                         forge_run_id: None,
                         duration_ms: started.elapsed().as_millis(),
-                        stderr_tail: stderr_tail(&stderr_combined, 4096),
+                        stderr_tail: stderr_tail_str,
                         log_path: log_path.to_path_buf(),
                         cached_at_unix_secs: None,
+                        failure_context,
                     });
                 }
                 break;

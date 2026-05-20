@@ -16,6 +16,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
+use crate::failure_context::{FailureCluster, FailureContext};
+
 /// One event emitted on the NDJSON stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -57,6 +59,13 @@ pub enum Event {
         subject: String,
         conclusion: String,
         duration_ms: u64,
+        /// Structured failure context. `Some(_)` on every `failure`
+        /// conclusion (even unparseable stderr produces a
+        /// `rule:"generic:unstructured"` context); `None` on
+        /// `success` / `unvalidated`. Shipped in 1.6.0 — additive
+        /// per the 1.0 stability promise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_context: Option<FailureContext>,
     },
     /// A multi-member cohort has finished validating atomically.
     /// The same conclusion applies to every member.
@@ -73,6 +82,14 @@ pub enum Event {
         summary: EventSummary,
         run_json_path: String,
         finished_at: String,
+        /// Root-cause clusters: proposals that failed for the
+        /// same reason (shared fingerprint over their parsed
+        /// findings). Empty when no two proposals share a
+        /// fingerprint (singletons are excluded — a cluster of
+        /// one is not a cluster). Shipped in 1.6.0 — additive
+        /// per the 1.0 stability promise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failure_clusters: Vec<FailureCluster>,
     },
 }
 
@@ -179,6 +196,7 @@ mod tests {
             subject: "foo".into(),
             conclusion: "success".into(),
             duration_ms: 1234,
+            failure_context: None,
         };
         let s = serde_json::to_string(&evt).unwrap();
         assert!(s.contains(r#""type":"proposal_completed""#));
@@ -187,6 +205,116 @@ mod tests {
             Event::ProposalCompleted { id, .. } => assert_eq!(id, "npm-foo"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn proposal_completed_carries_failure_context_when_red() {
+        let ctx = FailureContext::new(
+            "cargo:rustc-error",
+            "E0277: trait not impl",
+            vec![crate::failure_context::FailureFinding {
+                code: Some("E0277".into()),
+                message: "trait not impl".into(),
+                file: Some("src/lib.rs".into()),
+                line: Some(42),
+                column: Some(7),
+            }],
+        );
+        let evt = Event::ProposalCompleted {
+            id: "cargo-foo".into(),
+            subject: "foo".into(),
+            conclusion: "failure".into(),
+            duration_ms: 1234,
+            failure_context: Some(ctx.clone()),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("failure_context"), "wire format must carry failure_context; got {s}");
+        assert!(s.contains("cargo:rustc-error"));
+        let back: Event = serde_json::from_str(&s).unwrap();
+        match back {
+            Event::ProposalCompleted { failure_context, .. } => {
+                assert_eq!(failure_context, Some(ctx));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn proposal_completed_skips_failure_context_when_none() {
+        let evt = Event::ProposalCompleted {
+            id: "npm-foo".into(),
+            subject: "foo".into(),
+            conclusion: "success".into(),
+            duration_ms: 1234,
+            failure_context: None,
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(
+            !s.contains("failure_context"),
+            "None must be elided from the wire format; got {s}"
+        );
+    }
+
+    #[test]
+    fn run_completed_carries_failure_clusters_when_present() {
+        let ctx = FailureContext::new(
+            "cargo:rustc-error",
+            "E0277",
+            vec![crate::failure_context::FailureFinding {
+                code: Some("E0277".into()),
+                message: "trait not impl".into(),
+                file: None,
+                line: None,
+                column: None,
+            }],
+        );
+        let cluster = FailureCluster {
+            fingerprint: ctx.fingerprint.clone(),
+            proposal_ids: vec!["a-1".into(), "a-2".into()],
+            representative: ctx,
+        };
+        let evt = Event::RunCompleted {
+            summary: EventSummary {
+                proposals_total: 2,
+                proposals_passed: 0,
+                proposals_failed: 2,
+                proposals_unvalidated: 0,
+                proposals_shipped: 0,
+            },
+            run_json_path: "/tmp/run.json".into(),
+            finished_at: "2026-05-20T00:00:00Z".into(),
+            failure_clusters: vec![cluster.clone()],
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("failure_clusters"));
+        let back: Event = serde_json::from_str(&s).unwrap();
+        match back {
+            Event::RunCompleted { failure_clusters, .. } => {
+                assert_eq!(failure_clusters, vec![cluster]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn run_completed_skips_failure_clusters_when_empty() {
+        let evt = Event::RunCompleted {
+            summary: EventSummary {
+                proposals_total: 0,
+                proposals_passed: 0,
+                proposals_failed: 0,
+                proposals_unvalidated: 0,
+                proposals_shipped: 0,
+            },
+            run_json_path: "/tmp/run.json".into(),
+            finished_at: "2026-05-20T00:00:00Z".into(),
+            failure_clusters: Vec::new(),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(
+            !s.contains("failure_clusters"),
+            "empty cluster vec must be elided from the wire format; got {s}"
+        );
     }
 
     #[test]
