@@ -374,6 +374,12 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     if matches!(mode, ApplyMode::ApplyPr) && !args.force {
         preflight_apply_pr_gh_auth(&GhCliBackend::default())?;
     }
+    // Apply-pr preflight: detect a broken global `insteadOf` rewrite that
+    // would silently break `git push` for every github.com URL by rewriting
+    // them into a form with an empty `x-access-token:` credential.
+    if matches!(mode, ApplyMode::ApplyPr) && !args.force {
+        preflight_apply_pr_insteadof(&args.repo)?;
+    }
 
     let registry = default_registry();
     let started_at = iso8601_now();
@@ -647,6 +653,8 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 &run_id,
                 &validator,
                 &config.pull_request.labels,
+                &config.pull_request.reviewers,
+                config.pull_request.draft,
             )?);
         }
     }
@@ -1736,6 +1744,171 @@ fn compute_branch_name_for_runs(runs: &[&ProposalRun]) -> String {
 /// only to fail at `gh pr create` time. `--force` bypasses upstream for
 /// edge cases (`gh` in a non-standard location, plans to open the PR
 /// manually after the branch lands, etc.).
+/// Best-effort cleanup of local `--apply-pr` artifacts (worktree +
+/// branch) after a partial run. Pure function over side-effects so it
+/// can be tested directly against a temp git fixture.
+///
+/// REMOTE state (a pushed branch) is intentionally NOT cleaned up:
+/// when push succeeds but PR-open fails, the operator may want to
+/// manually open the PR from the pushed branch, so we leave that for
+/// them to decide.
+fn cleanup_local_apply_state(git_root: &Path, worktree: Option<&Path>, local_branch: Option<&str>) {
+    if let Some(wt) = worktree {
+        let _ = std::process::Command::new("git")
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(wt)
+            .current_dir(git_root)
+            .output();
+    }
+    if let Some(branch) = local_branch {
+        let _ = std::process::Command::new("git")
+            .arg("branch")
+            .arg("-D")
+            .arg(branch)
+            .current_dir(git_root)
+            .output();
+    }
+}
+
+/// RAII guard that calls [`cleanup_local_apply_state`] on Drop unless
+/// [`PartialApplyState::dismiss`] was called first. Used by
+/// `perform_apply_pr` to make sure a worktree+branch created mid-run
+/// doesn't survive a panic or early `?` return — that leftover branch
+/// is the "branch already exists" footgun every retry stumbled over
+/// before this guard existed.
+struct PartialApplyState {
+    git_root: PathBuf,
+    worktree: Option<PathBuf>,
+    local_branch: Option<String>,
+    /// When true, Drop is a no-op (worktree+branch preserved as the
+    /// audit trail for a successful Published run).
+    success: bool,
+    /// When false, Drop still cleans up but suppresses the "cleaned up
+    /// partial state" warning — used for expected no-op early-returns
+    /// like `NothingToPublish` where the cleanup isn't error recovery.
+    noisy: bool,
+}
+
+impl PartialApplyState {
+    fn new(git_root: PathBuf) -> Self {
+        Self {
+            git_root,
+            worktree: None,
+            local_branch: None,
+            success: false,
+            noisy: true,
+        }
+    }
+
+    fn track_local(&mut self, worktree: PathBuf, branch: String) {
+        self.worktree = Some(worktree);
+        self.local_branch = Some(branch);
+    }
+
+    /// Mark the operation successful so Drop becomes a no-op and the
+    /// worktree + local branch are preserved as the run's audit trail.
+    fn dismiss(mut self) {
+        self.success = true;
+    }
+
+    /// Allow Drop to clean up the local state but suppress the
+    /// early-exit warning. Used when the run exited for an expected
+    /// non-error reason (e.g. `NothingToPublish` post copy-back).
+    fn dismiss_quietly(mut self) {
+        self.noisy = false;
+    }
+}
+
+impl Drop for PartialApplyState {
+    fn drop(&mut self) {
+        if self.success {
+            return;
+        }
+        let had_local = self.worktree.is_some() || self.local_branch.is_some();
+        cleanup_local_apply_state(
+            &self.git_root,
+            self.worktree.as_deref(),
+            self.local_branch.as_deref(),
+        );
+        if self.noisy && had_local {
+            eprintln!(
+                "assay: cleaned up partial --apply-pr state (worktree + local branch) after early-exit; \
+                 any pushed remote branch was left alone for manual recovery."
+            );
+        }
+    }
+}
+
+/// Filter the operator's requested reviewers down to ones the
+/// publisher will let through to `gh pr create --reviewer ...`.
+///
+/// Team-level reviewers (the `org/team` form) bypass the collaborator
+/// filter — GitHub exposes them via a different endpoint and the
+/// assignability semantics differ. User-level reviewers (bare
+/// usernames) must appear in `backend.list_collaborators` or `gh pr
+/// create` will fail the whole PR-open call.
+///
+/// On `list_collaborators` error the publisher drops all user-level
+/// reviewers (parallel to the label-filter fallback) — the PR is the
+/// load-bearing artifact, reviewer assignment is convenience.
+fn filter_reviewers_to_collaborators(
+    backend: &dyn crate::publisher::PullRequestBackend,
+    owner: &str,
+    repo: &str,
+    requested: &[String],
+) -> Vec<String> {
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    let mut teams: Vec<&str> = Vec::new();
+    let mut users: Vec<&str> = Vec::new();
+    for name in requested {
+        if name.contains('/') {
+            teams.push(name.as_str());
+        } else {
+            users.push(name.as_str());
+        }
+    }
+    if users.is_empty() {
+        return teams.into_iter().map(str::to_string).collect();
+    }
+    let collaborators = match backend.list_collaborators(owner, repo) {
+        Ok(set) => set,
+        Err(err) => {
+            eprintln!(
+                "assay: WARNING: couldn't list collaborators on {owner}/{repo} ({err}); \
+                 opening the PR without user-level reviewers (team reviewers, if any, are still attached)"
+            );
+            return teams.into_iter().map(str::to_string).collect();
+        }
+    };
+    let collaborator_set: std::collections::HashSet<&str> =
+        collaborators.iter().map(String::as_str).collect();
+    let mut keep_users: Vec<&str> = Vec::new();
+    let mut drop_users: Vec<&str> = Vec::new();
+    for user in users {
+        if collaborator_set.contains(user) {
+            keep_users.push(user);
+        } else {
+            drop_users.push(user);
+        }
+    }
+    if !drop_users.is_empty() {
+        eprintln!(
+            "assay: WARNING: dropping {} reviewer(s) who aren't collaborators on {owner}/{repo}: {}",
+            drop_users.len(),
+            drop_users.join(", ")
+        );
+    }
+    teams
+        .into_iter()
+        .chain(keep_users)
+        .map(str::to_string)
+        .collect()
+}
+
 /// Format the error message for a failed `git worktree add` during
 /// --apply-pr. When stderr suggests the branch already exists (the
 /// common case when a prior run failed before PR open), append a
@@ -1753,13 +1926,24 @@ fn format_worktree_add_failure(branch: &str, stderr_trimmed: &str) -> String {
     format!("git worktree add (branch `{branch}`) failed: {stderr_trimmed}")
 }
 
-/// Filter the operator's requested labels down to those that actually
-/// exist on the target repo. `gh pr create --label <name>` fails the
-/// whole call if any label is missing, so we silently drop the missing
-/// ones and warn the operator. On `list_labels` error (network, scope,
-/// etc.) we drop ALL labels to preserve forward progress — the PR is
-/// the load-bearing artifact; labels are categorisation polish.
-fn filter_labels_to_existing(
+/// Ensure every label in `requested` exists on the target repo, then
+/// return the subset of names safe to pass to `gh pr create --label`.
+///
+/// Behavior:
+/// 1. Look up the existing label set via `backend.list_labels`. On
+///    error, drop ALL labels and warn — the PR is the load-bearing
+///    artifact, labels are categorisation polish.
+/// 2. For every requested label NOT already in the existing set, call
+///    `backend.create_label`. On success keep the label. On failure
+///    drop it and warn — same forward-progress posture as step 1.
+/// 3. Return the union of already-existing labels and successfully
+///    created labels (in request order).
+///
+/// This replaces the prior filter-only helper: operators who declared
+/// labels in `.assay.toml` now have those labels auto-provisioned the
+/// first time `--apply-pr` runs against a fresh repo, instead of the
+/// PR opening unattended.
+fn ensure_labels_exist(
     backend: &dyn crate::publisher::PullRequestBackend,
     owner: &str,
     repo: &str,
@@ -1780,21 +1964,28 @@ fn filter_labels_to_existing(
     };
     let existing_set: std::collections::HashSet<&str> =
         existing.iter().map(String::as_str).collect();
-    let (keep, drop_): (Vec<&String>, Vec<&String>) = requested
-        .iter()
-        .partition(|name| existing_set.contains(name.as_str()));
-    if !drop_.is_empty() {
+    let mut kept: Vec<String> = Vec::new();
+    let mut create_failures: Vec<String> = Vec::new();
+    for name in requested {
+        if existing_set.contains(name.as_str()) {
+            kept.push(name.clone());
+            continue;
+        }
+        match backend.create_label(owner, repo, name) {
+            Ok(()) => kept.push(name.clone()),
+            Err(err) => {
+                create_failures.push(format!("{name} ({err})"));
+            }
+        }
+    }
+    if !create_failures.is_empty() {
         eprintln!(
-            "assay: WARNING: dropping {} label(s) that don't exist on {owner}/{repo}: {}",
-            drop_.len(),
-            drop_
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "assay: WARNING: dropping {} label(s) that couldn't be auto-created on {owner}/{repo}: {}",
+            create_failures.len(),
+            create_failures.join(", ")
         );
     }
-    keep.into_iter().cloned().collect()
+    kept
 }
 
 fn preflight_apply_pr_gh_auth(backend: &GhCliBackend) -> Result<()> {
@@ -1804,6 +1995,56 @@ fn preflight_apply_pr_gh_auth(backend: &GhCliBackend) -> Result<()> {
              (run `gh auth login -s repo` and retry, or pass --force to skip this check)"
         ))
     })
+}
+
+/// Config key for the specific broken `insteadOf` rewrite — when this
+/// key is set with any non-empty value, `git push` to any github.com
+/// URL will be rewritten through a literal `x-access-token:@` prefix
+/// (empty password) which git treats as a real failing credential
+/// instead of consulting its credential helper.
+const BROKEN_INSTEADOF_KEY: &str = "url.https://x-access-token:@github.com/.insteadof";
+
+/// Pure check: given the raw `git config --get-all <KEY>` output (or
+/// `None` if the key wasn't set), return Err with a remediation when
+/// the broken rewrite is present. Returns the std `Result<_, String>`
+/// shape (NOT the crate alias) so the pure check stays independent of
+/// the crate's [`crate::error::Error`] enum.
+fn check_insteadof_rewrite(git_config_value: Option<&str>) -> std::result::Result<(), String> {
+    let Some(value) = git_config_value else {
+        return Ok(());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "apply-pr pre-flight: your global git config has \
+         `{BROKEN_INSTEADOF_KEY} = {trimmed}` which rewrites every github.com URL to embed an EMPTY \
+         x-access-token credential. git treats the empty token as a real (failing) credential and \
+         never consults its credential helper, breaking `git push` for every wildmason repo.\n\n\
+         Recommended fix (removes the broken rule globally):\n  \
+         git config --global --unset url.\"https://x-access-token:@github.com/\".insteadOf\n\n\
+         Workaround for this run only: pass --force to bypass this check, then push from a remote \
+         whose URL embeds a real token (e.g. `git remote set-url <remote> https://x-access-token:$(gh auth token)@github.com/<owner>/<repo>.git`)."
+    ))
+}
+
+/// Run the `insteadOf` rewrite check against the operator's git config.
+fn preflight_apply_pr_insteadof(repo: &Path) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get-all", BROKEN_INSTEADOF_KEY])
+        .current_dir(repo)
+        .output();
+    let value = match output {
+        // `git config --get-all` exits non-zero when the key is absent;
+        // that's the happy case, not an error.
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(_) => None,
+        // Couldn't invoke git at all — let downstream stages surface
+        // that error in their own context rather than fail the preflight.
+        Err(_) => return Ok(()),
+    };
+    check_insteadof_rewrite(value.as_deref()).map_err(Error::other)
 }
 
 /// Run the post-validation `--apply-pr` flow:
@@ -1820,6 +2061,8 @@ fn perform_apply_pr(
     run_id: &str,
     validator: &Validator,
     requested_labels: &[String],
+    requested_reviewers: &[String],
+    draft: bool,
 ) -> Result<ApplyPrSummary> {
     let red_count = pre_validation_failures
         + completed_runs
@@ -1944,6 +2187,13 @@ fn perform_apply_pr(
         )));
     }
 
+    // From here on, any early-exit must clean up the local worktree +
+    // branch we just created. The guard's Drop runs on every code path
+    // that doesn't reach `partial.dismiss()` at the bottom of this
+    // function.
+    let mut partial = PartialApplyState::new(git_root.clone());
+    partial.track_local(worktree.clone(), branch.clone());
+
     // Copy back into the worktree, per merged-ecosystem set.
     let mut modified_paths: Vec<PathBuf> = Vec::new();
     for outcome in &ship_plan {
@@ -2003,6 +2253,9 @@ fn perform_apply_pr(
     }
 
     if modified_paths.is_empty() {
+        // Worktree was created but copy-back found nothing to stage.
+        // Clean up quietly — this is an expected no-op, not an error.
+        partial.dismiss_quietly();
         return Ok(ApplyPrSummary::NothingToPublish);
     }
 
@@ -2057,7 +2310,9 @@ fn perform_apply_pr(
         format!("Bump {} dependencies via assay", shipped_flat.len())
     };
     let base = detect_default_branch(repo, remote).unwrap_or_else(|| "main".into());
-    let labels = filter_labels_to_existing(backend, &owner, &repo_name, requested_labels);
+    let labels = ensure_labels_exist(backend, &owner, &repo_name, requested_labels);
+    let reviewers =
+        filter_reviewers_to_collaborators(backend, &owner, &repo_name, requested_reviewers);
     let mut request = build_pull_request_request(PullRequestParams {
         owner: &owner,
         repo: &repo_name,
@@ -2066,8 +2321,8 @@ fn perform_apply_pr(
         subject: &title,
         body: body.clone(),
         labels,
-        reviewers: vec![],
-        draft: false,
+        reviewers,
+        draft,
     });
     request.title = title;
     let response = backend.open_pull_request(&request).map_err(|err| {
@@ -2092,6 +2347,12 @@ fn perform_apply_pr(
             "number": response.number,
         })),
     });
+
+    // Reaching here means push + branch metadata guard + PR open all
+    // succeeded. The worktree + local branch are part of the run's
+    // audit trail (operator can `cd .assay/runs/<run-id>/pr-tree` and
+    // inspect), so dismiss the cleanup guard.
+    partial.dismiss();
 
     Ok(ApplyPrSummary::Published {
         url: response.url,
@@ -4935,6 +5196,12 @@ mod tests {
         // (no labels exist) so older tests don't need to be aware of the
         // label filter at all.
         existing_labels: Vec<String>,
+        // Collaborator usernames the test claims exist on the repo.
+        // Same default rationale as existing_labels.
+        existing_collaborators: Vec<String>,
+        // Sink for label-create attempts so tests can assert what the
+        // publisher tried to provision.
+        created_labels: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::publisher::PullRequestBackend for MockPrBackend {
@@ -4968,6 +5235,27 @@ mod tests {
             _repo: &str,
         ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
             Ok(self.existing_labels.clone())
+        }
+
+        fn list_collaborators(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
+            Ok(self.existing_collaborators.clone())
+        }
+
+        fn create_label(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            name: &str,
+        ) -> std::result::Result<(), crate::publisher::BackendError> {
+            // Append to the mock's labels so subsequent list_labels would
+            // include it; mirrors the live behavior. Records the create
+            // attempt in `created_labels` so tests can assert.
+            self.created_labels.lock().unwrap().push(name.to_string());
+            Ok(())
         }
     }
 
@@ -5060,6 +5348,8 @@ mod tests {
                 is_protected: false,
             },
             existing_labels: Vec::new(),
+            existing_collaborators: Vec::new(),
+            created_labels: std::sync::Mutex::new(Vec::new()),
         };
 
         let validator = test_validator_unused();
@@ -5074,6 +5364,8 @@ mod tests {
             "assay-test-run-pushed",
             &validator,
             &[],
+            &[],
+            false,
         )
         .expect("apply-pr should succeed");
 
@@ -5124,6 +5416,8 @@ mod tests {
                 is_protected: false,
             },
             existing_labels: Vec::new(),
+            existing_collaborators: Vec::new(),
+            created_labels: std::sync::Mutex::new(Vec::new()),
         };
 
         let validator = test_validator_unused();
@@ -5138,6 +5432,8 @@ mod tests {
             "assay-test-run-refused",
             &validator,
             &[],
+            &[],
+            false,
         )
         .expect("refusal is not an error result");
 
@@ -5198,6 +5494,8 @@ mod tests {
                 is_protected: true,
             },
             existing_labels: Vec::new(),
+            existing_collaborators: Vec::new(),
+            created_labels: std::sync::Mutex::new(Vec::new()),
         };
 
         let validator = test_validator_unused();
@@ -5212,6 +5510,8 @@ mod tests {
             "assay-test-run-protected",
             &validator,
             &[],
+            &[],
+            false,
         )
         .expect_err("protected branch metadata must reject");
         assert!(
@@ -5256,11 +5556,134 @@ mod tests {
         );
     }
 
-    // ----- filter_labels_to_existing --------------------------------------
+    // ----- cleanup_local_apply_state / PartialApplyState ------------------
+
+    /// Set up a real git repo with one commit, then add a worktree on
+    /// a new branch. Returns (repo_tempdir, repo_path, branch, worktree_path).
+    fn setup_repo_with_worktree(
+        branch: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+        std::path::PathBuf,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_git_repo(&repo);
+        std::fs::write(repo.join("README.md"), "test\n").unwrap();
+        git(&repo, ["add", "README.md"]);
+        git(&repo, ["commit", "-m", "init"]);
+        let worktree = repo.join(".assay-test-worktree");
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", branch])
+            .arg(&worktree)
+            .arg("HEAD")
+            .current_dir(&repo)
+            .status()
+            .expect("git worktree add must execute");
+        assert!(status.success(), "git worktree add must succeed");
+        assert!(worktree.exists(), "worktree dir should exist after add");
+        (tmp, repo, branch.to_string(), worktree)
+    }
+
+    fn local_branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .current_dir(repo)
+            .status()
+            .expect("git rev-parse must execute");
+        out.success()
+    }
+
+    #[test]
+    fn cleanup_removes_worktree_and_local_branch() {
+        let (_tmp, repo, branch, worktree) = setup_repo_with_worktree("assay/test-cleanup-1");
+        assert!(
+            local_branch_exists(&repo, &branch),
+            "branch should exist pre-cleanup"
+        );
+        cleanup_local_apply_state(&repo, Some(&worktree), Some(&branch));
+        assert!(!worktree.exists(), "worktree dir should be removed");
+        assert!(
+            !local_branch_exists(&repo, &branch),
+            "local branch should be removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_with_no_state_is_noop() {
+        // No worktree, no branch — should not panic, should not error.
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        cleanup_local_apply_state(tmp.path(), None, None);
+    }
+
+    #[test]
+    fn partial_apply_state_drop_runs_cleanup_when_not_dismissed() {
+        let (_tmp, repo, branch, worktree) = setup_repo_with_worktree("assay/test-cleanup-drop");
+        {
+            let mut partial = PartialApplyState::new(repo.clone());
+            partial.track_local(worktree.clone(), branch.clone());
+            // partial drops at the end of this block without dismiss
+        }
+        assert!(!worktree.exists(), "Drop should have removed the worktree");
+        assert!(
+            !local_branch_exists(&repo, &branch),
+            "Drop should have removed the local branch"
+        );
+    }
+
+    #[test]
+    fn partial_apply_state_dismiss_preserves_local_state() {
+        let (_tmp, repo, branch, worktree) = setup_repo_with_worktree("assay/test-cleanup-dismiss");
+        {
+            let mut partial = PartialApplyState::new(repo.clone());
+            partial.track_local(worktree.clone(), branch.clone());
+            partial.dismiss();
+            // Drop runs at end of dismiss but success=true so no-op.
+        }
+        assert!(
+            worktree.exists(),
+            "dismiss should have preserved the worktree (audit trail)"
+        );
+        assert!(
+            local_branch_exists(&repo, &branch),
+            "dismiss should have preserved the local branch"
+        );
+    }
+
+    #[test]
+    fn partial_apply_state_dismiss_quietly_still_cleans_up() {
+        let (_tmp, repo, branch, worktree) = setup_repo_with_worktree("assay/test-cleanup-quiet");
+        {
+            let mut partial = PartialApplyState::new(repo.clone());
+            partial.track_local(worktree.clone(), branch.clone());
+            partial.dismiss_quietly();
+        }
+        assert!(
+            !worktree.exists(),
+            "dismiss_quietly should still clean up the worktree"
+        );
+        assert!(
+            !local_branch_exists(&repo, &branch),
+            "dismiss_quietly should still clean up the local branch"
+        );
+    }
+
+    // ----- ensure_labels_exist --------------------------------------------
 
     /// Backend stub that returns a static label list (or an error).
     struct LabelListBackend {
         labels: std::result::Result<Vec<String>, crate::publisher::BackendError>,
+        // `ensure_labels_exist` will call `create_label` for every label
+        // not present in `labels`. This field lets the test configure
+        // whether those creates succeed or fail.
+        create_result: std::result::Result<(), crate::publisher::BackendError>,
+        // Records every label name `create_label` was invoked with so
+        // tests can assert what the publisher tried to provision.
+        created: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::publisher::PullRequestBackend for LabelListBackend {
@@ -5271,7 +5694,7 @@ mod tests {
             _: &str,
         ) -> std::result::Result<crate::publisher::BranchMetadata, crate::publisher::BackendError>
         {
-            unreachable!("filter_labels_to_existing must not call fetch_branch_metadata")
+            unreachable!("ensure_labels_exist must not call fetch_branch_metadata")
         }
         fn open_pull_request(
             &self,
@@ -5280,7 +5703,7 @@ mod tests {
             crate::publisher::PullRequestResponse,
             crate::publisher::BackendError,
         > {
-            unreachable!("filter_labels_to_existing must not call open_pull_request")
+            unreachable!("ensure_labels_exist must not call open_pull_request")
         }
         fn list_labels(
             &self,
@@ -5305,54 +5728,333 @@ mod tests {
                 }),
             }
         }
+        fn list_collaborators(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
+            // Not used by ensure_labels tests; the matching filter_reviewers
+            // tests use CollaboratorListBackend below.
+            unreachable!("ensure_labels tests must not call list_collaborators")
+        }
+        fn create_label(
+            &self,
+            _: &str,
+            _: &str,
+            name: &str,
+        ) -> std::result::Result<(), crate::publisher::BackendError> {
+            match &self.create_result {
+                Ok(()) => {
+                    self.created.lock().unwrap().push(name.to_string());
+                    Ok(())
+                }
+                Err(e) => Err(match e {
+                    crate::publisher::BackendError::Network(s) => {
+                        crate::publisher::BackendError::Network(s.clone())
+                    }
+                    crate::publisher::BackendError::Auth(s) => {
+                        crate::publisher::BackendError::Auth(s.clone())
+                    }
+                    crate::publisher::BackendError::NotConfigured(s) => {
+                        crate::publisher::BackendError::NotConfigured(s.clone())
+                    }
+                    crate::publisher::BackendError::Rejected(s) => {
+                        crate::publisher::BackendError::Rejected(s.clone())
+                    }
+                }),
+            }
+        }
     }
 
     #[test]
-    fn filter_labels_returns_empty_when_no_labels_requested() {
+    fn ensure_labels_returns_empty_when_no_labels_requested() {
         let backend = LabelListBackend {
             labels: Ok(vec!["assay".into()]),
+            create_result: Ok(()),
+            created: std::sync::Mutex::new(Vec::new()),
         };
-        let out = filter_labels_to_existing(&backend, "o", "r", &[]);
+        let out = ensure_labels_exist(&backend, "o", "r", &[]);
+        assert!(out.is_empty());
+        assert!(
+            backend.created.lock().unwrap().is_empty(),
+            "no labels requested -> no creates attempted"
+        );
+    }
+
+    #[test]
+    fn ensure_labels_keeps_existing_without_attempting_create() {
+        let backend = LabelListBackend {
+            labels: Ok(vec!["assay".into(), "bug".into()]),
+            create_result: Ok(()),
+            created: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = ensure_labels_exist(&backend, "o", "r", &["assay".into(), "bug".into()]);
+        assert_eq!(out, vec!["assay".to_string(), "bug".to_string()]);
+        assert!(
+            backend.created.lock().unwrap().is_empty(),
+            "all labels already exist; nothing should be created"
+        );
+    }
+
+    #[test]
+    fn ensure_labels_auto_creates_missing_when_create_succeeds() {
+        let backend = LabelListBackend {
+            labels: Ok(vec!["assay".into()]),
+            create_result: Ok(()),
+            created: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = ensure_labels_exist(
+            &backend,
+            "o",
+            "r",
+            &["assay".into(), "dependencies".into(), "automerge".into()],
+        );
+        assert_eq!(
+            out,
+            vec![
+                "assay".to_string(),
+                "dependencies".to_string(),
+                "automerge".to_string(),
+            ],
+            "kept order: existing first then auto-created"
+        );
+        assert_eq!(
+            *backend.created.lock().unwrap(),
+            vec!["dependencies".to_string(), "automerge".to_string()],
+            "only the missing labels should be created"
+        );
+    }
+
+    #[test]
+    fn ensure_labels_drops_labels_whose_create_fails() {
+        let backend = LabelListBackend {
+            labels: Ok(vec!["assay".into()]),
+            create_result: Err(crate::publisher::BackendError::Rejected(
+                "no permission to create labels".into(),
+            )),
+            created: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = ensure_labels_exist(&backend, "o", "r", &["assay".into(), "dependencies".into()]);
+        assert_eq!(
+            out,
+            vec!["assay".to_string()],
+            "existing label survives; missing+create-fail label dropped"
+        );
+        assert!(
+            backend.created.lock().unwrap().is_empty(),
+            "no labels recorded as created when create_label returned Err"
+        );
+    }
+
+    #[test]
+    fn ensure_labels_drops_all_when_list_labels_errors() {
+        let backend = LabelListBackend {
+            labels: Err(crate::publisher::BackendError::Network("503".into())),
+            // Create would succeed if asked, but list_labels failure
+            // short-circuits before we even know what's missing.
+            create_result: Ok(()),
+            created: std::sync::Mutex::new(Vec::new()),
+        };
+        let out = ensure_labels_exist(&backend, "o", "r", &["assay".into()]);
+        assert!(
+            out.is_empty(),
+            "on list_labels error the publisher drops all labels for forward progress"
+        );
+        assert!(
+            backend.created.lock().unwrap().is_empty(),
+            "no creates should be attempted when we couldn't list existing labels"
+        );
+    }
+
+    // ----- check_insteadof_rewrite ---------------------------------------
+
+    #[test]
+    fn insteadof_check_passes_when_key_absent() {
+        assert!(check_insteadof_rewrite(None).is_ok());
+    }
+
+    #[test]
+    fn insteadof_check_passes_when_key_value_is_empty() {
+        assert!(check_insteadof_rewrite(Some("")).is_ok());
+        assert!(check_insteadof_rewrite(Some("   \n")).is_ok());
+    }
+
+    #[test]
+    fn insteadof_check_refuses_with_remediation_when_key_set_to_clean_github_url() {
+        let err = check_insteadof_rewrite(Some("https://github.com/"))
+            .expect_err("broken rewrite must be refused");
+        assert!(
+            err.contains("git config --global --unset"),
+            "remediation should suggest unset: {err}"
+        );
+        assert!(
+            err.contains("--force"),
+            "remediation should mention --force workaround: {err}"
+        );
+        assert!(
+            err.contains(BROKEN_INSTEADOF_KEY),
+            "remediation should name the exact broken key: {err}"
+        );
+    }
+
+    #[test]
+    fn insteadof_check_handles_multi_valued_config_with_trailing_newline() {
+        // `git config --get-all` separates multiple values with newlines.
+        let value = "https://github.com/\nhttps://github.com/somewhereelse/\n";
+        let err = check_insteadof_rewrite(Some(value))
+            .expect_err("any non-empty value of the broken key should fail");
+        assert!(err.contains("https://github.com/"));
+    }
+
+    // ----- filter_reviewers_to_collaborators ------------------------------
+
+    /// Backend stub that returns a configurable collaborator list (or
+    /// an error). `list_labels`/etc. panic — these tests don't touch
+    /// label or PR-open paths.
+    struct CollaboratorListBackend {
+        collaborators: std::result::Result<Vec<String>, crate::publisher::BackendError>,
+    }
+
+    impl crate::publisher::PullRequestBackend for CollaboratorListBackend {
+        fn fetch_branch_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<crate::publisher::BranchMetadata, crate::publisher::BackendError>
+        {
+            unreachable!("filter_reviewers tests must not call fetch_branch_metadata")
+        }
+        fn open_pull_request(
+            &self,
+            _: &crate::publisher::PullRequestRequest,
+        ) -> std::result::Result<
+            crate::publisher::PullRequestResponse,
+            crate::publisher::BackendError,
+        > {
+            unreachable!("filter_reviewers tests must not call open_pull_request")
+        }
+        fn list_labels(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
+            unreachable!("filter_reviewers tests must not call list_labels")
+        }
+        fn list_collaborators(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<Vec<String>, crate::publisher::BackendError> {
+            match &self.collaborators {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(match e {
+                    crate::publisher::BackendError::Network(s) => {
+                        crate::publisher::BackendError::Network(s.clone())
+                    }
+                    crate::publisher::BackendError::Auth(s) => {
+                        crate::publisher::BackendError::Auth(s.clone())
+                    }
+                    crate::publisher::BackendError::NotConfigured(s) => {
+                        crate::publisher::BackendError::NotConfigured(s.clone())
+                    }
+                    crate::publisher::BackendError::Rejected(s) => {
+                        crate::publisher::BackendError::Rejected(s.clone())
+                    }
+                }),
+            }
+        }
+        fn create_label(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> std::result::Result<(), crate::publisher::BackendError> {
+            unreachable!("filter_reviewers tests must not call create_label")
+        }
+    }
+
+    #[test]
+    fn filter_reviewers_returns_empty_when_none_requested() {
+        let backend = CollaboratorListBackend {
+            collaborators: Ok(vec!["alice".into()]),
+        };
+        let out = filter_reviewers_to_collaborators(&backend, "o", "r", &[]);
         assert!(out.is_empty());
     }
 
     #[test]
-    fn filter_labels_drops_missing_labels_keeping_only_existing() {
-        let backend = LabelListBackend {
-            labels: Ok(vec!["assay".into(), "bug".into()]),
+    fn filter_reviewers_drops_non_collaborator_users() {
+        let backend = CollaboratorListBackend {
+            collaborators: Ok(vec!["alice".into(), "bob".into()]),
         };
-        let out = filter_labels_to_existing(
+        let out = filter_reviewers_to_collaborators(
             &backend,
             "o",
             "r",
-            &["assay".into(), "dependencies".into(), "bug".into()],
+            &["alice".into(), "carol".into(), "bob".into()],
         );
         assert_eq!(
             out,
-            vec!["assay".to_string(), "bug".to_string()],
-            "should keep existing labels in request order"
+            vec!["alice".to_string(), "bob".to_string()],
+            "should keep collaborators, drop non-collaborators"
         );
     }
 
     #[test]
-    fn filter_labels_returns_empty_when_none_of_requested_exist() {
-        let backend = LabelListBackend {
-            labels: Ok(vec!["wontfix".into()]),
+    fn filter_reviewers_passes_team_reviewers_through_without_collab_check() {
+        // Teams are `org/team` — they go to a different GitHub endpoint
+        // and the assignability rules differ. The filter must NOT drop
+        // them on collaborator absence. The mock's list_collaborators
+        // shouldn't even be consulted when all reviewers are teams,
+        // but if it is, returning empty must still let the team pass.
+        let backend = CollaboratorListBackend {
+            collaborators: Ok(Vec::new()),
         };
-        let out =
-            filter_labels_to_existing(&backend, "o", "r", &["assay".into(), "dependencies".into()]);
-        assert!(out.is_empty(), "missing labels should all be dropped");
+        let out = filter_reviewers_to_collaborators(&backend, "o", "r", &["wildmason/core".into()]);
+        assert_eq!(out, vec!["wildmason/core".to_string()]);
     }
 
     #[test]
-    fn filter_labels_returns_empty_when_list_labels_errors() {
-        let backend = LabelListBackend {
-            labels: Err(crate::publisher::BackendError::Network("503".into())),
+    fn filter_reviewers_mixed_keeps_teams_and_extant_users() {
+        let backend = CollaboratorListBackend {
+            collaborators: Ok(vec!["alice".into()]),
         };
-        let out = filter_labels_to_existing(&backend, "o", "r", &["assay".into()]);
-        assert!(
-            out.is_empty(),
-            "on list_labels error the publisher drops all labels for forward progress"
+        let out = filter_reviewers_to_collaborators(
+            &backend,
+            "o",
+            "r",
+            &[
+                "wildmason/security".into(),
+                "alice".into(),
+                "ghost-user".into(),
+            ],
+        );
+        assert_eq!(
+            out,
+            vec!["wildmason/security".to_string(), "alice".to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_reviewers_on_list_error_drops_users_keeps_teams() {
+        // Mirrors the label-filter fallback: on `list_collaborators`
+        // error, drop user-level reviewers (we can't verify them safely)
+        // but pass team reviewers through (they don't depend on the
+        // collaborator check).
+        let backend = CollaboratorListBackend {
+            collaborators: Err(crate::publisher::BackendError::Network("503".into())),
+        };
+        let out = filter_reviewers_to_collaborators(
+            &backend,
+            "o",
+            "r",
+            &["alice".into(), "wildmason/core".into()],
+        );
+        assert_eq!(
+            out,
+            vec!["wildmason/core".to_string()],
+            "user reviewers dropped on error, team reviewers preserved"
         );
     }
 

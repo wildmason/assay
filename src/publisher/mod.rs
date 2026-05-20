@@ -66,6 +66,24 @@ pub trait PullRequestBackend: Send + Sync {
     /// labels before `gh pr create` (which fails the whole call if any
     /// label is missing).
     fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<String>, BackendError>;
+
+    /// Return the set of GitHub usernames who are collaborators on the
+    /// repository (users with at least pull-level access). Used by the
+    /// publisher to filter out non-collaborator user-level reviewers
+    /// before `gh pr create` (which fails the whole call if any
+    /// requested reviewer isn't assignable). Team-level reviewers
+    /// (`org/team` form) bypass this filter because GitHub exposes
+    /// them through a separate endpoint and the assignability rules
+    /// differ.
+    fn list_collaborators(&self, owner: &str, repo: &str) -> Result<Vec<String>, BackendError>;
+
+    /// Create a label on the repository (idempotent under `--force`).
+    /// Used by the publisher to auto-provision the labels declared in
+    /// `config.pull_request.labels` so the operator's labeling intent
+    /// is realized even on a fresh repo with no pre-existing labels.
+    /// Errors here are non-fatal — the publisher drops the offending
+    /// label and continues so the PR still opens.
+    fn create_label(&self, owner: &str, repo: &str, name: &str) -> Result<(), BackendError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,6 +169,14 @@ mod tests {
 
         fn list_labels(&self, _: &str, _: &str) -> Result<Vec<String>, BackendError> {
             Ok(Vec::new())
+        }
+
+        fn list_collaborators(&self, _: &str, _: &str) -> Result<Vec<String>, BackendError> {
+            Ok(Vec::new())
+        }
+
+        fn create_label(&self, _: &str, _: &str, _: &str) -> Result<(), BackendError> {
+            Ok(())
         }
     }
 

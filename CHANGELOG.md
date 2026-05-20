@@ -2,6 +2,24 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-20
+
+Four `--apply-pr` polish items surfaced by the 0.2.0 dogfood against `wildmason/safe-bundle`, all addressed:
+
+### Added
+
+- **Cleanup-on-failure RAII guard for `--apply-pr`.** When push or PR-open fails partway, the worktree at `.assay/runs/<run-id>/pr-tree` and the local branch created by `git worktree add -b` are now removed automatically on early-return (Rust Drop semantics). Stops the "branch already exists" footgun every retry stumbled over before. Successful runs preserve both (audit trail under `.assay/runs/`). `NothingToPublish` cleans up quietly because it isn't an error.
+- **Auto-create missing PR labels** via `gh label create <name> --color ededed --description "Bumped via assay" --force`. The publisher now provisions any label declared in `config.pull_request.labels` (default `["assay", "dependencies"]`) that doesn't already exist on the target repo. On create failure, the offending label is dropped with a warning — the PR still opens. Replaces the 0.2.0 filter-only helper which would silently drop missing labels.
+- **Reviewer assignment now flows from `config.pull_request.reviewers`** end-to-end, with a collaborator-existence filter (`gh api repos/<o>/<r>/collaborators --paginate`) so requesting a non-collaborator user doesn't abort the whole `gh pr create` call. Team-level reviewers (`org/team` form) bypass the filter because GitHub exposes them through a separate endpoint with different assignability rules.
+- **`config.pull_request.draft` plumbed through to `gh pr create`.** Drafts open as drafts.
+- **Pre-flight detection of the broken global `insteadOf` rewrite** (`url.https://x-access-token:@github.com/.insteadof = https://github.com/`). When this rule is set, `git push` for every github.com URL hits an empty-token credential and fails. The new `--apply-pr` preflight catches it before validation work begins and emits a remediation pointing at `git config --global --unset url."https://x-access-token:@github.com/".insteadOf`. `--force` bypasses.
+
+### Internal
+
+- Two new PullRequestBackend trait methods: `list_collaborators` (for the reviewer-existence filter) and `create_label` (for the label auto-provisioner). GhCliBackend shells out to `gh api repos/<o>/<r>/collaborators --paginate` and `gh label create --force` respectively.
+- Renamed `filter_labels_to_existing` → `ensure_labels_exist` to reflect the new auto-create behavior.
+- Test count: 603 → 618 (+15: 4 insteadOf check, 5 filter_reviewers, 5 ensure_labels replacing 4 filter_labels = +1 net, 5 cleanup/PartialApplyState).
+
 ## [0.2.0] — 2026-05-19
 
 ### Added

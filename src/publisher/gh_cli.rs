@@ -142,6 +142,37 @@ impl PullRequestBackend for GhCliBackend {
         })
     }
 
+    fn list_collaborators(&self, owner: &str, repo: &str) -> Result<Vec<String>, BackendError> {
+        // `gh api repos/<owner>/<repo>/collaborators --paginate --jq '.[].login'`
+        // returns one login per line. `--paginate` because GitHub caps
+        // the per-page response at 30.
+        let output = Command::new(&self.gh_bin)
+            .arg("api")
+            .arg(format!("repos/{owner}/{repo}/collaborators"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(".[].login")
+            .output()
+            .map_err(|err| {
+                BackendError::Network(format!(
+                    "couldn't execute `gh api` for collaborator list: {err}; gh CLI must be installed"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(BackendError::Network(format!(
+                "`gh api` for collaborator list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<String>, BackendError> {
         // `gh api repos/<owner>/<repo>/labels --paginate --jq '.[].name'`
         // returns one label name per line. `--paginate` is important
@@ -171,6 +202,39 @@ impl PullRequestBackend for GhCliBackend {
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect())
+    }
+
+    fn create_label(&self, owner: &str, repo: &str, name: &str) -> Result<(), BackendError> {
+        // `--force` makes the call idempotent: existing labels with the
+        // same name are updated (color/description refreshed) rather
+        // than erroring. The publisher always filters by `list_labels`
+        // first so this is only invoked for missing labels, but `--force`
+        // also covers the small race window where a label was created
+        // between the list and the create.
+        let output = Command::new(&self.gh_bin)
+            .arg("label")
+            .arg("create")
+            .arg(name)
+            .arg("--repo")
+            .arg(format!("{owner}/{repo}"))
+            .arg("--color")
+            .arg("ededed")
+            .arg("--description")
+            .arg("Bumped via assay")
+            .arg("--force")
+            .output()
+            .map_err(|err| {
+                BackendError::Network(format!(
+                    "couldn't execute `gh label create`: {err}; gh CLI must be installed"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(BackendError::Rejected(format!(
+                "`gh label create {name}` exited non-zero: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 
     fn open_pull_request(
