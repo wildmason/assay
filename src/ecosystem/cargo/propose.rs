@@ -16,7 +16,8 @@ use crate::model::{BumpTier, Classification, Manifest, ManifestKind, Proposal, P
 use super::super::EcosystemName;
 use super::classify::classify_unchanged_bump;
 use super::parse::{
-    cross_check, diff_lockfiles, parse_cargo_unchanged_output, parse_cargo_update_output,
+    cross_check, diff_lockfiles, lockfile_versions, parse_cargo_unchanged_output,
+    parse_cargo_update_output,
 };
 
 /// High-level Cargo proposer: takes cargo's stdout and the before/after
@@ -334,6 +335,86 @@ fn run_cargo_command(cwd: &Path, args: &[&str]) -> Result<CargoCommandOutput> {
 
 /// Replace any character outside `[a-z0-9-]` with `-`. Used to build
 /// branch-safe proposal IDs (e.g. `cargo-foo-bar-1-0-0`).
+/// Build a single synthetic [`Proposal`] for an operator-specified
+/// `--dep <name>@<version>` upgrade.
+///
+/// Reads `Cargo.lock` at `repo` to discover the dep's currently-resolved
+/// version (the proposal's `from`). When `name` isn't declared in the
+/// lockfile (or the lockfile is absent), returns `Ok(None)` so the cli
+/// can try the next ecosystem. When the lockfile already pins
+/// `target_version`, also returns `Ok(None)` so the run exits cleanly
+/// without a no-op proposal.
+///
+/// Tier classification reuses [`classify_unchanged_bump`] (Compatible
+/// when from→to stays within the same caret group, Breaking otherwise).
+/// The proposal bypasses LockfileOnly tier — even bumps that satisfy
+/// the existing constraint route through the constraint-widening
+/// applier, which is correct (idempotent widen to the same value) but
+/// produces a manifest churn that the discovery proposer would have
+/// avoided. Refining this is a follow-up; for v1 the goal is "make
+/// `--dep` work end-to-end" and Compatible/Breaking is conservative-correct.
+pub(super) fn synthesize_dep_proposal(
+    name: &str,
+    target_version: &str,
+    manifests: &[Manifest],
+    repo: &Path,
+) -> Result<Option<Proposal>> {
+    let lockfile_path = repo.join("Cargo.lock");
+    let lockfile_text = match std::fs::read_to_string(&lockfile_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(crate::error::Error::Io {
+                path: lockfile_path,
+                source: err,
+            });
+        }
+    };
+    let versions = lockfile_versions(&lockfile_text)?;
+    let Some(current) = versions.get(name) else {
+        return Ok(None);
+    };
+    if current == target_version {
+        eprintln!(
+            "[cargo] {name} already resolves to {target_version} in Cargo.lock; nothing to validate",
+        );
+        return Ok(None);
+    }
+
+    let manifest_paths: Vec<PathBuf> = manifests
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.kind,
+                crate::model::ManifestKind::CargoLock | crate::model::ManifestKind::CargoToml
+            )
+        })
+        .map(|m| m.path.clone())
+        .collect();
+    let tier = classify_unchanged_bump(current, target_version);
+    let id = format!(
+        "cargo-{}-{}-to-{}",
+        sanitize_id_segment(name),
+        sanitize_id_segment(current),
+        sanitize_id_segment(target_version),
+    );
+    Ok(Some(Proposal {
+        id,
+        ecosystem: EcosystemName::Cargo.as_str().to_string(),
+        kind: ProposalKind::Version,
+        subject: name.to_string(),
+        from: current.clone(),
+        to: target_version.to_string(),
+        initial_classification: Classification::Exact,
+        manifest_paths,
+        notes: vec!["source:--dep (operator-specified target)".to_string()],
+        bump_tier: tier,
+        affected_consumers: Vec::new(),
+        explanation: None,
+        cohort: None,
+    }))
+}
+
 fn sanitize_id_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut last_was_dash = false;

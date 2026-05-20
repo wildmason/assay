@@ -11,17 +11,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::model::{BumpTier, Classification, Proposal, ProposalKind};
+use crate::model::{BumpTier, Classification, Manifest, Proposal, ProposalKind};
 use crate::process_runner::{RunResult, run_with_timeout};
 
 use super::super::EcosystemName;
-use super::berry::propose_berry_updates;
+use super::berry::{parse_berry_lockfile, propose_berry_updates};
 use super::classify::classify_npm_bump;
-use super::direct_deps::collect_direct_dep_names;
-use super::flavor::{NpmFlavor, map_npm_spawn_io, npm_binary_name};
+use super::direct_deps::{collect_direct_dep_names, collect_direct_deps_with_constraints};
+use super::flavor::{NpmFlavor, detect_flavor, map_npm_spawn_io, npm_binary_name};
 use super::outdated::{
     NpmOutdatedRow, backfill_current_from_lockfile, parse_npm_outdated_output,
-    parse_yarn1_outdated_output,
+    parse_yarn1_outdated_output, read_lockfile_versions,
 };
 
 /// Builds proposals from parsed outdated rows. Tier mapping mirrors
@@ -310,6 +310,215 @@ pub(crate) fn filter_ignored_packages(
         .into_iter()
         .filter(|p| !ignored.iter().any(|i| i == &p.subject))
         .collect()
+}
+
+/// Build a single synthetic [`Proposal`] for an operator-specified
+/// `--dep <name>@<version>` upgrade across npm/pnpm/yarn1/yarn berry.
+///
+/// Looks up `name`'s currently-resolved version from the flavor-appropriate
+/// lockfile (`package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` flavor-
+/// or berry-format). When that fails (lockfile absent or the dep isn't
+/// pinned), falls back to the declared constraint string from
+/// `package.json` (`^4.17.0` → `4.17.0`) — sufficient for proposal
+/// generation but loses any version-narrowing the lockfile would have
+/// provided. Returns `Ok(None)` when the dep isn't declared anywhere.
+///
+/// Tier classification reuses [`classify_npm_bump`]; LockfileOnly is
+/// suppressed (see [`super::super::cargo::propose::synthesize_dep_proposal`]
+/// for the same rationale — conservative-correct for v1, refinement is
+/// a follow-up).
+pub(super) fn synthesize_dep_proposal(
+    name: &str,
+    target_version: &str,
+    manifests: &[Manifest],
+    repo: &Path,
+) -> Result<Option<Proposal>> {
+    let Some(flavor) = detect_flavor(repo) else {
+        // No lockfile means this project isn't actually npm-shaped at
+        // this scan_root — bail without producing a proposal so the
+        // cli can move on to the next ecosystem.
+        return Ok(None);
+    };
+    let current = match resolve_current_version(name, flavor, repo)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if current == target_version {
+        eprintln!(
+            "[npm] {name} already resolves to {target_version} in {}; nothing to validate",
+            flavor.lockfile_name(),
+        );
+        return Ok(None);
+    }
+
+    let manifest_paths: Vec<PathBuf> = manifests
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.kind,
+                crate::model::ManifestKind::PackageJson
+                    | crate::model::ManifestKind::NpmLockfile
+            )
+        })
+        .map(|m| m.path.clone())
+        .collect();
+    let tier = classify_npm_bump(&current, target_version);
+    let id = format!(
+        "npm-{}-{}-to-{}",
+        sanitize_id_segment(name),
+        sanitize_id_segment(&current),
+        sanitize_id_segment(target_version),
+    );
+    Ok(Some(Proposal {
+        id,
+        ecosystem: EcosystemName::Npm.as_str().to_string(),
+        kind: ProposalKind::Version,
+        subject: name.to_string(),
+        from: current,
+        to: target_version.to_string(),
+        initial_classification: Classification::Exact,
+        manifest_paths,
+        notes: vec!["source:--dep (operator-specified target)".to_string()],
+        bump_tier: tier,
+        affected_consumers: Vec::new(),
+        explanation: None,
+        cohort: None,
+    }))
+}
+
+/// Best-effort resolve of `name`'s currently-installed version under
+/// `repo`, scoped to the detected lockfile flavor.
+///
+/// Order of preference: flavor-native lockfile parse, then the
+/// declared constraint string from `package.json` with caret/tilde
+/// stripped. Returns `Ok(None)` when neither source mentions `name`.
+fn resolve_current_version(
+    name: &str,
+    flavor: NpmFlavor,
+    repo: &Path,
+) -> Result<Option<String>> {
+    match flavor {
+        NpmFlavor::Npm => {
+            let lockfile = read_lockfile_versions(repo)?;
+            if let Some(v) = lockfile.get(name) {
+                return Ok(Some(v.clone()));
+            }
+        }
+        NpmFlavor::YarnBerry => {
+            let path = repo.join("yarn.lock");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let installed = parse_berry_lockfile(&text)?;
+                if let Some(v) = installed.get(name) {
+                    return Ok(Some(v.clone()));
+                }
+            }
+        }
+        NpmFlavor::Pnpm => {
+            // pnpm-lock.yaml's importer.dependencies.<name>.version
+            // field carries the resolved version. Best-effort parse —
+            // missing fields fall through to the package.json
+            // constraint-stripping path below.
+            if let Some(v) = read_pnpm_lockfile_version(name, repo)? {
+                return Ok(Some(v));
+            }
+        }
+        NpmFlavor::Yarn => {
+            // yarn1's yarn.lock uses a custom format that's
+            // fiddly to parse without a real parser. The
+            // constraint-stripped fallback below covers the
+            // common case; precise yarn1 lockfile reading is a
+            // follow-up.
+        }
+    }
+    // Fallback: read the declared constraint from package.json (root +
+    // workspace members) and strip caret/tilde/etc to get a bare version.
+    let declared = collect_direct_deps_with_constraints(repo)?;
+    if let Some(spec) = declared.get(name) {
+        return Ok(Some(strip_constraint_prefix(spec).to_string()));
+    }
+    Ok(None)
+}
+
+fn read_pnpm_lockfile_version(name: &str, repo: &Path) -> Result<Option<String>> {
+    let path = repo.join("pnpm-lock.yaml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
+    let value: serde_yml::Value = match serde_yml::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    // pnpm-lock.yaml v6+ shape:
+    //   importers:
+    //     <importer>:
+    //       dependencies:
+    //         <name>:
+    //           specifier: ...
+    //           version: <resolved>
+    let Some(importers) = value.get("importers").and_then(|v| v.as_mapping()) else {
+        return Ok(None);
+    };
+    for (_, importer) in importers {
+        let Some(importer_map) = importer.as_mapping() else {
+            continue;
+        };
+        for dep_field in ["dependencies", "devDependencies", "peerDependencies"] {
+            let Some(deps) = importer_map
+                .get(serde_yml::Value::String(dep_field.into()))
+                .and_then(|v| v.as_mapping())
+            else {
+                continue;
+            };
+            let Some(entry) = deps.get(serde_yml::Value::String(name.into())) else {
+                continue;
+            };
+            let Some(version) = entry
+                .as_mapping()
+                .and_then(|m| m.get(serde_yml::Value::String("version".into())))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            // pnpm sometimes appends `(peers...)` to the version
+            // string. Strip everything after the first `(` to keep
+            // the bare semver.
+            let bare = version.split('(').next().unwrap_or(version).trim();
+            if !bare.is_empty() {
+                return Ok(Some(bare.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Strip caret/tilde/equals/operator prefixes from a constraint string,
+/// returning the bare version inside. Multi-req ranges (`">=1, <2"`)
+/// and tags / git refs are returned verbatim — the caller treats them
+/// as the literal `from` and lets the classifier handle the awkwardness.
+fn strip_constraint_prefix(spec: &str) -> &str {
+    let trimmed = spec.trim();
+    if let Some(rest) = trimmed.strip_prefix('^') {
+        return rest;
+    }
+    if let Some(rest) = trimmed.strip_prefix('~') {
+        return rest;
+    }
+    if let Some(rest) = trimmed.strip_prefix('=') {
+        return rest;
+    }
+    if let Some(rest) = trimmed.strip_prefix(">=") {
+        return rest;
+    }
+    if let Some(rest) = trimmed.strip_prefix("<=") {
+        return rest;
+    }
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        return rest;
+    }
+    if let Some(rest) = trimmed.strip_prefix('<') {
+        return rest;
+    }
+    trimmed
 }
 
 fn sanitize_id_segment(value: &str) -> String {

@@ -223,6 +223,130 @@ pub struct AnalyzeArgs {
     /// subset of members.
     #[arg(long = "member-gate")]
     pub member_gate: bool,
+
+    /// Validate a single, operator-specified dependency upgrade instead
+    /// of enumerating every available bump. Format: `<name>@<version>`
+    /// (scoped npm packages use `@scope/name@version`). Bypasses the
+    /// standard outdated-discovery proposer (`cargo update --dry-run`,
+    /// `npm outdated`, etc.) and builds a synthetic proposal with
+    /// `from` resolved from the project's lockfile/manifest and `to`
+    /// set to the supplied version. The proposal flows through the
+    /// same classifier / validator / apply pipeline as a discovered
+    /// proposal, so `--dep foo@1.2.3 --validate` is the canonical way
+    /// to ask "would moving to foo 1.2.3 break my project?" without
+    /// scanning the rest of the dep graph. When the dep isn't declared
+    /// in any enabled ecosystem, or is already at the requested
+    /// version, the run exits cleanly with a one-line explanation.
+    #[arg(long = "dep", value_name = "NAME@VERSION")]
+    pub dep: Option<String>,
+}
+
+/// Parse a `<name>@<version>` dep spec for `--dep`.
+///
+/// Scoped npm packages start with `@` (e.g. `@angular/core@22.0.0`); the
+/// leading `@` is part of the name and the version separator is the
+/// rightmost `@` whose index is > 0.
+///
+/// Returns the parsed `(name, version)` pair or a human-readable error
+/// describing why the spec was rejected. The error string is rendered
+/// verbatim by the CLI surface, so it's tuned for operator legibility
+/// rather than programmatic consumption.
+pub fn parse_dep_spec(spec: &str) -> Result<(String, String), String> {
+    if spec.is_empty() {
+        return Err("--dep value is empty; expected `<name>@<version>`".into());
+    }
+    // rsplit_once finds the rightmost `@`, which is the separator for
+    // both `name@version` and `@scope/name@version`.
+    let (name, version) = spec.rsplit_once('@').ok_or_else(|| {
+        format!("--dep value `{spec}` is missing `@version`; expected `<name>@<version>`")
+    })?;
+    // If the rsplit gave us an empty name (e.g. `@1.0.0`), the spec is
+    // malformed — a leading-`@` scope without a `/` follow-up is not a
+    // valid package name.
+    if name.is_empty() {
+        return Err(format!(
+            "--dep value `{spec}` has an empty name; expected `<name>@<version>` (use `@scope/name@version` for scoped npm packages)"
+        ));
+    }
+    if version.is_empty() {
+        return Err(format!(
+            "--dep value `{spec}` has an empty version; expected `<name>@<version>`"
+        ));
+    }
+    Ok((name.to_string(), version.to_string()))
+}
+
+#[cfg(test)]
+mod parse_dep_spec_tests {
+    use super::parse_dep_spec;
+
+    #[test]
+    fn parses_plain_cargo_name() {
+        assert_eq!(
+            parse_dep_spec("serde@1.0.228").unwrap(),
+            ("serde".into(), "1.0.228".into())
+        );
+    }
+
+    #[test]
+    fn parses_scoped_npm_name() {
+        assert_eq!(
+            parse_dep_spec("@angular/core@22.0.0").unwrap(),
+            ("@angular/core".into(), "22.0.0".into())
+        );
+    }
+
+    #[test]
+    fn parses_prerelease_version() {
+        assert_eq!(
+            parse_dep_spec("tokio@1.45.0-rc.1").unwrap(),
+            ("tokio".into(), "1.45.0-rc.1".into())
+        );
+    }
+
+    #[test]
+    fn parses_build_metadata_version() {
+        assert_eq!(
+            parse_dep_spec("toml@1.1.2+spec-1.1.0").unwrap(),
+            ("toml".into(), "1.1.2+spec-1.1.0".into())
+        );
+    }
+
+    #[test]
+    fn rejects_missing_at_separator() {
+        let err = parse_dep_spec("serde").unwrap_err();
+        assert!(err.contains("missing `@version`"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_version() {
+        let err = parse_dep_spec("serde@").unwrap_err();
+        assert!(err.contains("empty version"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_name_with_scope_marker() {
+        // "@1.0.0".rsplit_once('@') splits at the only `@`, giving an
+        // empty name. Scoped packages MUST include `/<name>` after the
+        // leading `@`.
+        let err = parse_dep_spec("@1.0.0").unwrap_err();
+        assert!(err.contains("empty name"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_spec() {
+        let err = parse_dep_spec("").unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_bare_scope_without_version() {
+        let err = parse_dep_spec("@angular/core").unwrap_err();
+        // Trailing `core` after the scope `@` — rsplit_once produces
+        // ("@angular/core", ""? no — finds the `@` at index 0, splits
+        // into ("", "angular/core"). The empty-name guard catches it.
+        assert!(err.contains("empty name") || err.contains("empty version"), "got: {err}");
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]

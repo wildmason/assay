@@ -176,7 +176,7 @@ pub fn diff_lockfiles(before: &str, after: &str) -> Result<Vec<CargoUpdateLine>>
     Ok(out)
 }
 
-fn lockfile_versions(toml_text: &str) -> Result<BTreeMap<String, String>> {
+pub(super) fn lockfile_versions(toml_text: &str) -> Result<BTreeMap<String, String>> {
     let parsed: toml::Value =
         toml_text
             .parse()

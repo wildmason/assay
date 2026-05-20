@@ -2,6 +2,33 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-05-20
+
+Targeted single-dep validation — the canonical "I just heard about a CVE in foo, validate moving to foo@1.5.3" workflow finally has a first-class flag.
+
+### Added
+
+- **`assay analyze --dep <name>@<version>`** — Skip the standard outdated-discovery proposer (`cargo update --dry-run`, `npm outdated`, etc.) and build a synthetic single proposal: `from` is resolved from the project's lockfile or declared constraint, `to` is the operator-supplied version. The proposal flows through the same classifier / validator / apply pipeline as a discovered proposal, so `--dep foo@1.2.3 --validate` is the canonical way to answer "would moving to foo 1.2.3 break my project?" without scanning the rest of the dep graph.
+- **Scoped npm packages handled** via rightmost-`@` separator parsing: `--dep @angular/core@22.0.0` works; the leading `@` stays attached to the scope name.
+- **Clean exit when nothing to do.** When the requested dep isn't declared in any enabled ecosystem at the repo, or is already pinned at the requested version, the run emits a one-line stderr notice (`[dep] foo@1.2.3: not declared in any enabled ecosystem at this repo, or already pinned at the requested version. Nothing to validate.`) and a per-ecosystem "already resolves to X in Cargo.lock" notice when the lockfile already matches.
+- **Lockfile reads across all four npm flavors.** `package-lock.json` reuses the existing v2/v3 reader; `pnpm-lock.yaml` is parsed via a focused YAML walk of `importers.<importer>.dependencies.<name>.version` (peer-suffix `(react@18)` stripped); yarn berry `yarn.lock` reuses the existing `__metadata:`-anchored descriptor parser; yarn1's custom-format `yarn.lock` falls through to a constraint-strip fallback against `package.json` (acceptable for v1 — produces a working proposal even if `from` loses any narrowing the lockfile would have provided).
+- **Trait surface.** New `DependencyEcosystem::synthesize_dep_proposal(name, target_version, manifests, repo, ctx) -> Result<Option<Proposal>>` method with a sensible `Ok(None)` default so ecosystems that don't support `--dep` (currently `github-actions`, whose `<subject>@<ref>` shape isn't a version) inherit a clean skip rather than a crash.
+
+### Internal
+
+- **`parse_dep_spec` (`src/cli/args.rs`)** parses `<name>@<version>` with 9 covering tests (plain, scoped, prerelease, build-metadata, and 5 rejection cases: missing `@`, empty version, empty name from `@1.0.0`, empty spec, bare scope without version).
+- **10 new ecosystem tests** for the synthesize path: 4 cargo (success, dep absent, already-at-target, major-bump-as-breaking), 6 npm (npm/pnpm/yarn-berry lockfile reads, dep absent, already-at-target, yarn1 constraint-strip fallback).
+- Tier classification reuses `classify_unchanged_bump` / `classify_npm_bump`. LockfileOnly tier is suppressed in v1 — even bumps that satisfy the existing constraint route through the manifest-widening applier (idempotent widen to the same value), which is conservative-correct but produces a harmless manifest edit the discovery proposer would have avoided. Refining this is a follow-up.
+
+### End-to-end verification (dogfooded)
+
+- `assay analyze --dep sha2@0.11.0 --repo .` against assay's own Cargo repo emits one Breaking proposal (`sha2 0.10.9 -> 0.11.0`) with the `source:--dep` note.
+- `assay analyze --dep typescript@6.0.0 --repo <aegis>` against the aegis npm project emits one Breaking proposal (`typescript 5.9.3 -> 6.0.0`) with three correctly-resolved consumers (`@angular/compiler-cli`, `ng-packagr`, `rollup-plugin-dts`) — the peer-dep walker found them via `affected_consumers` enrichment.
+- `assay analyze --dep nonsense` errors cleanly: `assay: --dep value 'nonsense' is missing '@version'; expected '<name>@<version>'`.
+- `assay analyze --dep sha2@0.10.9` (already-at-target) and `--dep nonexistent@1.0.0` (not declared) both exit cleanly with the per-ecosystem and cli-level notices.
+
+712 tests pass (up from 702 in 1.4.2); clippy clean under `-D warnings`.
+
 ## [1.4.2] — 2026-05-20
 
 Continuation of the 1.4.1 internal refactor: finish breaking up the remaining godfiles. No behavior changes; no public-API changes; identical CLI surface, receipt schema, and event stream. 693 tests still pass; clippy still clean under `-D warnings`; end-to-end dogfood against assay's own repo still emits the expected 4 cargo proposals.

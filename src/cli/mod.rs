@@ -109,6 +109,14 @@ fn dispatch(cli: Cli) -> Result<()> {
 
 fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut args = args;
+    // Parse `--dep <name>@<version>` upfront so a malformed spec fails
+    // before any IO. `None` means "run the discovery proposer normally"
+    // (the prior behavior); `Some((name, version))` short-circuits each
+    // ecosystem's discovery in favor of a synthetic single-proposal path.
+    let dep_target: Option<(String, String)> = match args.dep.as_deref() {
+        Some(spec) => Some(parse_dep_spec(spec).map_err(Error::other)?),
+        None => None,
+    };
     // Load config first — ProjectScope::resolve needs `[project] roots`
     // for the polyglot multi-scan-root case.
     let config = crate::config::load(&args.repo)?;
@@ -271,7 +279,28 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     refresh_cache: args.refresh_cache,
                     sha_pin_proposals: !args.no_sha_pin_proposals,
                 };
-                let mut proposals = ecosystem.propose_updates(&manifests, scan_root, &context)?;
+                let mut proposals = if let Some((dep_name, dep_version)) = &dep_target {
+                    // `--dep` bypasses the discovery proposer in favor of a
+                    // synthesized single-proposal path: the ecosystem reads
+                    // the dep's current pin from manifest/lockfile state
+                    // and builds one Proposal with `from = current,
+                    // to = <operator-supplied>`. Ecosystems that don't
+                    // support `--dep` (currently github-actions, whose
+                    // `<subject>@<ref>` shape isn't a version) inherit the
+                    // default `Ok(None)` and contribute nothing here.
+                    match ecosystem.synthesize_dep_proposal(
+                        dep_name,
+                        dep_version,
+                        &manifests,
+                        scan_root,
+                        &context,
+                    )? {
+                        Some(p) => vec![p],
+                        None => Vec::new(),
+                    }
+                } else {
+                    ecosystem.propose_updates(&manifests, scan_root, &context)?
+                };
                 // Enrich each proposal with the list of workspace members
                 // that directly declare the subject as a dependency. Scoped
                 // to scan_root so per-sub-project consumer lists are
@@ -639,6 +668,21 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             run_json_path: run_json_path.display().to_string(),
             finished_at: receipt.finished_at.clone(),
         });
+    }
+
+    // `--dep` mode and no proposal produced means the dep wasn't declared
+    // in any enabled ecosystem at this repo. Surface a single clear
+    // explanation to stderr so the operator doesn't read "0 proposal(s)"
+    // and assume the dep already passes — it just wasn't found anywhere
+    // worth checking. Ecosystem-level "already at target" notices fired
+    // earlier from synthesize_dep_proposal stderr lines.
+    if let Some((dep_name, dep_version)) = &dep_target
+        && all_proposals.is_empty()
+    {
+        eprintln!(
+            "[dep] {dep_name}@{dep_version}: not declared in any enabled ecosystem at this repo, \
+             or already pinned at the requested version. Nothing to validate.",
+        );
     }
 
     if matches!(args.format, OutputFormat::Json) {
@@ -1825,6 +1869,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         })
         .expect_err("host validation must be gated");
         assert!(err.to_string().contains("--unsafe-host-validation"));
@@ -1906,6 +1951,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;
@@ -2404,6 +2450,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         }
     }
 
@@ -2672,6 +2719,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         let validator = build_validator(&args, &args.repo).expect("gate-cmd should always build");
         // CustomBackend reports `needs_workflow_file() == false`, so the
@@ -2748,6 +2796,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         // Just needs to not error during construction.
         build_validator(&args, &args.repo).expect("gate-file should always build");
@@ -2787,6 +2836,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         // forge may or may not be on PATH; what matters is that the
         // empty dir gives no manifest and no workflows. On a dev box
@@ -2840,6 +2890,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         });
         // We don't care whether the rest of the pipeline succeeds in
         // this empty tempdir; the assertion is that we are *not*
@@ -4136,6 +4187,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(filter.require_pull_request_trigger);
@@ -4173,6 +4225,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert!(!filter.require_pull_request_trigger);
@@ -4208,6 +4261,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         let filter = workflow_filter_from_args(&args);
         assert_eq!(filter.include_globs, vec!["always.yml"]);
@@ -4245,6 +4299,7 @@ mod tests {
             cache_ttl: "7d".into(),
             explain: false,
             member_gate: false,
+            dep: None,
         };
         let cargo = crate::ecosystem::cargo::CargoEcosystem;
         let gha = crate::ecosystem::github_actions::GitHubActionsEcosystem;

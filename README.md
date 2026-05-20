@@ -59,6 +59,19 @@ Or branch + push + open a pull request:
 assay analyze --apply-pr
 ```
 
+### Targeted single-dep validation (`--dep`)
+
+When you already know which upgrade you want to investigate — a freshly disclosed CVE, a release note that flagged behavior changes, a partner team's request to take a specific patch — skip the full discovery scan and validate exactly that one bump:
+
+```sh
+assay analyze --dep serde@1.0.228 --validate
+assay analyze --dep @angular/core@22.0.0 --validate
+```
+
+`<NAME>@<VERSION>` accepts the usual ecosystem shapes — plain (`serde@1.0.228`), scoped npm (`@angular/core@22.0.0`), prerelease (`tokio@1.45.0-rc.1`), build metadata (`toml@1.1.2+spec-1.1.0`). The current pin is resolved from your lockfile (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`, yarn berry `yarn.lock`); yarn1 falls back to the declared constraint in `package.json`. When the dep isn't declared in any enabled ecosystem at the repo, or is already pinned at the requested version, the run exits cleanly with a one-line notice — no false-positive zero-proposal report.
+
+`--dep` composes with `--validate`, `--apply-local`, and `--apply-pr` the same way as a discovered proposal, so `--dep serde@1.0.228 --apply-pr` is the canonical "validate this CVE fix end-to-end and open the PR if it survives CI" workflow.
+
 ## The four apply modes
 
 | Mode | Flag | What it does | Mutates the host? |

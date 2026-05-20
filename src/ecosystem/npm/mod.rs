@@ -90,7 +90,7 @@ use apply::{apply_npm_proposal, copy_back_npm_sandbox};
 use flavor::detect_flavor;
 use propose::{
     annotate_proposals_with_overrides, filter_ignored_packages, run_npm_proposer,
-    tag_proposals_with_cohorts, widen_cohort_tiers,
+    synthesize_dep_proposal, tag_proposals_with_cohorts, widen_cohort_tiers,
 };
 use workspaces::resolve_npm_consumers;
 
@@ -163,6 +163,17 @@ impl DependencyEcosystem for NpmEcosystem {
         widen_cohort_tiers(&mut proposals);
         annotate_proposals_with_overrides(&mut proposals, repo);
         Ok(filter_ignored_packages(proposals, &ctx.ignored_subjects))
+    }
+
+    fn synthesize_dep_proposal(
+        &self,
+        name: &str,
+        target_version: &str,
+        manifests: &[Manifest],
+        repo: &Path,
+        _ctx: &EcosystemContext,
+    ) -> Result<Option<Proposal>> {
+        synthesize_dep_proposal(name, target_version, manifests, repo)
     }
 
     fn gate_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
@@ -289,6 +300,183 @@ mod tests {
         let rows = parse_npm_outdated_output(stdout).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].current, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // --dep synthesize path: targeted single-proposal generation across
+    // npm flavors. Covers the npm-format lockfile read, the pnpm-lock
+    // YAML walk, the yarn berry lockfile parse, and the constraint-strip
+    // fallback used for yarn1.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn synthesize_dep_proposal_npm_reads_lockfile_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"app","version":"0.1.0","dependencies":{"lodash":"^4.17.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("package-lock.json"),
+            r#"{
+                "name":"app",
+                "lockfileVersion":3,
+                "packages":{
+                    "":{"name":"app","version":"0.1.0"},
+                    "node_modules/lodash":{"version":"4.17.20"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let proposal = eco
+            .synthesize_dep_proposal("lodash", "4.18.1", &manifests, repo, &ctx)
+            .unwrap()
+            .expect("synthesize should produce a proposal");
+        assert_eq!(proposal.subject, "lodash");
+        assert_eq!(proposal.from, "4.17.20");
+        assert_eq!(proposal.to, "4.18.1");
+        assert!(matches!(proposal.bump_tier, BumpTier::Compatible));
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_pnpm_reads_pnpm_lock_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"app","version":"0.1.0","dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("pnpm-lock.yaml"),
+            "lockfileVersion: '6.0'\n\
+             \n\
+             importers:\n  .:\n    dependencies:\n      react:\n        specifier: ^18.0.0\n        version: 18.2.0\n",
+        )
+        .unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let proposal = eco
+            .synthesize_dep_proposal("react", "19.0.0", &manifests, repo, &ctx)
+            .unwrap()
+            .expect("synthesize should produce a proposal");
+        assert_eq!(proposal.from, "18.2.0");
+        assert_eq!(proposal.to, "19.0.0");
+        assert!(matches!(proposal.bump_tier, BumpTier::Breaking));
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_yarn_berry_reads_yarn_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"app","version":"0.1.0","dependencies":{"@angular/core":"^21.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("yarn.lock"),
+            "__metadata:\n  version: 9\n\n\
+             \"@angular/core@npm:^21.0.0\":\n  version: 21.2.13\n  resolution: \"@angular/core@npm:21.2.13\"\n",
+        )
+        .unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let proposal = eco
+            .synthesize_dep_proposal("@angular/core", "22.0.0", &manifests, repo, &ctx)
+            .unwrap()
+            .expect("synthesize should produce a proposal");
+        assert_eq!(proposal.from, "21.2.13");
+        assert_eq!(proposal.to, "22.0.0");
+        assert!(matches!(proposal.bump_tier, BumpTier::Breaking));
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_returns_none_when_dep_absent_from_npm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"app","dependencies":{"lodash":"^4.17.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("package-lock.json"),
+            r#"{"name":"app","lockfileVersion":3,"packages":{"node_modules/lodash":{"version":"4.17.20"}}}"#,
+        )
+        .unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let result = eco
+            .synthesize_dep_proposal("nonexistent", "1.0.0", &manifests, repo, &ctx)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_returns_none_when_already_at_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"app","dependencies":{"vite":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("package-lock.json"),
+            r#"{"name":"app","lockfileVersion":3,"packages":{"node_modules/vite":{"version":"5.4.10"}}}"#,
+        )
+        .unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let result = eco
+            .synthesize_dep_proposal("vite", "5.4.10", &manifests, repo, &ctx)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_yarn1_falls_back_to_constraint_strip() {
+        // yarn1 yarn.lock is custom-format and we don't parse it for
+        // --dep in v1; the constraint-strip path covers the dep by
+        // reading the declared `^X.Y.Z` from package.json. This isn't
+        // pinpoint-accurate (loses the lockfile's narrower pin) but
+        // produces a working proposal for the validator.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"app","dependencies":{"chalk":"^4.1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("yarn.lock"),
+            "# yarn lockfile v1\n\nchalk@^4.1.0:\n  version \"4.1.2\"\n",
+        )
+        .unwrap();
+        let eco = NpmEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let proposal = eco
+            .synthesize_dep_proposal("chalk", "5.0.0", &manifests, repo, &ctx)
+            .unwrap()
+            .expect("synthesize should produce a proposal");
+        // Constraint-strip fallback recovers `4.1.0` from `^4.1.0`,
+        // not the lockfile's `4.1.2`. `from = 4.1.0` is acceptable
+        // for the proposal — the bump still classifies as Breaking
+        // (major 4 → 5).
+        assert_eq!(proposal.from, "4.1.0");
+        assert_eq!(proposal.to, "5.0.0");
+        assert!(matches!(proposal.bump_tier, BumpTier::Breaking));
     }
 
     #[test]

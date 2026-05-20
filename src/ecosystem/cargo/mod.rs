@@ -39,7 +39,7 @@ pub(crate) use propose::{filter_ignored_crates, tag_proposals_with_cargo_cohorts
 use propose::filter_to_direct_deps;
 
 use consumers::resolve_cargo_consumers;
-use propose::run_cargo_proposer;
+use propose::{run_cargo_proposer, synthesize_dep_proposal};
 
 #[derive(Debug, Default, Clone)]
 pub struct CargoEcosystem;
@@ -94,6 +94,17 @@ impl DependencyEcosystem for CargoEcosystem {
         tag_proposals_with_cargo_cohorts(&mut proposals);
         super::cohort_pipeline::widen_cohort_tiers(&mut proposals);
         Ok(filter_ignored_crates(proposals, &ctx.ignored_subjects))
+    }
+
+    fn synthesize_dep_proposal(
+        &self,
+        name: &str,
+        target_version: &str,
+        manifests: &[Manifest],
+        repo: &Path,
+        _ctx: &EcosystemContext,
+    ) -> Result<Option<Proposal>> {
+        synthesize_dep_proposal(name, target_version, manifests, repo)
     }
 
     fn gate_workflows(&self, _proposal: &Proposal, repo: &Path) -> Result<Vec<PathBuf>> {
@@ -675,6 +686,79 @@ warning: not updating lockfile due to dry run
             );
         }
         assert!(!id.starts_with('-') && !id.ends_with('-'));
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_builds_proposal_when_dep_in_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("serde", "1.0.100")])).unwrap();
+        let eco = CargoEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let proposal = eco
+            .synthesize_dep_proposal("serde", "1.0.228", &manifests, repo, &ctx)
+            .unwrap()
+            .expect("synthesize should produce a proposal");
+        assert_eq!(proposal.subject, "serde");
+        assert_eq!(proposal.from, "1.0.100");
+        assert_eq!(proposal.to, "1.0.228");
+        // Same caret group (^1) → Compatible.
+        assert!(matches!(proposal.bump_tier, BumpTier::Compatible));
+        // The `--dep` notes marker exists so the receipt explains
+        // why this proposal isn't paired with a discovered bump.
+        assert!(
+            proposal.notes.iter().any(|n| n.contains("--dep")),
+            "expected --dep source marker, got {:?}",
+            proposal.notes,
+        );
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_returns_none_when_dep_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("serde", "1.0.100")])).unwrap();
+        let eco = CargoEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let result = eco
+            .synthesize_dep_proposal("nonexistent-crate", "1.0.0", &manifests, repo, &ctx)
+            .unwrap();
+        assert!(result.is_none(), "expected None for absent crate");
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_returns_none_when_already_at_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("tokio", "1.45.0")])).unwrap();
+        let eco = CargoEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let result = eco
+            .synthesize_dep_proposal("tokio", "1.45.0", &manifests, repo, &ctx)
+            .unwrap();
+        assert!(result.is_none(), "expected None when already at target");
+    }
+
+    #[test]
+    fn synthesize_dep_proposal_classifies_major_bump_as_breaking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("clap", "3.2.0")])).unwrap();
+        let eco = CargoEcosystem;
+        let manifests = eco.detect_manifests(repo).unwrap();
+        let ctx = EcosystemContext::default();
+        let proposal = eco
+            .synthesize_dep_proposal("clap", "4.0.0", &manifests, repo, &ctx)
+            .unwrap()
+            .expect("synthesize should produce a proposal");
+        assert!(matches!(proposal.bump_tier, BumpTier::Breaking));
     }
 
     #[test]

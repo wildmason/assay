@@ -102,6 +102,36 @@ pub trait DependencyEcosystem: Send + Sync {
         ctx: &EcosystemContext,
     ) -> Result<Vec<Proposal>>;
 
+    /// Build a single synthetic proposal for a user-specified
+    /// `<name>@<version>` upgrade, bypassing the standard
+    /// outdated-discovery proposer ([`Self::propose_updates`]).
+    ///
+    /// Behaviour:
+    /// - Returns `Ok(None)` when this ecosystem doesn't declare `name`
+    ///   in any of its manifests at `repo` (lockfile entry absent, no
+    ///   `uses:` reference, etc.). The cli treats this as "this dep
+    ///   doesn't live here" and tries the next ecosystem.
+    /// - Returns `Ok(None)` when the dep is declared but already
+    ///   resolves at `target_version`, with a best-effort one-line
+    ///   notice on stderr explaining why the run produced no
+    ///   proposals.
+    /// - Returns `Ok(Some(proposal))` when a fresh proposal makes
+    ///   sense, classified through the ecosystem's normal tier rules.
+    ///
+    /// The default impl returns `Ok(None)` so ecosystems that don't
+    /// support `--dep` (currently github-actions, which uses a different
+    /// `<subject>@<ref>` shape) silently skip rather than crashing.
+    fn synthesize_dep_proposal(
+        &self,
+        _name: &str,
+        _target_version: &str,
+        _manifests: &[Manifest],
+        _repo: &Path,
+        _ctx: &EcosystemContext,
+    ) -> Result<Option<Proposal>> {
+        Ok(None)
+    }
+
     /// Identify the workflow files this proposal should be validated
     /// against (the "gate" — what counts as 'this passes'). Returned paths
     /// are workspace-relative.
