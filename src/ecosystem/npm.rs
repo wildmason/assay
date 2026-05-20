@@ -636,24 +636,29 @@ pub(crate) fn explain_npm_bump(from: &str, to: &str) -> crate::model::BumpExplan
             _ if from_v.major != to_v.major => "npm:caret-major-crossed",
             _ => "npm:caret-group-crossed",
         };
+        // Each summary names the rule once and the input boundary
+        // once — the previous form repeated both halves in slightly
+        // different words (dogfood-flagged as stuttering). Each also
+        // hints at the implied manifest edit the operator will need
+        // to widen the caret constraint (`^{from} → ^{to}`).
         let summary = match (from_v.major, from_v.minor) {
             (0, 0) => format!(
-                "npm: 0.0.x band — every patch is breaking-by-spec; {from} -> {to} crosses \
-                 a patch boundary"
+                "npm: 0.0.x band — {from} -> {to} crosses a patch boundary (breaking-by-spec); \
+                 widens `^{from}` -> `^{to}`"
             ),
             (0, _) if from_v.minor != to_v.minor => format!(
-                "npm: 0.x band — minor bumps are breaking-by-spec; {from} -> {to} crosses \
-                 minor={} -> minor={}",
+                "npm: 0.x band — {from} -> {to} crosses minor={}→{} (breaking-by-spec); \
+                 widens `^{from}` -> `^{to}`",
                 from_v.minor, to_v.minor
             ),
             _ if from_v.major != to_v.major => format!(
-                "npm: 1.0+ band — major bumps are breaking-by-spec; {from} -> {to} crosses \
-                 major={} -> major={}",
+                "npm: 1.0+ band — {from} -> {to} crosses major={}→{} (breaking-by-spec); \
+                 widens `^{from}` -> `^{to}`",
                 from_v.major, to_v.major
             ),
             _ => format!(
-                "npm: bump crosses a caret-compat group boundary; {from} -> {to} requires \
-                 review"
+                "npm: {from} -> {to} crosses a caret-compat group boundary; widens \
+                 `^{from}` -> `^{to}` and merits review"
             ),
         };
         BumpExplanation {

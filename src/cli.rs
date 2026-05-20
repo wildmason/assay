@@ -154,6 +154,17 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     pub fail_fast: bool,
 
+    /// Suppress the per-ecosystem manifest-detection breadcrumbs
+    /// (`[npm] manifests detected: N`, `[cargo] manifests detected:
+    /// M`, etc.) and the per-proposal `proposal <id>: ...` lines.
+    /// The bottom-of-run summary + tier breakdown + per-tier detail
+    /// section still print. Useful when piping text output into
+    /// another tool or when the breadcrumbs are too noisy. No effect
+    /// on `--format json` (which already batches output to a single
+    /// document at end-of-run).
+    #[arg(long)]
+    pub quiet: bool,
+
     /// Disable network calls during proposer phase. Network-bound
     /// ecosystems (currently: GitHub Actions, which resolves
     /// `uses:@SHA` against the latest release on github.com) fall
@@ -439,8 +450,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             // stream of top-level JSON objects that was neither
             // strict JSON nor NDJSON — `JSON.parse(stdout)` failed and
             // the proposals were missing from the payload entirely
-            // (2026-05-20 dogfood, 4 of 7 agents confirmed).
-            if matches!(args.format, OutputFormat::Text) {
+            // (2026-05-20 dogfood, 4 of 7 agents confirmed). --quiet
+            // also suppresses the inline breadcrumb (still emits the
+            // bottom-of-run summary).
+            if matches!(args.format, OutputFormat::Text) && !args.quiet {
                 report_text(ecosystem.name(), scan_root_rel.as_deref(), &manifests);
             }
             for manifest in &manifests {
@@ -504,8 +517,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                     // Text mode prints proposals as they're discovered
                     // (progressive feedback during slow cargo runs).
                     // JSON mode batches everything into the final
-                    // single-document emission at end-of-run.
-                    if matches!(args.format, OutputFormat::Text) {
+                    // single-document emission at end-of-run. --quiet
+                    // suppresses the inline lines; the bottom-of-run
+                    // per-tier section still surfaces every proposal.
+                    if matches!(args.format, OutputFormat::Text) && !args.quiet {
                         println!(
                             "    proposal {}: {} {} -> {}",
                             proposal.id, proposal.subject, proposal.from, proposal.to,
@@ -4302,6 +4317,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -4381,6 +4397,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -4873,6 +4890,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5135,6 +5153,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5208,6 +5227,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5245,6 +5265,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -5296,6 +5317,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6589,6 +6611,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6624,6 +6647,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6657,6 +6681,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
@@ -6692,6 +6717,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            quiet: false,
             offline: false,
             refresh_cache: false,
             ignore: Vec::new(),
