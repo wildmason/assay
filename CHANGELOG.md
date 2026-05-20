@@ -2,6 +2,46 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] — 2026-05-20
+
+Continuation of the 1.4.1 internal refactor: finish breaking up the remaining godfiles. No behavior changes; no public-API changes; identical CLI surface, receipt schema, and event stream. 693 tests still pass; clippy still clean under `-D warnings`; end-to-end dogfood against assay's own repo still emits the expected 4 cargo proposals.
+
+### Internal
+
+- **`validator.rs` (2898 lines) → `validator/` module tree** with three backend submodules + a trim mod.rs:
+  - `validator/backend_build_test.rs` — manifest-inferred cargo build+test backend (`BuildTestBackend`)
+  - `validator/backend_forge.rs` — `ForgeRunBackend` + `ValidatorCommandBuilder` + `ForgeRunSummary` + `parse_forge_run_output`
+  - `validator/backend_custom.rs` — `CustomBackend` for `--gate-cmd` / `--gate-file`
+  - `validator/mod.rs` — trait, types, the `Validator` orchestrator, and the shared `stderr_tail` helper
+- **`ecosystem/github_actions.rs` (2350 lines) → `ecosystem/github_actions/` module tree**:
+  - `github_actions/tag_utils.rs` — pure tag-parsing helpers (`parse_action_tag`, `tag_specificity`, `count_version_segments`, `truncate_tag`, `is_shortcut_ref`, `is_likely_commit_sha`, `is_version_char`)
+  - `github_actions/manifest_discovery.rs` — workflow/composite-action detection + `uses:` line parser (`walk_composite_actions`, `workflow_to_manifest`, `collect_uses_references`, `parse_uses_value`, `extract_tag_comment`)
+  - `github_actions/propose.rs` — proposer (`aggregate_actions_from_manifests`, `pick_target_tag`, `build_action_proposals`, `build_sha_pin_proposal`, `classify_action_bump`, `explain_action_bump`, `filter_ignored_actions`)
+  - `github_actions/apply.rs` — `rewrite_uses_in_workflow` + line-terminator preservation
+  - `github_actions/mod.rs` — `GitHubActionsEcosystem` impl + shared types (`UsesReference`, `UsesKind`, `PinKind`, `ActionAggregate`) + tests
+- **`ecosystem/cargo.rs` (2288 lines) → `ecosystem/cargo/` module tree**:
+  - `cargo/parse.rs` — `CargoUpdateLine` / `CargoUnchangedLine` types and `parse_cargo_update_output` / `parse_cargo_unchanged_output` / `diff_lockfiles` / `cross_check`
+  - `cargo/classify.rs` — caret-compat group rules (`classify_unchanged_bump`, `explain_unchanged_bump`, `explain_lockfile_only_bump`)
+  - `cargo/propose.rs` — `run_cargo_proposer`, `propose_from_cargo_dry_run`, `propose_from_cargo_stdout`, `propose_unchanged_from_cargo_stdout`, `filter_ignored_crates`, `tag_proposals_with_cargo_cohorts`, transitive-dep filter, `sanitize_id_segment`
+  - `cargo/apply.rs` — `apply_cargo_proposal` + merged variants + `apply_cargo_update_to_tree` + copy-back primitives
+  - `cargo/consumers.rs` — `resolve_cargo_consumers` + `find_workspace_consumers_in_metadata` + `can_reach_any` (the cargo_metadata BFS)
+  - `cargo/mod.rs` — `CargoEcosystem` impl + tests
+- **`ecosystem/npm.rs` (3845 lines) → `ecosystem/npm/` module tree** — finished the split started in 1.4.1:
+  - `npm/flavor.rs` — `NpmFlavor` + `detect_flavor` + `yarn_lock_is_berry` + platform-aware binary names + spawn-IO error mapper
+  - `npm/outdated.rs` — `NpmOutdatedRow` + `parse_npm_outdated_output` + `parse_yarn1_outdated_output` + `read_lockfile_versions` + `backfill_current_from_lockfile`
+  - `npm/classify.rs` — `classify_npm_bump` + `explain_npm_bump` + `explain_npm_lockfile_only_bump`
+  - `npm/direct_deps.rs` — `collect_direct_dep_names` + `collect_direct_deps_with_constraints`
+  - `npm/berry.rs` — `parse_berry_lockfile` + `parse_berry_descriptor_name` + `query_berry_latest_version` + `propose_berry_updates`
+  - `npm/workspaces.rs` — `WorkspaceMember` + `detect_workspace_members` + `resolve_npm_consumers`
+  - `npm/apply.rs` — `apply_npm_proposal` + install variants + package.json edit helpers + `copy_back_npm_sandbox`
+  - `npm/propose.rs` — `build_npm_proposals` + `run_npm_proposer` + `filter_to_direct_deps` + cohort/override/ignore annotation pipeline
+  - `npm/peer_walk.rs` — existing module retained as-is
+  - `npm/mod.rs` — `NpmEcosystem` impl + tests
+
+### Why
+
+Every previously-published symbol path is preserved through re-exports at the matching `*/mod.rs`; downstream callers (`assay-gui`, `cli`, `apply_merger`) didn't need to change. The change is purely a layout one: each submodule is now under ~750 lines of production code with focused tests, so a future change to (say) the npm `--apply-pr` flow lives in `npm/apply.rs` without sifting through 3845 lines of unrelated outdated-parsing + workspace-walk + cohort-annotation code. The same standard the cli refactor set in 1.4.1.
+
 ## [1.4.1] — 2026-05-20
 
 Internal refactor: break up the godfiles. No behavior changes; no public-API changes; identical CLI surface, receipt schema, and event stream. 693 tests still pass; clippy still clean under `-D warnings`.
