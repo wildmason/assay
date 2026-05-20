@@ -64,7 +64,9 @@ impl DependencyEcosystem for CargoEcosystem {
         if !has_lock {
             return Ok(Vec::new());
         }
-        let proposals = run_cargo_proposer(repo, manifests)?;
+        let mut proposals = run_cargo_proposer(repo, manifests)?;
+        tag_proposals_with_cargo_cohorts(&mut proposals);
+        super::cohort_pipeline::widen_cohort_tiers(&mut proposals);
         Ok(filter_ignored_crates(proposals, &ctx.ignored_subjects))
     }
 
@@ -945,6 +947,21 @@ pub(crate) fn filter_ignored_crates(proposals: Vec<Proposal>, ignored: &[String]
         .into_iter()
         .filter(|p| !ignored.iter().any(|i| i == &p.subject))
         .collect()
+}
+
+/// Set the `cohort` field on every cargo proposal whose subject
+/// matches a known crate-family cohort definition. Pure annotation
+/// pass — no proposals added, dropped, or rewritten; just tagged
+/// so the reporter can group them under one heading and the
+/// validator/applier treat them as atomic units. Stand-alone
+/// crates (`anyhow`, `thiserror`, `regex`, …) keep `cohort: None`.
+/// See [`super::cargo_cohorts::KNOWN_COHORTS`].
+pub(crate) fn tag_proposals_with_cargo_cohorts(proposals: &mut [Proposal]) {
+    for p in proposals.iter_mut() {
+        if let Some(c) = super::cargo_cohorts::match_cohort(&p.subject) {
+            p.cohort = Some(c.id.to_string());
+        }
+    }
 }
 
 /// Cargo.toml) dependency names. Used to drop transitive-only entries
