@@ -565,6 +565,7 @@ pub fn propose_from_cargo_dry_run(
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         });
     }
     Ok(proposals)
@@ -1030,6 +1031,7 @@ pub fn propose_unchanged_from_cargo_stdout(
             bump_tier: tier,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         });
     }
     proposals
@@ -1064,6 +1066,7 @@ pub fn propose_from_cargo_stdout(
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         });
     }
     Ok(proposals)
@@ -1635,6 +1638,7 @@ warning: not updating lockfile due to dry run
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 
@@ -1843,6 +1847,7 @@ warning: not updating lockfile due to dry run
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 
@@ -1868,6 +1873,7 @@ warning: not updating lockfile due to dry run
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
         let mut workflows = eco.gate_workflows(&stub_proposal, tmp.path()).unwrap();
         workflows.sort();
@@ -1923,6 +1929,7 @@ warning: not updating lockfile due to dry run
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 

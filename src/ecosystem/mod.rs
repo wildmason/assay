@@ -14,6 +14,7 @@ pub mod cargo_manifest_editor;
 pub mod github_actions;
 pub mod github_actions_api;
 pub mod npm;
+pub mod npm_cohorts;
 
 /// Identifies an ecosystem by short name. Matches the string stored on
 /// `Proposal.ecosystem` so the receipt index can group by it.

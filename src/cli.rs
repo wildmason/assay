@@ -1091,42 +1091,145 @@ fn tier_counts<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) -> (usize,
 /// ```
 fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) {
     use crate::model::BumpTier;
+    let mut lockfile_only: Vec<&Proposal> = Vec::new();
     let mut compatible: Vec<&Proposal> = Vec::new();
     let mut breaking: Vec<&Proposal> = Vec::new();
     for p in proposals {
         match p.bump_tier {
+            BumpTier::LockfileOnly => lockfile_only.push(p),
             BumpTier::Compatible => compatible.push(p),
             BumpTier::Breaking => breaking.push(p),
-            BumpTier::LockfileOnly => {}
         }
     }
-    if compatible.is_empty() && breaking.is_empty() {
+    // Lockfile-only is shown in the per-tier section only when it
+    // carries at least one cohort — otherwise it stays collapsed into
+    // the top-of-run "tier breakdown: N lockfile-only / ..." count to
+    // keep single-package cargo runs lean. The dogfood (slate, aegis,
+    // mortar) flagged 33-line @angular/* + @tiptap/* lockfile-only
+    // walls; surfacing the cohort header as one line under
+    // `lockfile-only:` is the dense-but-informative pivot.
+    let lockfile_has_cohort = lockfile_only.iter().any(|p| p.cohort.is_some());
+    if compatible.is_empty() && breaking.is_empty() && !lockfile_has_cohort {
         return;
     }
     println!("assay: per-tier upgrades:");
-    let print_group = |label: &str, mut group: Vec<&Proposal>| {
+    let print_group = |label: &str, group: Vec<&Proposal>| {
         if group.is_empty() {
             return;
         }
-        group.sort_by(|a, b| a.subject.cmp(&b.subject));
         println!("  {label}:");
-        for p in group {
-            let mut line = format!("    {}  {} -> {}", p.subject, p.from, p.to);
-            if !p.notes.is_empty() {
-                line.push_str(&format!("  [{}]", p.notes.join(", ")));
-            }
-            line.push_str(&format_consumers_suffix(&p.affected_consumers));
-            println!("{line}");
-            // When --explain was set, the proposer attached a
-            // BumpExplanation; render it as an indented sub-line so the
-            // operator sees the rule + reason inline with the proposal.
-            if let Some(exp) = &p.explanation {
-                println!("      [{}] {}", exp.rule, exp.summary);
-            }
-        }
+        print_group_with_cohorts(&group);
     };
+    if lockfile_has_cohort {
+        print_group("lockfile-only", lockfile_only);
+    }
     print_group("compatible", compatible);
     print_group("breaking", breaking);
+}
+
+/// Render one tier-group with cohort awareness: cohort members
+/// collapse into one header line plus a member list; stand-alones
+/// render as-is. Stable ordering — cohorts first (alphabetical by id),
+/// then stand-alones (alphabetical by subject). This keeps the dense
+/// "@angular/* family" line at the top of a tier when an Angular
+/// project has half a dozen lockfile-only minor bumps; previously the
+/// reader had to mentally regroup them. See the 2026-05-20 dogfood
+/// against slate/aegis/wildmason.dev where this gap surfaced 3×.
+fn print_group_with_cohorts(group: &[&Proposal]) {
+    use std::collections::BTreeMap;
+    let mut by_cohort: BTreeMap<String, Vec<&Proposal>> = BTreeMap::new();
+    let mut standalone: Vec<&Proposal> = Vec::new();
+    for &p in group {
+        match &p.cohort {
+            Some(id) => by_cohort.entry(id.clone()).or_default().push(p),
+            None => standalone.push(p),
+        }
+    }
+    // Single-member cohorts (only one cohort package present in this
+    // tier — e.g. `@angular/cdk` alone with no `@angular/material`)
+    // render as stand-alone lines: a one-element cohort header
+    // wrapping a single member is pure overhead and obscures the
+    // version. Multi-member cohorts (the actual lockstep-bump value-
+    // prop) get the cohort header.
+    for (cohort_id, mut members) in by_cohort {
+        members.sort_by(|a, b| a.subject.cmp(&b.subject));
+        if members.len() == 1 {
+            standalone.push(members.into_iter().next().unwrap());
+        } else {
+            print_cohort_block(&cohort_id, &members);
+        }
+    }
+    standalone.sort_by(|a, b| a.subject.cmp(&b.subject));
+    for p in standalone {
+        print_single_proposal_line(p);
+    }
+}
+
+/// Render a cohort group as a single header line plus an indented
+/// member list. Shows the version range when members target
+/// different versions (e.g. `@angular/cdk` lags `@angular/core` by 2
+/// patches in some Angular releases) and a single version when they
+/// all converge.
+fn print_cohort_block(cohort_id: &str, members: &[&Proposal]) {
+    let display = crate::ecosystem::npm_cohorts::KNOWN_COHORTS
+        .iter()
+        .find(|c| c.id == cohort_id)
+        .map(|c| c.display)
+        .unwrap_or(cohort_id);
+    let from_versions: std::collections::BTreeSet<&str> =
+        members.iter().map(|p| p.from.as_str()).collect();
+    let to_versions: std::collections::BTreeSet<&str> =
+        members.iter().map(|p| p.to.as_str()).collect();
+    let from_str = format_version_set(&from_versions);
+    let to_str = format_version_set(&to_versions);
+    let n = members.len();
+    let word = if n == 1 { "package" } else { "packages" };
+    println!("    {display} cohort ({n} {word}, {from_str} -> {to_str}):");
+    for p in members {
+        let mut line = format!("      - {}", p.subject);
+        // Only show per-member version when it diverges from the
+        // group's range — otherwise the cohort header already covers
+        // it and the per-member line is noise.
+        if from_versions.len() > 1 || to_versions.len() > 1 {
+            line.push_str(&format!("  {} -> {}", p.from, p.to));
+        }
+        if !p.notes.is_empty() {
+            line.push_str(&format!("  [{}]", p.notes.join(", ")));
+        }
+        line.push_str(&format_consumers_suffix(&p.affected_consumers));
+        println!("{line}");
+        if let Some(exp) = &p.explanation {
+            println!("        [{}] {}", exp.rule, exp.summary);
+        }
+    }
+}
+
+fn print_single_proposal_line(p: &Proposal) {
+    let mut line = format!("    {}  {} -> {}", p.subject, p.from, p.to);
+    if !p.notes.is_empty() {
+        line.push_str(&format!("  [{}]", p.notes.join(", ")));
+    }
+    line.push_str(&format_consumers_suffix(&p.affected_consumers));
+    println!("{line}");
+    if let Some(exp) = &p.explanation {
+        println!("      [{}] {}", exp.rule, exp.summary);
+    }
+}
+
+/// Display a set of version strings as either a single value (when
+/// everyone agrees) or a `min..max` range. Used by the cohort header
+/// to show convergent vs divergent member versions in one line.
+fn format_version_set(versions: &std::collections::BTreeSet<&str>) -> String {
+    let mut iter = versions.iter();
+    let first = match iter.next() {
+        Some(v) => *v,
+        None => return String::new(),
+    };
+    if versions.len() == 1 {
+        return first.to_string();
+    }
+    let last = versions.iter().last().copied().unwrap_or(first);
+    format!("{first}..{last}")
 }
 
 /// Render a parenthesized "(N consumer(s): a, b, c)" suffix for the
@@ -3578,6 +3681,7 @@ mod tests {
                 bump_tier: BumpTier::Breaking,
                 affected_consumers: Vec::new(),
                 explanation: None,
+                cohort: None,
             },
             sandbox: PathBuf::from("/tmp/sandbox"),
             outcome: crate::model::ValidationOutcome {
@@ -3619,6 +3723,7 @@ mod tests {
                 bump_tier: BumpTier::LockfileOnly,
                 affected_consumers: Vec::new(),
                 explanation: None,
+                cohort: None,
             },
             sandbox: PathBuf::from("/tmp/sb"),
             outcome: crate::model::ValidationOutcome {
@@ -3707,6 +3812,7 @@ mod tests {
                 bump_tier: BumpTier::Breaking,
                 affected_consumers: Vec::new(),
                 explanation: None,
+                cohort: None,
             },
             summary: summary.into(),
         }
@@ -4232,6 +4338,7 @@ mod tests {
                 bump_tier: BumpTier::LockfileOnly,
                 affected_consumers: Vec::new(),
                 explanation: None,
+                cohort: None,
             },
             sandbox: PathBuf::from("/tmp/sb"),
             outcome: crate::model::ValidationOutcome {
@@ -4984,6 +5091,7 @@ mod tests {
             bump_tier: BumpTier::Compatible,
             affected_consumers: vec![],
             explanation: None,
+            cohort: None,
         }];
         populate_proposal_explanations(&mut proposals, "cargo");
         let exp = proposals[0]
@@ -5010,6 +5118,7 @@ mod tests {
             bump_tier: BumpTier::Breaking,
             affected_consumers: vec![],
             explanation: None,
+            cohort: None,
         }];
         populate_proposal_explanations(&mut proposals, "github-actions");
         let exp = proposals[0].explanation.as_ref().unwrap();
@@ -5033,6 +5142,7 @@ mod tests {
             bump_tier: BumpTier::LockfileOnly,
             affected_consumers: vec![],
             explanation: None,
+            cohort: None,
         }];
         populate_proposal_explanations(&mut proposals, "cargo");
         let exp = proposals[0].explanation.as_ref().unwrap();
@@ -5056,6 +5166,7 @@ mod tests {
             bump_tier: BumpTier::Compatible,
             affected_consumers: vec![],
             explanation: None,
+            cohort: None,
         }];
         populate_proposal_explanations(&mut proposals, "fictional");
         assert!(proposals[0].explanation.is_none());
@@ -5185,6 +5296,7 @@ mod tests {
                     bump_tier: crate::model::BumpTier::LockfileOnly,
                     affected_consumers: Vec::new(),
                     explanation: None,
+                    cohort: None,
                 },
                 tmp.path(),
                 &[],
@@ -5371,6 +5483,7 @@ mod tests {
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 

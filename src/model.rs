@@ -191,6 +191,15 @@ pub struct Proposal {
     /// deserialize cleanly.
     #[serde(default)]
     pub explanation: Option<BumpExplanation>,
+    /// Framework cohort this proposal belongs to (`@angular/*`,
+    /// `@tiptap/*`, `next + @next/*`, etc.). When set, all proposals
+    /// sharing this cohort id MUST move together — they're treated as
+    /// a single atomic apply unit by the validator + applier, and the
+    /// reporter groups them under one cohort header. `None` for
+    /// stand-alone proposals. `#[serde(default)]` for receipt
+    /// back-compat with pre-cohort runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort: Option<String>,
 }
 
 /// Diagnostic detail captured when a validator backend fails on a
@@ -476,6 +485,7 @@ mod tests {
             bump_tier: BumpTier::Breaking,
             affected_consumers: vec![],
             explanation: Some(exp.clone()),
+            cohort: None,
         };
         let json = serde_json::to_string(&proposal).unwrap();
         let back: Proposal = serde_json::from_str(&json).unwrap();

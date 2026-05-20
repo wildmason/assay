@@ -2,6 +2,25 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-20
+
+"Framework cohort" release. Closes the largest UX gap from the 0.4.0 dogfood: Angular / Tiptap / Vue / Next / Nuxt / SvelteKit / Astro / React / Vitest / Storybook / NestJS / Remix / @tauri-apps/* packages all publish in lockstep, but pre-0.5.0 they emitted as N independent proposals. Slate dogfood: 9 separate `@angular/*` proposals + 20 separate `@tiptap/*` proposals (33 lockfile-only lines total) when conceptually each cohort is one upgrade decision.
+
+### Added
+
+- **`cohort: Option<String>` field on `Proposal`.** Packages that belong to a known framework cohort get tagged at proposer time. New `crate::ecosystem::npm_cohorts` module holds the hardcoded definitions; matcher uses exact + prefix rules. 15 cohorts shipping: `angular-framework`, `angular-tooling`, `angular-components`, `tiptap`, `nextjs`, `nuxt`, `sveltekit`, `astro`, `react`, `vue`, `vitest`, `storybook`, `nestjs`, `remix`, `tauri-js`.
+- **Cohort-aware reporter.** Per-tier section collapses cohort members into a single header line (`@angular/* framework cohort (7 packages, 21.2.4 -> 21.2.13):`) with an indented member list. Single-member cohorts render as stand-alone proposals (no cohort overhead when there's nothing to group). Version ranges are surfaced when members target different versions (e.g. `@angular/cdk` lags `@angular/core` by 2 patches → `21.2.1..21.2.4 -> 21.2.13`).
+- **Lockfile-only tier surfaces in the per-tier section when it contains cohorts.** Pre-0.5.0 lockfile-only was always collapsed into the top-of-run count to keep cargo runs lean; now it renders when there's cohort grouping to show (typical Angular/Vue/React project shape). Single-package cargo runs unchanged.
+- **npm `overrides` / pnpm `pnpm.overrides` / yarn `resolutions` honored** as annotations. Slate dogfood: package.json overrides block was silently ignored; the operator had no signal that adopting a proposal would conflict with an existing pin. Each proposal whose subject is governed by an override now carries `override-pinned to <version>; adopting this bump would conflict` in its `notes` array. Path-form keys (`"foo > bar"`) are handled — the right-most segment is the package being pinned. Conditional pnpm overrides (`{ "..": "1.0.0" }`) handled too.
+
+### Internal
+
+- New `npm_cohorts::CohortDef { id, display, exact, prefixes }` struct.
+- New `npm::tag_proposals_with_cohorts` post-processing step (npm proposer pipeline).
+- New `npm::annotate_proposals_with_overrides` post-processing step (npm proposer pipeline).
+- New `print_group_with_cohorts` + `print_cohort_block` + `print_single_proposal_line` reporter helpers (replaces the inline closure that lived in `print_discovered_section`).
+- Test count: 629 → 646 (+17: 10 cohort matcher tests, 5 override-parsing tests, 2 reporter cohort-grouping integration tests).
+
 ## [0.4.0] — 2026-05-20
 
 "Polish & correctness" release. A seven-target dogfood tour across the Wildmason fleet (`ci-forge`, `gha-eventsmith`, `aegis`, `slate`, `mortar`, `helm`, `wildmason.dev`, plus the `nlg` smoke) surfaced two real correctness bugs, three significant UX gaps, and a long tail of receipt-schema papercuts. All addressed.

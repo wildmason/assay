@@ -186,7 +186,9 @@ impl DependencyEcosystem for NpmEcosystem {
             })
             .map(|m| m.path.clone())
             .collect();
-        let proposals = run_npm_proposer(flavor, repo, &manifest_paths)?;
+        let mut proposals = run_npm_proposer(flavor, repo, &manifest_paths)?;
+        tag_proposals_with_cohorts(&mut proposals);
+        annotate_proposals_with_overrides(&mut proposals, repo);
         Ok(filter_ignored_packages(proposals, &ctx.ignored_subjects))
     }
 
@@ -521,6 +523,7 @@ pub(crate) fn build_npm_proposals(
             bump_tier: tier,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         });
     }
     proposals
@@ -1789,6 +1792,135 @@ fn sanitize_id_segment(value: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// Set the `cohort` field on every proposal whose subject matches a
+/// known framework cohort definition. Pure annotation pass — no
+/// proposals are added, dropped, or rewritten; just tagged so the
+/// reporter can group them under one heading and the validator/
+/// applier can treat them as atomic units. Stand-alone packages
+/// (`lodash`, `typescript`, `vite`, `@types/*`, etc.) keep
+/// `cohort: None`. See [`npm_cohorts::KNOWN_COHORTS`].
+pub(crate) fn tag_proposals_with_cohorts(proposals: &mut [Proposal]) {
+    for p in proposals.iter_mut() {
+        if let Some(c) = super::npm_cohorts::match_cohort(&p.subject) {
+            p.cohort = Some(c.id.to_string());
+        }
+    }
+}
+
+/// Read the project's override declarations (npm `overrides`,
+/// pnpm.overrides, yarn `resolutions`) from `package.json` and
+/// attach a `note: "override-pinned to <version>"` to every proposal
+/// whose subject is governed by an override. The proposal is NOT
+/// dropped — the user still wants to see what the registry has —
+/// but the note flags that adopting the proposal would conflict
+/// with the existing pin. Slate dogfood: 4 packages in `overrides`
+/// (chevrotain, langium, dompurify, lodash-es) were silently
+/// ignored; the operator had no signal that bumping any of them
+/// would fight the override.
+///
+/// Best-effort: a missing or malformed `package.json` produces no
+/// annotations. Nested override paths (e.g. `"foo > bar"` meaning
+/// "only when foo depends on bar") are flattened conservatively —
+/// the bare package name on the LHS is treated as the override key
+/// because that's what assay's exact-match against `Proposal.subject`
+/// can act on.
+pub(crate) fn annotate_proposals_with_overrides(proposals: &mut [Proposal], repo: &Path) {
+    let overrides = match read_package_overrides(repo) {
+        Some(m) if !m.is_empty() => m,
+        _ => return,
+    };
+    for p in proposals.iter_mut() {
+        if let Some(pin) = overrides.get(&p.subject) {
+            p.notes.push(format!(
+                "override-pinned to {pin}; adopting this bump would conflict"
+            ));
+        }
+    }
+}
+
+/// Parse `package.json` for npm `overrides`, pnpm `pnpm.overrides`,
+/// and yarn `resolutions` blocks. Returns a flat map from package
+/// name → pinned spec. Returns `None` when the file is absent or
+/// can't be parsed (the propose flow is best-effort; an unreadable
+/// manifest just means no annotations).
+fn read_package_overrides(repo: &Path) -> Option<BTreeMap<String, String>> {
+    let path = repo.join("package.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(obj) = json.get("overrides").and_then(|v| v.as_object()) {
+        flatten_overrides(obj, &mut out);
+    }
+    if let Some(obj) = json
+        .get("pnpm")
+        .and_then(|p| p.get("overrides"))
+        .and_then(|v| v.as_object())
+    {
+        flatten_overrides(obj, &mut out);
+    }
+    if let Some(obj) = json.get("resolutions").and_then(|v| v.as_object()) {
+        flatten_overrides(obj, &mut out);
+    }
+    Some(out)
+}
+
+/// Flatten an npm/pnpm/yarn override block into `name -> spec`.
+///
+/// Three shapes are recognized:
+///
+/// - `"lodash": "1.0.0"` → `lodash` pinned to `1.0.0`.
+/// - `"lodash": { "..": "1.0.0" }` → pnpm conditional override; the
+///   `..` key means "regardless of parent" so this also pins
+///   `lodash` to `1.0.0`. Other parent-keyed forms (e.g.
+///   `"react": "18.0.0"` nested under `lodash`) are recorded with
+///   the nested package name (`react`) as the pin target — that's
+///   the npm semantic of "when X is a transitive of Y, force Y to
+///   version Z."
+/// - `"foo > bar": "1.0.0"` → npm path-key override; the
+///   right-most segment (`bar`) is the package being pinned.
+fn flatten_overrides(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    out: &mut BTreeMap<String, String>,
+) {
+    for (key, value) in obj {
+        let pkg_name = override_key_to_package_name(key);
+        match value {
+            serde_json::Value::String(s) => {
+                out.insert(pkg_name.to_string(), s.clone());
+            }
+            serde_json::Value::Object(nested) => {
+                if let Some(serde_json::Value::String(s)) = nested.get("..") {
+                    out.insert(pkg_name.to_string(), s.clone());
+                }
+                // Nested non-".." entries describe parent-scoped
+                // pins; the inner key is the package being pinned.
+                for (inner_key, inner_value) in nested {
+                    if inner_key == ".." {
+                        continue;
+                    }
+                    if let serde_json::Value::String(s) = inner_value {
+                        let inner_pkg = override_key_to_package_name(inner_key);
+                        out.insert(inner_pkg.to_string(), s.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Resolve an npm/pnpm/yarn override-key into a bare package name.
+/// Keys like `"lodash"` → `lodash`; `"foo > bar"` (npm path form)
+/// → `bar` (the right-most segment is the pinned package); empty or
+/// malformed keys fall through to the original string so the caller
+/// sees them in the receipt for debugging.
+fn override_key_to_package_name(key: &str) -> &str {
+    if let Some((_, tail)) = key.rsplit_once('>') {
+        return tail.trim();
+    }
+    key.trim()
+}
+
 /// Drop proposals whose `subject` exactly matches an entry in the
 /// per-ecosystem ignore list. Mirrors `filter_ignored_crates`
 /// ([`crate::ecosystem::cargo`]) and `filter_ignored_actions`
@@ -2627,6 +2759,130 @@ mod tests {
     }
 
     #[test]
+    fn tag_proposals_with_cohorts_assigns_angular_framework_cohort() {
+        let mut proposals = vec![
+            sample_proposal("@angular/core"),
+            sample_proposal("@angular/common"),
+            sample_proposal("@angular/cdk"),
+            sample_proposal("lodash"),
+        ];
+        tag_proposals_with_cohorts(&mut proposals);
+        let by_subject: std::collections::BTreeMap<_, _> = proposals
+            .iter()
+            .map(|p| (p.subject.as_str(), p.cohort.as_deref()))
+            .collect();
+        assert_eq!(
+            by_subject.get("@angular/core").copied().flatten(),
+            Some("angular-framework")
+        );
+        assert_eq!(
+            by_subject.get("@angular/common").copied().flatten(),
+            Some("angular-framework")
+        );
+        assert_eq!(
+            by_subject.get("@angular/cdk").copied().flatten(),
+            Some("angular-components")
+        );
+        assert_eq!(by_subject.get("lodash").copied().flatten(), None);
+    }
+
+    #[test]
+    fn annotate_proposals_with_overrides_marks_pinned_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+                "name": "demo",
+                "dependencies": { "lodash": "^4.17.0", "axios": "^1.6.0" },
+                "overrides": { "lodash": "4.17.21" }
+            }"#,
+        )
+        .unwrap();
+        let mut proposals = vec![sample_proposal("lodash"), sample_proposal("axios")];
+        annotate_proposals_with_overrides(&mut proposals, tmp.path());
+        let lodash = proposals.iter().find(|p| p.subject == "lodash").unwrap();
+        let axios = proposals.iter().find(|p| p.subject == "axios").unwrap();
+        assert!(
+            lodash
+                .notes
+                .iter()
+                .any(|n| n.contains("override-pinned to 4.17.21")),
+            "lodash should be annotated; notes: {:?}",
+            lodash.notes
+        );
+        assert!(
+            axios.notes.is_empty(),
+            "axios should NOT be annotated; notes: {:?}",
+            axios.notes
+        );
+    }
+
+    #[test]
+    fn annotate_proposals_picks_up_pnpm_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+                "name": "demo",
+                "pnpm": { "overrides": { "lodash": "4.17.21" } }
+            }"#,
+        )
+        .unwrap();
+        let mut proposals = vec![sample_proposal("lodash")];
+        annotate_proposals_with_overrides(&mut proposals, tmp.path());
+        assert!(
+            proposals[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("override-pinned"))
+        );
+    }
+
+    #[test]
+    fn annotate_proposals_picks_up_yarn_resolutions() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+                "name": "demo",
+                "resolutions": { "lodash": "4.17.21" }
+            }"#,
+        )
+        .unwrap();
+        let mut proposals = vec![sample_proposal("lodash")];
+        annotate_proposals_with_overrides(&mut proposals, tmp.path());
+        assert!(
+            proposals[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("override-pinned"))
+        );
+    }
+
+    #[test]
+    fn override_key_to_package_name_handles_path_form() {
+        // npm's `"foo > bar"` syntax means "pin `bar` when reached
+        // via `foo`." The right-most segment is the pinned package.
+        assert_eq!(override_key_to_package_name("foo > bar"), "bar");
+        assert_eq!(override_key_to_package_name("a > b > c"), "c");
+        assert_eq!(override_key_to_package_name("lodash"), "lodash");
+        assert_eq!(
+            override_key_to_package_name("@angular/core"),
+            "@angular/core"
+        );
+    }
+
+    #[test]
+    fn annotate_proposals_handles_missing_package_json_gracefully() {
+        // A scan with no manifest must not crash; the proposals
+        // come back unannotated.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut proposals = vec![sample_proposal("lodash")];
+        annotate_proposals_with_overrides(&mut proposals, tmp.path());
+        assert!(proposals[0].notes.is_empty());
+    }
+
+    #[test]
     fn build_npm_proposals_id_disambiguates_by_source_version() {
         // Two `npm outdated` rows for the same package at different
         // currently-installed versions must produce distinct proposal
@@ -2675,6 +2931,7 @@ mod tests {
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 
@@ -2697,6 +2954,7 @@ mod tests {
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 

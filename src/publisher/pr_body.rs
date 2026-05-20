@@ -126,6 +126,7 @@ mod tests {
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 

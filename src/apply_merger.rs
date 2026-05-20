@@ -370,6 +370,7 @@ fn synthesize_merged_proposal(
         bump_tier: Default::default(),
         affected_consumers: Vec::new(),
         explanation: None,
+        cohort: None,
     }
 }
 
@@ -580,6 +581,7 @@ mod tests {
             bump_tier: Default::default(),
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         }
     }
 

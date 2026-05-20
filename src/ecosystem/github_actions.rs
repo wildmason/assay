@@ -455,6 +455,7 @@ pub(crate) fn build_action_proposals(
             bump_tier: tier,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         });
     }
     proposals
@@ -1433,6 +1434,7 @@ jobs:
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
 
         // 3. Apply.
@@ -1483,6 +1485,7 @@ jobs:
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
         let eco = GitHubActionsEcosystem;
         let modified = eco
@@ -1522,6 +1525,7 @@ jobs:
             bump_tier: crate::model::BumpTier::LockfileOnly,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
         let eco = GitHubActionsEcosystem;
         let err = eco
@@ -2017,6 +2021,7 @@ jobs:
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
         let proposals = vec![
             make("actions/checkout"),
@@ -2047,6 +2052,7 @@ jobs:
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
         let proposals = vec![make("actions/checkout"), make("actions/checkout-fork")];
         let kept = filter_ignored_actions(proposals, &["actions/checkout".to_string()]);
@@ -2069,6 +2075,7 @@ jobs:
             bump_tier: BumpTier::Compatible,
             affected_consumers: Vec::new(),
             explanation: None,
+            cohort: None,
         };
         let original = vec![make("a/b"), make("c/d")];
         let kept = filter_ignored_actions(original.clone(), &[]);
