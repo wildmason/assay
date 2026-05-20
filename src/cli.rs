@@ -405,13 +405,16 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             // `src-tauri` / `ui` instead of full absolute paths. None
             // → repo root case (no prefix needed).
             let scan_root_rel = relative_prefix(&args.repo, scan_root);
-            match args.format {
-                OutputFormat::Text => {
-                    report_text(ecosystem.name(), scan_root_rel.as_deref(), &manifests)
-                }
-                OutputFormat::Json => {
-                    report_json(ecosystem.name(), scan_root_rel.as_deref(), &manifests)?
-                }
+            // JSON mode suppresses inline per-ecosystem reporting:
+            // the full structured payload is emitted once at the end
+            // of the run as a single valid JSON document (mirroring
+            // the receipt). Inline per-ecosystem objects produced a
+            // stream of top-level JSON objects that was neither
+            // strict JSON nor NDJSON — `JSON.parse(stdout)` failed and
+            // the proposals were missing from the payload entirely
+            // (2026-05-20 dogfood, 4 of 7 agents confirmed).
+            if matches!(args.format, OutputFormat::Text) {
+                report_text(ecosystem.name(), scan_root_rel.as_deref(), &manifests);
             }
             for manifest in &manifests {
                 provenance.records.push(ProvenanceRecord {
@@ -471,6 +474,10 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                         artifact_path: None,
                         details: Some(serde_json::to_value(proposal).map_err(Error::Json)?),
                     });
+                    // Text mode prints proposals as they're discovered
+                    // (progressive feedback during slow cargo runs).
+                    // JSON mode batches everything into the final
+                    // single-document emission at end-of-run.
                     if matches!(args.format, OutputFormat::Text) {
                         println!(
                             "    proposal {}: {} {} -> {}",
@@ -689,6 +696,24 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         provenance,
     };
     let run_json_path = write_run_receipt(&args.repo, &receipt)?;
+
+    if matches!(args.format, OutputFormat::Json) {
+        // Single end-of-run JSON document. Mirrors the on-disk
+        // receipt 1:1 so any tooling that knows how to parse the
+        // receipt can also parse `--format json` stdout — and so
+        // `JSON.parse(stdout)` actually succeeds (regression for the
+        // dogfood-confirmed "multiple top-level objects" bug). The
+        // receipt path is attached as a sibling field for callers
+        // that want to drop into the on-disk artifact directly.
+        let payload = serde_json::json!({
+            "receipt": receipt,
+            "receipt_path": run_json_path.display().to_string(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(crate::error::Error::Json)?
+        );
+    }
 
     if matches!(args.format, OutputFormat::Text) {
         // Per-tier breakdown surfaces the helm-style "110 deps behind
@@ -3348,21 +3373,6 @@ fn missing_cargo_lock_warning(name: &str, manifests: &[Manifest]) -> Option<Stri
     }
 }
 
-fn report_json(name: &str, scan_root_rel: Option<&Path>, manifests: &[Manifest]) -> Result<()> {
-    if manifests.is_empty() {
-        return Ok(());
-    }
-    let payload = serde_json::json!({
-        "ecosystem": name,
-        "scan_root": scan_root_rel.map(|p| p.display().to_string()),
-        "manifests": manifests,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&payload).map_err(crate::error::Error::Json)?
-    );
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
