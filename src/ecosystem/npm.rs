@@ -136,14 +136,24 @@ impl DependencyEcosystem for NpmEcosystem {
         }
         let mut found = Vec::new();
         let package_json = repo.join("package.json");
-        if package_json.is_file() {
+        let package_json_present = package_json.is_file();
+        if package_json_present {
             found.push(Manifest {
                 path: PathBuf::from("package.json"),
                 kind: ManifestKind::PackageJson,
                 metadata: BTreeMap::new(),
             });
         }
-        if let Some(flavor) = detect_flavor(repo) {
+        // Don't report orphan lockfiles (lockfile without sibling
+        // package.json) as detected manifests — propose_updates would
+        // return empty and the operator would see "1 manifest, 0
+        // proposals" with no explanation (mortar dogfood: empty root
+        // `package-lock.json` short-circuited polyglot traversal AND
+        // looked like a successful scan). Polyglot detection still
+        // discovers the real `ui/package.json` separately.
+        if package_json_present
+            && let Some(flavor) = detect_flavor(repo)
+        {
             found.push(Manifest {
                 path: PathBuf::from(flavor.lockfile_name()),
                 kind: ManifestKind::NpmLockfile,

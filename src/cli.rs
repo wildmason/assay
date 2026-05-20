@@ -154,10 +154,14 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     pub fail_fast: bool,
 
-    /// Disable network calls during proposer phase. With this flag set,
-    /// ecosystems that need network access (currently: GitHub Actions
-    /// — to resolve `uses:@SHA` against the latest release on github.com)
-    /// emit no proposals. Local-only ecosystems (Cargo, npm) are
+    /// Disable network calls during proposer phase. Network-bound
+    /// ecosystems (currently: GitHub Actions, which resolves
+    /// `uses:@SHA` against the latest release on github.com) fall
+    /// back to whatever the action-store cache already holds —
+    /// proposals are still emitted, but each is annotated with
+    /// `source:offline-cache` and a "may be stale" note in the
+    /// receipt. When no cache entry exists for an action, no
+    /// proposal is emitted. Local-only ecosystems (Cargo, npm) are
     /// unaffected. Defaults to network-enabled.
     #[arg(long)]
     pub offline: bool,
@@ -324,6 +328,19 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         }
     }
     let mode = ApplyMode::from_args(&args);
+    // --member-gate only filters validator workflows. In DryRun the
+    // validator never runs, so the flag is a no-op there. Without
+    // this hint, the dogfood (ci-forge) showed an operator might
+    // think `--member-gate` is doing something when paired with the
+    // default (proposer-only) analyze mode.
+    if args.member_gate && !mode.runs_validator() {
+        eprintln!(
+            "[member-gate] note: --member-gate filters validator gate workflows; the \
+             current mode ({:?}) doesn't run the validator, so this flag has no effect. \
+             Add --validate (or --apply-local / --apply-pr) to exercise member-precise gating.",
+            mode,
+        );
+    }
     // The host-executor safety check matters whenever the validator
     // runs (Validate, ApplyLocal, ApplyPr) — `cargo build` against a
     // newly-bumped tree may execute build scripts assay just pulled
@@ -387,6 +404,16 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut total_manifests = 0usize;
     let mut all_proposals: Vec<(usize, PathBuf, Proposal)> = Vec::new();
     let mut provenance = Provenance::default();
+    // Per-ecosystem manifest-count tally for the post-scan zero-result
+    // hint. Honors the active --ecosystem filter (skipped ecosystems
+    // aren't counted as "0 manifests"). Used to emit "no manifests
+    // found at <root> for <eco>" when the user explicitly requested
+    // an ecosystem that turned up nothing — the helm dogfood
+    // (`.github/workflows/` absent) and mortar dogfood (orphan
+    // root-level lockfile) both showed silent zero output as the
+    // worst kind of "did it work?" confusion.
+    let mut per_eco_manifest_count: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
 
     // Polyglot scan loop: every scan_root × every enabled ecosystem.
     // Each ecosystem's `detect_manifests` is scoped to one scan_root
@@ -490,6 +517,38 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 }
             }
             total_manifests += manifests.len();
+            *per_eco_manifest_count.entry(ecosystem.name()).or_insert(0) += manifests.len();
+        }
+    }
+
+    // Zero-manifest hint for explicitly-filtered ecosystems. Only
+    // fires when the user passed `--ecosystem <name>` for a SPECIFIC
+    // ecosystem (not the implicit `all` default), so the broader
+    // "everything-was-scanned" runs don't get noisy. The text format
+    // surfaces this directly; the receipt JSON already records the
+    // empty scan via the absence of any `scanner.<name>` provenance
+    // record.
+    if matches!(args.format, OutputFormat::Text)
+        && let Some(selector) = args.ecosystem
+        && !matches!(selector, EcosystemSelector::All)
+    {
+        for ecosystem in registry.iter() {
+            if !ecosystem_enabled(&args, ecosystem.as_ref()) {
+                continue;
+            }
+            let count = per_eco_manifest_count
+                .get(ecosystem.name())
+                .copied()
+                .unwrap_or(0);
+            if count == 0 {
+                let hint = zero_manifest_hint(ecosystem.name());
+                println!(
+                    "[{}] no manifests found under `{}`{}",
+                    ecosystem.name(),
+                    args.repo.display(),
+                    hint,
+                );
+            }
         }
     }
 
@@ -721,10 +780,29 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
         // hides. Walks all_proposals directly — the source of truth.
         let (lockfile_only, compatible, breaking) =
             tier_counts(all_proposals.iter().map(|(_, _, p)| p));
+        // Active-ecosystem count honors `--ecosystem` so the summary
+        // doesn't read "across 3 ecosystem(s)" when only one ran (the
+        // gha-eventsmith / ci-forge / helm dogfood agents all flagged
+        // this as misleading). Total compiled-in count is printed in
+        // parentheses when the user filtered, so the diff between
+        // active and total is visible.
+        let active_eco_count = registry
+            .iter()
+            .filter(|eco| ecosystem_enabled(&args, eco.as_ref()))
+            .count();
+        let eco_phrase = if active_eco_count == registry.len() {
+            format!("{} ecosystem(s)", active_eco_count)
+        } else {
+            format!(
+                "{} of {} ecosystem(s)",
+                active_eco_count,
+                registry.len()
+            )
+        };
         println!(
-            "assay: scanned {} manifest(s) across {} ecosystem(s); {} proposal(s) (mode={:?})",
+            "assay: scanned {} manifest(s) across {}; {} proposal(s) (mode={:?})",
             total_manifests,
-            registry.len(),
+            eco_phrase,
             all_proposals.len(),
             mode,
         );
@@ -2911,6 +2989,29 @@ impl ProjectScope {
             scan_roots,
             ecosystem_restriction: None,
         })
+    }
+}
+
+/// Per-ecosystem remediation hint when `--ecosystem <name>` returns
+/// no manifests. Each branch points at the most common reason from
+/// the 2026-05-20 dogfood: gha repos that don't have
+/// `.github/workflows/`, cargo crates without a lockfile, npm
+/// projects without a `package.json`.
+fn zero_manifest_hint(eco_name: &str) -> &'static str {
+    match eco_name {
+        "github-actions" => {
+            " (no `.github/workflows/*.yml` present — github-actions runs only against \
+             workflow files)"
+        }
+        "cargo" => {
+            " (no `Cargo.toml` at the scan root; pass --project <member> to target a \
+             workspace member directly)"
+        }
+        "npm" => {
+            " (no `package.json` at the scan root; pass --project <subdir> if the npm \
+             project lives in a subdirectory)"
+        }
+        _ => "",
     }
 }
 
