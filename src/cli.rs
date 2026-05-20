@@ -711,12 +711,11 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             );
             let (cached_workflow_total, fresh_workflow_total) =
                 aggregate_cache_counts(&completed_runs);
-            if cached_workflow_total + fresh_workflow_total > 0 {
-                let saved_pct = if cached_workflow_total + fresh_workflow_total > 0 {
-                    (cached_workflow_total * 100) / (cached_workflow_total + fresh_workflow_total)
-                } else {
-                    0
-                };
+            let workflow_total = cached_workflow_total + fresh_workflow_total;
+            if workflow_total > 0 {
+                let saved_pct = (cached_workflow_total * 100)
+                    .checked_div(workflow_total)
+                    .unwrap_or(0);
                 println!(
                     "assay: verdict cache: {} cached / {} fresh ({}% reused; --no-cache to bypass, --cache-ttl <dur> to tune)",
                     cached_workflow_total, fresh_workflow_total, saved_pct,

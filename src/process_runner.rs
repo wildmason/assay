@@ -199,8 +199,11 @@ fn kill_child_tree(child: &mut Child) {
     use std::os::unix::process::ExitStatusExt;
     let pid = child.id() as libc::pid_t;
     // Best-effort: SIGTERM the whole process group, then immediate
-    // SIGKILL to ensure even unresponsive children go away. Wrap in
-    // unsafe — these libc calls are sound when given a valid pid.
+    // SIGKILL to ensure even unresponsive children go away. The crate
+    // is `deny(unsafe_code)` overall; this single block opts in because
+    // `libc::kill` has no safe wrapper and the args (negative pid as
+    // valid process group id, valid signal constants) are sound.
+    #[allow(unsafe_code)]
     unsafe {
         // Negative pid = signal the process group.
         libc::kill(-pid, libc::SIGTERM);

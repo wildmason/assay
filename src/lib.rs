@@ -1,4 +1,8 @@
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid` so the single documented unsafe block in
+// `process_runner.rs::kill_child_tree` (unix process-group signaling)
+// can opt in via `#[allow(unsafe_code)]`. Every other unsafe block in
+// the crate stays a hard error.
+#![deny(unsafe_code)]
 
 //! assay — dependency upgrade impact analyzer.
 //!
