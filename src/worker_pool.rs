@@ -199,7 +199,7 @@ pub struct WorkerContext<'a> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn semaphore_serializes_under_cap_one() {
@@ -426,7 +426,6 @@ mod tests {
         };
         let gha_in_flight_c = gha_in_flight.clone();
         let gha_max_c = gha_max.clone();
-        let start = Instant::now();
         pool.run(
             units,
             ctx,
@@ -444,14 +443,13 @@ mod tests {
             |_| false,
             |u| u.0,
         );
-        // Wall time check: if everything serialized, this would run ~280ms
-        // (4 cargo×20 + 4 gha×50). With parallel GHA + serial cargo:
-        // roughly max(4*20=80, 50) + 1 GHA tick ≈ 130ms ish.
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "GHA + cargo combined should not be fully serialized: {elapsed:?}"
-        );
+        // `gha_max >= 2` directly proves the property under test: GHA
+        // units overlapped despite the cargo semaphore serializing the
+        // cargo arm. An earlier `elapsed < 300ms` wall-clock proxy was
+        // flaky on slow shared CI runners (observed: 474ms on a
+        // macos-latest GitHub-hosted runner) without proving anything
+        // additional — full serialization would still register
+        // `gha_max == 1`, which this assertion catches directly.
         assert!(
             gha_max.load(Ordering::Acquire) >= 2,
             "expected at least 2 GHA units to overlap; only saw {}",
