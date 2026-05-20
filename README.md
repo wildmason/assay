@@ -9,10 +9,12 @@ The wedge versus Dependabot/Renovate: **monorepo blast-radius**. When `tar = { v
 ## Install
 
 ```sh
-cargo install assay
+cargo install dep-assay
 ```
 
-Rust 1.85 or later. No other system dependencies required for the proposer phase; the validator phase needs either `forge` ([ci-forge](https://github.com/wildmason/ci-forge)) on PATH or a manifest-inferred build/test toolchain (Cargo, npm, etc.).
+The crate is published as `dep-assay` on crates.io because the bare `assay` name was taken in 2022 by an unrelated testing macro. The installed binary, library, and brand are still `assay` — `cargo install dep-assay` produces `~/.cargo/bin/assay` and you invoke it as `assay analyze ...`.
+
+Rust 1.88 or later. No other system dependencies required for the proposer phase; the validator phase needs either `forge` ([ci-forge](https://github.com/wildmason/ci-forge)) on PATH or a manifest-inferred build/test toolchain (Cargo, npm, etc.).
 
 ## Quick start
 

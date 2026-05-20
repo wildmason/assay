@@ -19,6 +19,7 @@ All notable changes to `assay` are documented here. Format follows [Keep a Chang
 
 ### Changed
 
+- **Crate renamed to `dep-assay` on crates.io.** The bare `assay` name was claimed in 2022 by an unrelated testing-macro crate (`mgattozzi/assay`, 72k downloads, stable). The binary, library, and brand all stay `assay` — `cargo install dep-assay` produces `~/.cargo/bin/assay` and you invoke it as `assay analyze ...`. Only the package identifier on crates.io changes. README install section updated.
 - **MSRV bumped from Rust 1.85 to Rust 1.88.** The source already used let-chains (stabilized in 1.88) at seven sites across `cargo.rs`, `npm.rs`, and `external_deps.rs`; the previous `rust-version = "1.85"` declaration was aspirational and the code wouldn't compile on a true 1.85 toolchain. `Cargo.toml` and `.github/workflows/ci.yml`'s MSRV job both updated to 1.88.
 - **`AssayRunReceipt.schema_version`** is now driven by the central constant `model::CURRENT_RECEIPT_SCHEMA_VERSION` (value `1`) and gains `#[serde(default)]` for back-compat with hypothetical pre-versioning receipts.
 - **`.assay.toml`'s `[assay]` section is now optional.** When omitted, `schema_version` defaults to the parser's current schema version. Closes a footgun where the documented example config crashed the parser.

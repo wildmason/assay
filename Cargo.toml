@@ -1,5 +1,5 @@
 [package]
-name = "assay"
+name = "dep-assay"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
