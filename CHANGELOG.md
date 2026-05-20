@@ -2,6 +2,27 @@
 
 All notable changes to `assay` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project tracks [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-20
+
+"npm peer-dep awareness" release. Closes the third largest dogfood gap: `affected_consumers` was empty for every npm proposal. For a library that declares `peerDependencies: { "@angular/core": ">=21" }`, an `@angular/core` bump may shift the minimum peer range — exactly the cross-cut a library author needs. Pre-0.7.0 that signal was invisible.
+
+### Added
+
+- **npm peer-dep cross-reference.** `resolve_npm_consumers` now walks `node_modules/*/package.json` (flat layout) and `node_modules/@*/*/package.json` (scoped layout) looking for `peerDependencies` declarations of the proposal's subject. Each matching package name is added to `affected_consumers`. Workspace-member detection still runs first; peer-dep declarers are appended without duplicates.
+- **TypeScript-affects-Angular signal.** Slate dogfood post-fix: `typescript 5.9.3 -> 6.0.3 (2 consumers: @angular/build, @angular/compiler-cli)` — the operator now sees at a glance that bumping TypeScript may break Angular tooling that declares TS as a peer. `@angular/cdk 21.2.9 -> 21.2.11 (1 consumer: @wildmason/aegis)` — the project's own dependency on aegis is recognized as a peer-dep relationship.
+- **Tiptap-extension peer awareness.** `@tiptap/pm` shows 9 consumers (`@tiptap/core`, `@tiptap/extension-*`) — Tiptap extensions all declare `@tiptap/pm` as a peer, so bumping pm has clear blast-radius visibility.
+
+### Behavior
+
+- **pnpm virtual store NOT walked.** `node_modules/.pnpm/<name>@<version>/...` is out of scope for v0.7.0 — pnpm projects still get the workspace-member half. Plain `node_modules/<pkg>/` and `node_modules/@scope/<pkg>/` ARE walked, so hoisted dependencies in npm and yarn classic projects work.
+- **Best-effort, IO-tolerant.** A missing `node_modules`, unreadable package.json, or malformed JSON produces zero peer-dep consumers; the proposer never crashes when node_modules is half-installed.
+
+### Internal
+
+- New `find_peer_dep_consumers(tree, subject) -> Vec<String>` helper in `npm.rs`.
+- New `check_peer_dep(pkg_dir, subject, pkg_name, &mut out)` filter helper.
+- Test count: 651 → 655 (+4: flat package, scoped package, dot-dir + non-peer skip, missing-node_modules-handled).
+
 ## [0.6.0] — 2026-05-20
 
 "SHA-pinning" release. Closes the biggest GitHub-Actions security value-prop gap from the 2026-05-20 dogfood: every floating tag pin (`actions/checkout@v6`) is now ALSO proposed as a SHA pin (`actions/checkout@<sha> # v6.0.2`), the GitHub-recommended supply-chain-hardened form. The cache resolved the SHAs all along — pre-0.6.0 they were sitting unused.

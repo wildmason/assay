@@ -1557,7 +1557,97 @@ fn resolve_npm_consumers(proposal: &Proposal, tree: &Path) -> Result<Vec<Consume
             consumers.push(member.name.clone());
         }
     }
+    // Augment with peer-dep declarers from node_modules. For a
+    // library that declares `peerDependencies: { "@angular/core":
+    // ">=21" }`, an `@angular/core` bump may shift the minimum peer
+    // range — that's the "blast radius" data the operator needs.
+    // The dogfood (slate, aegis, wildmason.dev) flagged this as the
+    // biggest npm `affected_consumers` gap. Failures are silent
+    // (best-effort) — proposers don't crash because node_modules
+    // happens to be partially installed.
+    for peer in find_peer_dep_consumers(tree, &proposal.subject) {
+        if peer == proposal.subject {
+            continue;
+        }
+        if !consumers.iter().any(|c| c == &peer) {
+            consumers.push(peer);
+        }
+    }
+    consumers.sort();
     Ok(consumers)
+}
+
+/// Walk `node_modules/*/package.json` (and the scoped variant
+/// `node_modules/@*/*/package.json`) looking for declarations of
+/// `subject` in the `peerDependencies` block. Returns the list of
+/// package names that declare it. Best-effort — IO errors are
+/// swallowed since the proposer should still ship results when
+/// node_modules is in a half-installed state.
+///
+/// Handles the npm "flat hoisted" layout (`node_modules/foo/`) and
+/// scoped packages (`node_modules/@scope/foo/`). pnpm's virtual
+/// store (`node_modules/.pnpm/<name>@<version>/node_modules/<name>/`)
+/// is out of scope for v0.7.0 — pnpm projects can still get the
+/// workspace-member path; the peer-dep augmentation is npm-shape only.
+fn find_peer_dep_consumers(tree: &Path, subject: &str) -> Vec<String> {
+    let node_modules = tree.join("node_modules");
+    if !node_modules.is_dir() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(&node_modules) {
+        Ok(iter) => iter,
+        Err(_) => return Vec::new(),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Skip pnpm virtual-store, npm cache, and dotted entries.
+        if name.starts_with('.') {
+            continue;
+        }
+        if name.starts_with('@') {
+            // Scoped: walk @scope/<name>/package.json.
+            let scope_entries = match std::fs::read_dir(&path) {
+                Ok(iter) => iter,
+                Err(_) => continue,
+            };
+            for sub in scope_entries.flatten() {
+                let sub_name = match sub.file_name().into_string() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let full = format!("{name}/{sub_name}");
+                check_peer_dep(&sub.path(), subject, &full, &mut out);
+            }
+        } else {
+            check_peer_dep(&path, subject, &name, &mut out);
+        }
+    }
+    out
+}
+
+/// Parse `<pkg_dir>/package.json` and append `pkg_name` to `out` if
+/// the manifest declares `subject` in its `peerDependencies` block.
+/// Silent on any IO / parse failure — peer-dep population is
+/// advisory.
+fn check_peer_dep(pkg_dir: &Path, subject: &str, pkg_name: &str, out: &mut Vec<String>) {
+    let pkg_json = pkg_dir.join("package.json");
+    let text = match std::fs::read_to_string(&pkg_json) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    if let Some(obj) = value.get("peerDependencies").and_then(|v| v.as_object())
+        && obj.contains_key(subject)
+    {
+        out.push(pkg_name.to_string());
+    }
 }
 
 fn package_json_declares(pkg_path: &Path, name: &str) -> Result<bool> {
@@ -2756,6 +2846,81 @@ mod tests {
         let before = proposals.len();
         let kept = filter_ignored_packages(proposals, &[]);
         assert_eq!(kept.len(), before);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_finds_flat_packages_declaring_subject_as_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(nm.join("lucide-angular")).unwrap();
+        std::fs::write(
+            nm.join("lucide-angular").join("package.json"),
+            r#"{
+                "name": "lucide-angular",
+                "version": "0.577.0",
+                "peerDependencies": {
+                    "@angular/common": "13.x - 21.x",
+                    "@angular/core": "13.x - 21.x"
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(nm.join("lodash")).unwrap();
+        std::fs::write(
+            nm.join("lodash").join("package.json"),
+            r#"{"name": "lodash", "version": "4.17.21"}"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert_eq!(consumers, vec!["lucide-angular"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_walks_scoped_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        std::fs::create_dir_all(nm.join("@wildmason").join("aegis")).unwrap();
+        std::fs::write(
+            nm.join("@wildmason").join("aegis").join("package.json"),
+            r#"{
+                "name": "@wildmason/aegis",
+                "version": "1.5.4",
+                "peerDependencies": { "@angular/cdk": ">=21" }
+            }"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/cdk");
+        assert_eq!(consumers, vec!["@wildmason/aegis"]);
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_skips_dot_dirs_and_non_peer_declarations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        // pnpm-style virtual store — skipped because it starts with `.`
+        std::fs::create_dir_all(nm.join(".pnpm").join("foo")).unwrap();
+        std::fs::write(
+            nm.join(".pnpm").join("foo").join("package.json"),
+            r#"{"name": "foo", "peerDependencies": {"@angular/core": "^21"}}"#,
+        )
+        .unwrap();
+        // Real package that declares it as `dependencies` (not peer) — skipped
+        std::fs::create_dir_all(nm.join("normal-dep")).unwrap();
+        std::fs::write(
+            nm.join("normal-dep").join("package.json"),
+            r#"{"name": "normal-dep", "dependencies": {"@angular/core": "^21"}}"#,
+        )
+        .unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty(), "got: {consumers:?}");
+    }
+
+    #[test]
+    fn find_peer_dep_consumers_handles_missing_node_modules_gracefully() {
+        // No node_modules dir → empty result, no crash.
+        let tmp = tempfile::tempdir().unwrap();
+        let consumers = find_peer_dep_consumers(tmp.path(), "@angular/core");
+        assert!(consumers.is_empty());
     }
 
     #[test]
