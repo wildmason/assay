@@ -25,10 +25,7 @@ use crate::model::{ConsumerId, Proposal};
 /// crate. The plan's pipeline runs the Resolver after Applier (so the
 /// post-apply `Cargo.lock` is what's resolved), but for the trait-method
 /// surface we just run against whatever tree is passed in.
-pub(super) fn resolve_cargo_consumers(
-    proposal: &Proposal,
-    tree: &Path,
-) -> Result<Vec<ConsumerId>> {
+pub(super) fn resolve_cargo_consumers(proposal: &Proposal, tree: &Path) -> Result<Vec<ConsumerId>> {
     use cargo_metadata::{CargoOpt, MetadataCommand};
 
     let manifest_path = tree.join("Cargo.toml");

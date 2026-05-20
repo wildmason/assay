@@ -10,9 +10,9 @@
 //!   being broken out into focused submodules as the refactor
 //!   progresses.
 
-pub mod args;
 mod apply_local;
 mod apply_pr;
+pub mod args;
 mod config_resolve;
 mod git_ops;
 mod paths;
@@ -28,37 +28,37 @@ pub use args::*;
 pub use config_resolve::parse_cache_ttl;
 
 use apply_local::perform_apply_local_commit;
-use apply_pr::{perform_apply_pr, preflight_apply_pr_gh_auth, preflight_apply_pr_insteadof};
-use config_resolve::{
-    build_validator, ecosystem_enabled, populate_proposal_explanations, resolve_ignore_list,
-    workflow_filter_from_args, zero_manifest_hint,
-};
-#[cfg(test)]
-use config_resolve::parse_cli_ignore;
-#[cfg(test)]
-use text_report::missing_cargo_lock_warning;
-use git_ops::working_tree_dirty_path;
-#[cfg(test)]
-use git_ops::prepare_apply_local_tree;
 #[cfg(test)]
 use apply_pr::{
     BROKEN_INSTEADOF_KEY, PartialApplyState, check_insteadof_rewrite, cleanup_local_apply_state,
     ensure_labels_exist, filter_reviewers_to_collaborators, format_worktree_add_failure,
 };
+use apply_pr::{perform_apply_pr, preflight_apply_pr_gh_auth, preflight_apply_pr_insteadof};
+#[cfg(test)]
+use config_resolve::parse_cli_ignore;
+use config_resolve::{
+    build_validator, ecosystem_enabled, populate_proposal_explanations, resolve_ignore_list,
+    workflow_filter_from_args, zero_manifest_hint,
+};
+#[cfg(test)]
+use git_ops::prepare_apply_local_tree;
+use git_ops::working_tree_dirty_path;
 #[cfg(test)]
 use git_ops::{partition_stageable_paths, porcelain_line_is_assay_artifact};
 use paths::{forward_slash_path, relative_prefix, strip_extended_length_prefix};
 use project_scope::{ProjectScope, capture_run_context};
+#[cfg(test)]
+use reporting::format_consumers_suffix;
 use reporting::{
     aggregate_cache_counts, aggregate_member_skipped_count, build_failure_clusters,
     format_failure_clusters_section, format_red_proposal_section, print_discovered_section,
     ship_counts, tier_counts,
 };
-#[cfg(test)]
-use reporting::format_consumers_suffix;
 use run_state::{
     ApplyPrSummary, CommitSummary, PreValidationFailureRow, ProposalRun, WorkUnit, WorkerOutcome,
 };
+#[cfg(test)]
+use text_report::missing_cargo_lock_warning;
 use text_report::report_text;
 use time_utils::{generate_run_id, iso8601_now};
 use work_unit::{build_work_units, emit_run_started_event, process_proposal_unit};
@@ -66,9 +66,9 @@ use work_unit::{build_work_units, emit_run_started_event, process_proposal_unit}
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::ecosystem::{EcosystemContext, default_registry};
 #[cfg(test)]
 use crate::ecosystem::DependencyEcosystem;
+use crate::ecosystem::{EcosystemContext, default_registry};
 use crate::error::{Error, Result};
 use crate::model::{
     AssayRunReceipt, Classification, Proposal, Provenance, ProvenanceRecord, RepositoryRef,
@@ -82,7 +82,6 @@ use crate::worker_pool::{Semaphore, WorkerContext, WorkerPool};
 
 use clap::Parser;
 use std::sync::{Arc, Mutex};
-
 
 /// Parse a vector of CLI arguments without running anything. Exposed for tests.
 pub fn parse_cli(args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>) -> Cli {
@@ -106,7 +105,6 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Analyze(args) => analyze_command(args),
     }
 }
-
 
 fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let mut args = args;
@@ -910,7 +908,6 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

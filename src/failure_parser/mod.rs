@@ -40,8 +40,12 @@ pub enum EcosystemHint {
 /// ALWAYS returns a populated `FailureContext` — see module docs.
 pub fn parse(stderr: &str, hint: EcosystemHint) -> FailureContext {
     match hint {
-        EcosystemHint::Cargo => cargo::parse_cargo(stderr).unwrap_or_else(|| generic::parse_generic(stderr)),
-        EcosystemHint::Npm => npm::parse_npm(stderr).unwrap_or_else(|| generic::parse_generic(stderr)),
+        EcosystemHint::Cargo => {
+            cargo::parse_cargo(stderr).unwrap_or_else(|| generic::parse_generic(stderr))
+        }
+        EcosystemHint::Npm => {
+            npm::parse_npm(stderr).unwrap_or_else(|| generic::parse_generic(stderr))
+        }
         EcosystemHint::Auto => cargo::parse_cargo(stderr)
             .or_else(|| npm::parse_npm(stderr))
             .unwrap_or_else(|| generic::parse_generic(stderr)),
@@ -88,7 +92,8 @@ mod tests {
     fn auto_prefers_cargo_when_both_match() {
         // Stderr contains a cargo-style error — Auto should hit cargo
         // first and never fall through to npm.
-        let stderr = "error[E0277]: the trait `Foo` is not implemented for `Bar`\n  --> src/lib.rs:42:7\n";
+        let stderr =
+            "error[E0277]: the trait `Foo` is not implemented for `Bar`\n  --> src/lib.rs:42:7\n";
         let ctx = parse(stderr, EcosystemHint::Auto);
         assert_eq!(ctx.rule, "cargo:rustc-error");
     }
@@ -101,12 +106,24 @@ mod tests {
         assert_eq!(hint_from_command(&["yarn".into()]), EcosystemHint::Npm);
         assert_eq!(hint_from_command(&["tsc".into()]), EcosystemHint::Npm);
         // Windows binary suffix is stripped.
-        assert_eq!(hint_from_command(&["cargo.exe".into()]), EcosystemHint::Cargo);
+        assert_eq!(
+            hint_from_command(&["cargo.exe".into()]),
+            EcosystemHint::Cargo
+        );
         // Absolute path is reduced to the basename.
-        assert_eq!(hint_from_command(&["/usr/bin/cargo".into()]), EcosystemHint::Cargo);
-        assert_eq!(hint_from_command(&["C:\\path\\to\\npm.exe".into()]), EcosystemHint::Npm);
+        assert_eq!(
+            hint_from_command(&["/usr/bin/cargo".into()]),
+            EcosystemHint::Cargo
+        );
+        assert_eq!(
+            hint_from_command(&["C:\\path\\to\\npm.exe".into()]),
+            EcosystemHint::Npm
+        );
         // Unknown / empty → Auto.
-        assert_eq!(hint_from_command(&["custom-script".into()]), EcosystemHint::Auto);
+        assert_eq!(
+            hint_from_command(&["custom-script".into()]),
+            EcosystemHint::Auto
+        );
         assert_eq!(hint_from_command(&[]), EcosystemHint::Auto);
     }
 }

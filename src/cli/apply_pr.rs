@@ -328,8 +328,7 @@ pub(super) fn preflight_apply_pr_gh_auth(backend: &GhCliBackend) -> Result<()> {
 /// URL will be rewritten through a literal `x-access-token:@` prefix
 /// (empty password) which git treats as a real failing credential
 /// instead of consulting its credential helper.
-pub(super) const BROKEN_INSTEADOF_KEY: &str =
-    "url.https://x-access-token:@github.com/.insteadof";
+pub(super) const BROKEN_INSTEADOF_KEY: &str = "url.https://x-access-token:@github.com/.insteadof";
 
 /// Pure check: given the raw `git config --get-all <KEY>` output (or
 /// `None` if the key wasn't set), return Err with a remediation when

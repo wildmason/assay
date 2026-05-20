@@ -54,11 +54,11 @@ pub mod config;
 pub mod ecosystem;
 pub mod error;
 pub mod events;
+#[doc(hidden)]
+pub mod external_deps;
 pub mod failure_context;
 #[doc(hidden)]
 pub mod failure_parser;
-#[doc(hidden)]
-pub mod external_deps;
 #[doc(hidden)]
 pub mod member_gate;
 pub mod model;

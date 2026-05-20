@@ -345,7 +345,10 @@ mod parse_dep_spec_tests {
         // Trailing `core` after the scope `@` — rsplit_once produces
         // ("@angular/core", ""? no — finds the `@` at index 0, splits
         // into ("", "angular/core"). The empty-name guard catches it.
-        assert!(err.contains("empty name") || err.contains("empty version"), "got: {err}");
+        assert!(
+            err.contains("empty name") || err.contains("empty version"),
+            "got: {err}"
+        );
     }
 }
 

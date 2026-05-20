@@ -7,17 +7,15 @@
 //! a `Regression` outcome; a missing binary produces a `SetupFailure`.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::failure_parser::{EcosystemHint, hint_from_command, parse as parse_failure};
 use crate::process_runner::{RunResult, run_with_timeout};
 use crate::verdict_cache::fingerprint_commands;
 
-use super::{
-    FailureFlavor, ValidatorBackend, WorkflowOutcome, WorkflowResult, stderr_tail,
-};
+use super::{FailureFlavor, ValidatorBackend, WorkflowOutcome, WorkflowResult, stderr_tail};
 
 /// Manifest-inferred build+test backend — the fallback when `forge` is
 /// not on PATH or the project has no `.github/workflows/` directory.

@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::model::{Manifest, ManifestKind, Proposal, ValidationOutcome};
 #[cfg(test)]
 use crate::model::{BumpTier, Classification, ProposalKind};
+use crate::model::{Manifest, ManifestKind, Proposal, ValidationOutcome};
 #[cfg(test)]
 use std::collections::BTreeMap;
 
@@ -36,9 +36,7 @@ mod tag_utils;
 
 pub use apply::rewrite_uses_in_workflow;
 pub use manifest_discovery::collect_uses_references;
-pub(crate) use propose::{
-    build_action_proposals, explain_action_bump, filter_ignored_actions,
-};
+pub(crate) use propose::{build_action_proposals, explain_action_bump, filter_ignored_actions};
 
 #[cfg(test)]
 use propose::{aggregate_actions_from_manifests, classify_action_bump};

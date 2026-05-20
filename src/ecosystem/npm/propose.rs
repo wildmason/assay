@@ -356,8 +356,7 @@ pub(super) fn synthesize_dep_proposal(
         .filter(|m| {
             matches!(
                 m.kind,
-                crate::model::ManifestKind::PackageJson
-                    | crate::model::ManifestKind::NpmLockfile
+                crate::model::ManifestKind::PackageJson | crate::model::ManifestKind::NpmLockfile
             )
         })
         .map(|m| m.path.clone())
@@ -392,11 +391,7 @@ pub(super) fn synthesize_dep_proposal(
 /// Order of preference: flavor-native lockfile parse, then the
 /// declared constraint string from `package.json` with caret/tilde
 /// stripped. Returns `Ok(None)` when neither source mentions `name`.
-fn resolve_current_version(
-    name: &str,
-    flavor: NpmFlavor,
-    repo: &Path,
-) -> Result<Option<String>> {
+fn resolve_current_version(name: &str, flavor: NpmFlavor, repo: &Path) -> Result<Option<String>> {
     match flavor {
         NpmFlavor::Npm => {
             let lockfile = read_lockfile_versions(repo)?;

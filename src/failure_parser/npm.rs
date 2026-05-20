@@ -52,7 +52,8 @@ const NPM_ERR_PREFIX: &str = "npm ERR!";
 fn peer_dep_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"^\s*npm ERR!\s+peer dep missing:\s+(.+?)(?:,\s*required by\s+(.+?))?\s*$").unwrap()
+        Regex::new(r"^\s*npm ERR!\s+peer dep missing:\s+(.+?)(?:,\s*required by\s+(.+?))?\s*$")
+            .unwrap()
     })
 }
 
@@ -160,7 +161,11 @@ pub(super) fn parse_npm(stderr: &str) -> Option<FailureContext> {
     }
     if !eresolve_findings.is_empty() {
         let summary = format_summary(&eresolve_findings);
-        return Some(FailureContext::new("npm:eresolve", summary, eresolve_findings));
+        return Some(FailureContext::new(
+            "npm:eresolve",
+            summary,
+            eresolve_findings,
+        ));
     }
 
     // peer-dep missing — single-line pattern.
@@ -185,7 +190,11 @@ pub(super) fn parse_npm(stderr: &str) -> Option<FailureContext> {
     }
     if !peer_findings.is_empty() {
         let summary = format_summary(&peer_findings);
-        return Some(FailureContext::new("npm:peer-dep-missing", summary, peer_findings));
+        return Some(FailureContext::new(
+            "npm:peer-dep-missing",
+            summary,
+            peer_findings,
+        ));
     }
 
     // Bare `npm ERR! <msg>` — last resort. Filter out the noisy lines
@@ -388,7 +397,11 @@ src/b.ts:10:5 - error TS2345: Argument type mismatch.
         assert_eq!(ctx.rule, "npm:generic");
         assert_eq!(ctx.findings.len(), 1);
         assert!(ctx.findings[0].code.is_none());
-        assert!(ctx.findings[0].message.contains("Could not write to lockfile"));
+        assert!(
+            ctx.findings[0]
+                .message
+                .contains("Could not write to lockfile")
+        );
     }
 
     // -------------------------------------------------------------------------

@@ -98,7 +98,11 @@ impl FailureContext {
     /// computing the fingerprint from the (sorted) findings. Parsers
     /// should construct via this helper rather than building the struct
     /// literally so the fingerprint stays in sync with the findings.
-    pub fn new(rule: impl Into<String>, summary: impl Into<String>, findings: Vec<FailureFinding>) -> Self {
+    pub fn new(
+        rule: impl Into<String>,
+        summary: impl Into<String>,
+        findings: Vec<FailureFinding>,
+    ) -> Self {
         let fingerprint = compute_fingerprint(&findings);
         Self {
             rule: rule.into(),
@@ -185,7 +189,12 @@ pub fn cluster_failures(outcomes: &[(String, FailureContext)]) -> Vec<FailureClu
 mod tests {
     use super::*;
 
-    fn finding(code: Option<&str>, message: &str, file: Option<&str>, line: Option<u32>) -> FailureFinding {
+    fn finding(
+        code: Option<&str>,
+        message: &str,
+        file: Option<&str>,
+        line: Option<u32>,
+    ) -> FailureFinding {
         FailureFinding {
             code: code.map(String::from),
             message: message.into(),
@@ -201,11 +210,17 @@ mod tests {
 
     #[test]
     fn fingerprint_is_16_lowercase_hex_chars() {
-        let findings = vec![finding(Some("E0277"), "trait not implemented", Some("src/lib.rs"), Some(42))];
+        let findings = vec![finding(
+            Some("E0277"),
+            "trait not implemented",
+            Some("src/lib.rs"),
+            Some(42),
+        )];
         let fp = compute_fingerprint(&findings);
         assert_eq!(fp.len(), 16, "fingerprint must be 16 chars; got {fp}");
         assert!(
-            fp.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
             "fingerprint must be lowercase hex; got {fp}"
         );
     }
@@ -216,7 +231,12 @@ mod tests {
         // fingerprint — this is the core invariant of the grouper.
         let a = vec![
             finding(Some("E0277"), "trait", Some("src/lib.rs"), Some(42)),
-            finding(Some("E0308"), "mismatched types", Some("src/lib.rs"), Some(99)),
+            finding(
+                Some("E0308"),
+                "mismatched types",
+                Some("src/lib.rs"),
+                Some(99),
+            ),
         ];
         let mut b = a.clone();
         b.reverse();
@@ -225,8 +245,18 @@ mod tests {
 
     #[test]
     fn fingerprint_differs_when_finding_content_differs() {
-        let a = vec![finding(Some("E0277"), "trait X not impl", Some("src/lib.rs"), Some(42))];
-        let b = vec![finding(Some("E0277"), "trait Y not impl", Some("src/lib.rs"), Some(42))];
+        let a = vec![finding(
+            Some("E0277"),
+            "trait X not impl",
+            Some("src/lib.rs"),
+            Some(42),
+        )];
+        let b = vec![finding(
+            Some("E0277"),
+            "trait Y not impl",
+            Some("src/lib.rs"),
+            Some(42),
+        )];
         assert_ne!(compute_fingerprint(&a), compute_fingerprint(&b));
     }
 
@@ -248,7 +278,12 @@ mod tests {
 
     #[test]
     fn new_attaches_canonical_fingerprint() {
-        let findings = vec![finding(Some("E0277"), "trait not impl", Some("src/a.rs"), Some(1))];
+        let findings = vec![finding(
+            Some("E0277"),
+            "trait not impl",
+            Some("src/a.rs"),
+            Some(1),
+        )];
         let ctx = FailureContext::new("cargo:rustc-error", "summary line", findings.clone());
         assert_eq!(ctx.fingerprint, compute_fingerprint(&findings));
     }
@@ -342,9 +377,21 @@ mod tests {
     fn failure_finding_optional_fields_skip_when_none() {
         let f = finding(None, "bare error message", None, None);
         let json = serde_json::to_string(&f).unwrap();
-        assert!(!json.contains("\"code\""), "code:None must not serialize; got {json}");
-        assert!(!json.contains("\"file\""), "file:None must not serialize; got {json}");
-        assert!(!json.contains("\"line\""), "line:None must not serialize; got {json}");
-        assert!(!json.contains("\"column\""), "column:None must not serialize; got {json}");
+        assert!(
+            !json.contains("\"code\""),
+            "code:None must not serialize; got {json}"
+        );
+        assert!(
+            !json.contains("\"file\""),
+            "file:None must not serialize; got {json}"
+        );
+        assert!(
+            !json.contains("\"line\""),
+            "line:None must not serialize; got {json}"
+        );
+        assert!(
+            !json.contains("\"column\""),
+            "column:None must not serialize; got {json}"
+        );
     }
 }

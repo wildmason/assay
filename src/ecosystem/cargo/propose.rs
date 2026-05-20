@@ -153,10 +153,7 @@ pub(super) fn run_cargo_proposer(repo: &Path, manifests: &[Manifest]) -> Result<
 /// per-ecosystem ignore list from `.assay.toml`'s
 /// `[ecosystems.cargo] ignore = [...]`. Exact-match, mirroring the
 /// GHA filter.
-pub(crate) fn filter_ignored_crates(
-    proposals: Vec<Proposal>,
-    ignored: &[String],
-) -> Vec<Proposal> {
+pub(crate) fn filter_ignored_crates(proposals: Vec<Proposal>, ignored: &[String]) -> Vec<Proposal> {
     if ignored.is_empty() {
         return proposals;
     }

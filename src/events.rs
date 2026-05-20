@@ -228,11 +228,16 @@ mod tests {
             failure_context: Some(ctx.clone()),
         };
         let s = serde_json::to_string(&evt).unwrap();
-        assert!(s.contains("failure_context"), "wire format must carry failure_context; got {s}");
+        assert!(
+            s.contains("failure_context"),
+            "wire format must carry failure_context; got {s}"
+        );
         assert!(s.contains("cargo:rustc-error"));
         let back: Event = serde_json::from_str(&s).unwrap();
         match back {
-            Event::ProposalCompleted { failure_context, .. } => {
+            Event::ProposalCompleted {
+                failure_context, ..
+            } => {
                 assert_eq!(failure_context, Some(ctx));
             }
             _ => panic!("wrong variant"),
@@ -289,7 +294,9 @@ mod tests {
         assert!(s.contains("failure_clusters"));
         let back: Event = serde_json::from_str(&s).unwrap();
         match back {
-            Event::RunCompleted { failure_clusters, .. } => {
+            Event::RunCompleted {
+                failure_clusters, ..
+            } => {
                 assert_eq!(failure_clusters, vec![cluster]);
             }
             _ => panic!("wrong variant"),

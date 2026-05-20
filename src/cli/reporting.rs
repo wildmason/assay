@@ -11,9 +11,7 @@ use std::collections::BTreeSet;
 use crate::failure_context::{FailureCluster, cluster_failures};
 use crate::model::Proposal;
 
-use super::run_state::{
-    ApplyPrSummary, CommitSummary, PreValidationFailureRow, ProposalRun,
-};
+use super::run_state::{ApplyPrSummary, CommitSummary, PreValidationFailureRow, ProposalRun};
 
 /// Maximum lines of captured stderr to render per failed proposal in
 /// the human reporter. Anything past this gets a one-line truncation
@@ -360,10 +358,7 @@ pub(super) fn format_red_proposal_section(
             // operators see the parsed error inline rather than
             // hunting through a raw stderr tail.
             if let Some(ctx) = &detail.failure_context {
-                out.push_str(&format!(
-                    "    [{}] {}\n",
-                    ctx.rule, ctx.summary,
-                ));
+                out.push_str(&format!("    [{}] {}\n", ctx.rule, ctx.summary,));
                 for finding in &ctx.findings {
                     let code = finding.code.as_deref().unwrap_or("");
                     let loc = match (&finding.file, finding.line, finding.column) {
@@ -377,10 +372,7 @@ pub(super) fn format_red_proposal_section(
                     } else {
                         format!("{code} ")
                     };
-                    out.push_str(&format!(
-                        "      - {code_prefix}{}{loc}\n",
-                        finding.message,
-                    ));
+                    out.push_str(&format!("      - {code_prefix}{}{loc}\n", finding.message,));
                 }
             }
             // Raw log appendix — kept for the "trust but verify"
@@ -491,7 +483,11 @@ mod failure_cluster_tests {
 
     #[test]
     fn format_failure_clusters_section_renders_cluster_count_and_ids() {
-        let c = cluster("cargo:rustc-error", "trait not impl", &["p-1", "p-2", "p-3"]);
+        let c = cluster(
+            "cargo:rustc-error",
+            "trait not impl",
+            &["p-1", "p-2", "p-3"],
+        );
         let out = format_failure_clusters_section(std::slice::from_ref(&c)).unwrap();
         assert!(out.contains("root-cause clusters (1)"));
         assert!(out.contains(&c.fingerprint));

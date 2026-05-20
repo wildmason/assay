@@ -13,9 +13,7 @@ use crate::failure_parser::{EcosystemHint, hint_from_command, parse as parse_fai
 use crate::process_runner::{RunResult, run_with_timeout};
 use crate::verdict_cache::fingerprint_commands;
 
-use super::{
-    FailureFlavor, ValidatorBackend, WorkflowOutcome, WorkflowResult, stderr_tail,
-};
+use super::{FailureFlavor, ValidatorBackend, WorkflowOutcome, WorkflowResult, stderr_tail};
 
 /// Operator-supplied command / script backend — picked when the operator
 /// passes `--gate-cmd "<shell-line>"` or `--gate-file <script>`.

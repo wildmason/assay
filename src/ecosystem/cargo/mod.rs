@@ -30,10 +30,10 @@ pub use parse::{
     CargoUnchangedLine, CargoUpdateLine, diff_lockfiles, parse_cargo_unchanged_output,
     parse_cargo_update_output,
 };
+pub(crate) use propose::{filter_ignored_crates, tag_proposals_with_cargo_cohorts};
 pub use propose::{
     propose_from_cargo_dry_run, propose_from_cargo_stdout, propose_unchanged_from_cargo_stdout,
 };
-pub(crate) use propose::{filter_ignored_crates, tag_proposals_with_cargo_cohorts};
 
 #[cfg(test)]
 use propose::filter_to_direct_deps;
@@ -693,7 +693,11 @@ warning: not updating lockfile due to dry run
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("serde", "1.0.100")])).unwrap();
+        std::fs::write(
+            repo.join("Cargo.lock"),
+            lockfile_with(&[("serde", "1.0.100")]),
+        )
+        .unwrap();
         let eco = CargoEcosystem;
         let manifests = eco.detect_manifests(repo).unwrap();
         let ctx = EcosystemContext::default();
@@ -720,7 +724,11 @@ warning: not updating lockfile due to dry run
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("serde", "1.0.100")])).unwrap();
+        std::fs::write(
+            repo.join("Cargo.lock"),
+            lockfile_with(&[("serde", "1.0.100")]),
+        )
+        .unwrap();
         let eco = CargoEcosystem;
         let manifests = eco.detect_manifests(repo).unwrap();
         let ctx = EcosystemContext::default();
@@ -735,7 +743,11 @@ warning: not updating lockfile due to dry run
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
         std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
-        std::fs::write(repo.join("Cargo.lock"), lockfile_with(&[("tokio", "1.45.0")])).unwrap();
+        std::fs::write(
+            repo.join("Cargo.lock"),
+            lockfile_with(&[("tokio", "1.45.0")]),
+        )
+        .unwrap();
         let eco = CargoEcosystem;
         let manifests = eco.detect_manifests(repo).unwrap();
         let ctx = EcosystemContext::default();

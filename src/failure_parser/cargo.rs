@@ -53,13 +53,18 @@ fn rustc_loc_re() -> &'static Regex {
 /// `error: failed to run custom build command for \`<crate>\``
 fn build_script_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^error:\s*failed to run custom build command for [`'](.+?)[`']").unwrap())
+    R.get_or_init(|| {
+        Regex::new(r"^error:\s*failed to run custom build command for [`'](.+?)[`']").unwrap()
+    })
 }
 
 /// `error: linking with <linker> failed[: exit code: <n>]`
 fn linker_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
-    R.get_or_init(|| Regex::new(r"^error:\s*linking with [`']?(.+?)[`']? failed(?::\s*exit code:\s*(\S+))?").unwrap())
+    R.get_or_init(|| {
+        Regex::new(r"^error:\s*linking with [`']?(.+?)[`']? failed(?::\s*exit code:\s*(\S+))?")
+            .unwrap()
+    })
 }
 
 /// `error: could not compile \`<crate>\``
@@ -212,7 +217,11 @@ pub(super) fn parse_cargo(stderr: &str) -> Option<FailureContext> {
                 line: None,
                 column: None,
             };
-            return Some(FailureContext::new("cargo:rustc-error", message, vec![finding]));
+            return Some(FailureContext::new(
+                "cargo:rustc-error",
+                message,
+                vec![finding],
+            ));
         }
     }
 

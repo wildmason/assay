@@ -80,9 +80,7 @@ use outdated::{
 #[cfg(test)]
 use peer_walk::find_peer_dep_consumers;
 #[cfg(test)]
-use propose::{
-    build_npm_proposals, filter_to_direct_deps, override_key_to_package_name,
-};
+use propose::{build_npm_proposals, filter_to_direct_deps, override_key_to_package_name};
 #[cfg(test)]
 use workspaces::detect_workspace_members;
 

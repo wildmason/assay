@@ -180,7 +180,10 @@ fn query_berry_latest_version(repo: &Path, pkg: &str) -> Option<String> {
 /// so this per-dep walk is the canonical reliable path. Per-dep
 /// registry queries are slow (N subprocesses per project) but
 /// deterministic and don't require a plugin install.
-pub(super) fn propose_berry_updates(repo: &Path, manifest_paths: &[PathBuf]) -> Result<Vec<Proposal>> {
+pub(super) fn propose_berry_updates(
+    repo: &Path,
+    manifest_paths: &[PathBuf],
+) -> Result<Vec<Proposal>> {
     let direct = collect_direct_deps_with_constraints(repo)?;
     if direct.is_empty() {
         return Ok(Vec::new());

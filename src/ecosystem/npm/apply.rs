@@ -13,7 +13,9 @@ use crate::error::{Error, Result};
 use crate::model::{BumpTier, Proposal};
 use crate::process_runner::{RunResult, run_with_timeout};
 
-use super::flavor::{NpmFlavor, detect_flavor, flavor_from_binary_name, map_npm_spawn_io, npm_binary_name};
+use super::flavor::{
+    NpmFlavor, detect_flavor, flavor_from_binary_name, map_npm_spawn_io, npm_binary_name,
+};
 use super::workspaces::detect_workspace_members;
 
 /// Apply an npm proposal:
@@ -279,7 +281,11 @@ pub(super) fn try_edit_package_json(path: &Path, name: &str, new_version: &str) 
 ///
 /// Returns `new_version` verbatim for non-aliased entries (the common
 /// case) and for entries the resolver can't classify.
-pub(super) fn resolve_install_version(tree_path: &Path, name: &str, new_version: &str) -> Result<String> {
+pub(super) fn resolve_install_version(
+    tree_path: &Path,
+    name: &str,
+    new_version: &str,
+) -> Result<String> {
     let pkg_path = tree_path.join("package.json");
     let text = std::fs::read_to_string(&pkg_path).map_err(|source| Error::Io {
         path: pkg_path.clone(),
