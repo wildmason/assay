@@ -23,7 +23,7 @@ use crate::worker_pool::WorkerContext;
 
 use super::args::AnalyzeArgs;
 use super::config_resolve::ecosystem_enabled;
-use super::git_ops::prepare_apply_local_tree;
+use super::git_ops::{apply_tree_worktree_root, prepare_apply_local_tree};
 use super::paths::{forward_slash_path, strip_extended_length_prefix};
 use super::run_state::{WorkUnit, WorkerOutcome};
 
@@ -105,6 +105,72 @@ pub(super) fn build_work_units(
     units
 }
 
+fn unit_members(unit: &WorkUnit) -> Vec<Proposal> {
+    let mut members = Vec::with_capacity(1 + unit.lockstep_members.len());
+    members.push(unit.proposal.clone());
+    members.extend(unit.lockstep_members.iter().cloned());
+    members
+}
+
+fn failure_context_from_outcome(
+    outcome: &crate::model::ValidationOutcome,
+) -> Option<crate::failure_context::FailureContext> {
+    outcome
+        .failure_details
+        .first()
+        .and_then(|d| d.failure_context.clone())
+}
+
+fn workflow_strings(outcome: &crate::model::ValidationOutcome) -> Vec<String> {
+    outcome
+        .validated_workflows
+        .iter()
+        .cloned()
+        .map(forward_slash_path)
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+struct CompletionEvidence {
+    conclusion: String,
+    duration_ms: u64,
+    notes: Vec<String>,
+    validated_workflows: Vec<String>,
+    ci_forge_run_ids: Vec<String>,
+    failure_context: Option<crate::failure_context::FailureContext>,
+}
+
+fn emit_unit_completed(ctx: &WorkerContext<'_>, unit: &WorkUnit, evidence: CompletionEvidence) {
+    if unit.lockstep_members.is_empty() {
+        ctx.event_sink
+            .emit(crate::events::Event::ProposalCompleted {
+                id: unit.proposal.id.clone(),
+                subject: unit.proposal.subject.clone(),
+                conclusion: evidence.conclusion,
+                duration_ms: evidence.duration_ms,
+                notes: evidence.notes,
+                validated_workflows: evidence.validated_workflows,
+                ci_forge_run_ids: evidence.ci_forge_run_ids,
+                failure_context: evidence.failure_context,
+            });
+    } else {
+        let cohort = unit.proposal.cohort.clone().unwrap_or_default();
+        let member_ids: Vec<String> = std::iter::once(unit.proposal.id.clone())
+            .chain(unit.lockstep_members.iter().map(|p| p.id.clone()))
+            .collect();
+        ctx.event_sink.emit(crate::events::Event::CohortCompleted {
+            cohort,
+            conclusion: evidence.conclusion,
+            member_ids,
+            duration_ms: evidence.duration_ms,
+            notes: evidence.notes,
+            validated_workflows: evidence.validated_workflows,
+            ci_forge_run_ids: evidence.ci_forge_run_ids,
+            failure_context: evidence.failure_context,
+        });
+    }
+}
+
 /// Worker body: prepare sandbox → apply proposal → gate workflows → validate.
 ///
 /// All provenance records produced during this unit live on the
@@ -165,19 +231,35 @@ pub(super) fn process_proposal_unit(
         Ok(path) => path,
         Err(err) => {
             let summary = format!("apply tree preparation failed: {err}");
-            records.push(ProvenanceRecord {
-                tool: "assay".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                stage: format!("applier.{}", ecosystem.name()),
-                subject: unit.proposal.id.clone(),
-                status: Classification::Unsupported,
-                summary: summary.clone(),
-                artifact_path: None,
-                details: None,
-            });
+            for member in unit_members(&unit) {
+                records.push(ProvenanceRecord {
+                    tool: "assay".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    stage: format!("applier.{}", ecosystem.name()),
+                    subject: member.id,
+                    status: Classification::Unsupported,
+                    summary: summary.clone(),
+                    artifact_path: None,
+                    details: None,
+                });
+            }
+            let duration_ms =
+                u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            emit_unit_completed(
+                ctx,
+                &unit,
+                CompletionEvidence {
+                    conclusion: "failure".into(),
+                    duration_ms,
+                    notes: vec![summary.clone()],
+                    validated_workflows: Vec::new(),
+                    ci_forge_run_ids: Vec::new(),
+                    failure_context: None,
+                },
+            );
             return WorkerOutcome::PreValidationFailure {
                 eco_idx: unit.eco_idx,
-                proposal: unit.proposal,
+                proposals: unit_members(&unit),
                 provenance: records,
                 summary,
             };
@@ -200,38 +282,34 @@ pub(super) fn process_proposal_unit(
     };
     if let Err(err) = apply_result {
         let summary = format!("apply failed: {err}");
-        records.push(ProvenanceRecord {
-            tool: "assay".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            stage: format!("applier.{}", ecosystem.name()),
-            subject: unit.proposal.id.clone(),
-            status: Classification::Unsupported,
-            summary: summary.clone(),
-            artifact_path: None,
-            details: None,
-        });
-        // For cohort lockstep failures, surface a PreValidationFailure
-        // for EACH member so the reporter accounts for them all.
-        // The simple variant only carries one `proposal`; we keep the
-        // primary in this slot and append additional records for each
-        // sibling so the receipt has full provenance.
-        if !unit.lockstep_members.is_empty() {
-            for sibling in &unit.lockstep_members {
-                records.push(ProvenanceRecord {
-                    tool: "assay".into(),
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    stage: format!("applier.{}", ecosystem.name()),
-                    subject: sibling.id.clone(),
-                    status: Classification::Unsupported,
-                    summary: format!("cohort-lockstep apply failed: {err}"),
-                    artifact_path: None,
-                    details: None,
-                });
-            }
+        for member in unit_members(&unit) {
+            records.push(ProvenanceRecord {
+                tool: "assay".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                stage: format!("applier.{}", ecosystem.name()),
+                subject: member.id,
+                status: Classification::Unsupported,
+                summary: summary.clone(),
+                artifact_path: None,
+                details: None,
+            });
         }
+        let duration_ms = u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        emit_unit_completed(
+            ctx,
+            &unit,
+            CompletionEvidence {
+                conclusion: "failure".into(),
+                duration_ms,
+                notes: vec![summary.clone()],
+                validated_workflows: Vec::new(),
+                ci_forge_run_ids: Vec::new(),
+                failure_context: None,
+            },
+        );
         return WorkerOutcome::PreValidationFailure {
             eco_idx: unit.eco_idx,
-            proposal: unit.proposal,
+            proposals: unit_members(&unit),
             provenance: records,
             summary,
         };
@@ -274,16 +352,62 @@ pub(super) fn process_proposal_unit(
         });
     }
 
-    let workflow_paths = ecosystem
-        .gate_workflows(&unit.proposal, &apply_tree)
-        .unwrap_or_default();
+    let validation_tree = if validator.needs_workflow_file() {
+        match apply_tree_worktree_root(&scan_root, &apply_tree) {
+            Ok(root) => root,
+            Err(err) => {
+                let summary = format!("validation worktree root resolution failed: {err}");
+                for member in unit_members(&unit) {
+                    records.push(ProvenanceRecord {
+                        tool: "assay".into(),
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        stage: format!("validator.{}", ecosystem.name()),
+                        subject: member.id,
+                        status: Classification::Stubbed,
+                        summary: summary.clone(),
+                        artifact_path: None,
+                        details: None,
+                    });
+                }
+                let duration_ms =
+                    u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                emit_unit_completed(
+                    ctx,
+                    &unit,
+                    CompletionEvidence {
+                        conclusion: "unvalidated".into(),
+                        duration_ms,
+                        notes: vec![summary.clone()],
+                        validated_workflows: Vec::new(),
+                        ci_forge_run_ids: Vec::new(),
+                        failure_context: None,
+                    },
+                );
+                return WorkerOutcome::ValidatorErrored {
+                    eco_idx: unit.eco_idx,
+                    proposals: unit_members(&unit),
+                    provenance: records,
+                    summary,
+                };
+            }
+        }
+    } else {
+        apply_tree.clone()
+    };
+    let workflow_paths = if validator.needs_workflow_file() {
+        ecosystem
+            .gate_workflows(&unit.proposal, &validation_tree)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     // Member-precise filter: when --member-gate is set, drop
     // workflows that name only non-affected workspace members. The
     // filter never drops wildcard workflows (--workspace etc.) or
     // workflows with no member selectors.
     let (workflow_paths, member_skipped) = if ctx.member_gate {
         let (kept, dropped) = crate::member_gate::filter_workflows_by_member(
-            &apply_tree,
+            &validation_tree,
             &workflow_paths,
             &unit.proposal.affected_consumers,
         );
@@ -310,26 +434,42 @@ pub(super) fn process_proposal_unit(
     } else {
         (workflow_paths, 0usize)
     };
-    let outcome = match validator.validate(&unit.proposal, &apply_tree, &workflow_paths) {
+    let outcome = match validator.validate(&unit.proposal, &validation_tree, &workflow_paths) {
         Ok(mut outcome) => {
             outcome.member_skipped_workflow_count = member_skipped;
             outcome
         }
         Err(err) => {
             let summary = format!("validator could not run: {err}");
-            records.push(ProvenanceRecord {
-                tool: "assay".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                stage: format!("validator.{}", ecosystem.name()),
-                subject: unit.proposal.id.clone(),
-                status: Classification::Stubbed,
-                summary: summary.clone(),
-                artifact_path: None,
-                details: None,
-            });
+            for member in unit_members(&unit) {
+                records.push(ProvenanceRecord {
+                    tool: "assay".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    stage: format!("validator.{}", ecosystem.name()),
+                    subject: member.id,
+                    status: Classification::Stubbed,
+                    summary: summary.clone(),
+                    artifact_path: None,
+                    details: None,
+                });
+            }
+            let duration_ms =
+                u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            emit_unit_completed(
+                ctx,
+                &unit,
+                CompletionEvidence {
+                    conclusion: "unvalidated".into(),
+                    duration_ms,
+                    notes: vec![summary.clone()],
+                    validated_workflows: Vec::new(),
+                    ci_forge_run_ids: Vec::new(),
+                    failure_context: None,
+                },
+            );
             return WorkerOutcome::ValidatorErrored {
                 eco_idx: unit.eco_idx,
-                proposal: unit.proposal,
+                proposals: unit_members(&unit),
                 provenance: records,
                 summary,
             };
@@ -351,22 +491,18 @@ pub(super) fn process_proposal_unit(
     });
     let duration_ms = u64::try_from(worker_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if unit.lockstep_members.is_empty() {
-        // Lift the first failure's structured context onto the
-        // `proposal_completed` event. `failure_details` is empty
-        // for greens and `unvalidated` outcomes, so this leaves the
-        // event field `None` in those cases (skipped on the wire).
-        let failure_context = outcome
-            .failure_details
-            .first()
-            .and_then(|d| d.failure_context.clone());
-        ctx.event_sink
-            .emit(crate::events::Event::ProposalCompleted {
-                id: unit.proposal.id.clone(),
-                subject: unit.proposal.subject.clone(),
+        emit_unit_completed(
+            ctx,
+            &unit,
+            CompletionEvidence {
                 conclusion: outcome.conclusion.clone(),
                 duration_ms,
-                failure_context,
-            });
+                notes: outcome.notes.clone(),
+                validated_workflows: workflow_strings(&outcome),
+                ci_forge_run_ids: outcome.ci_forge_run_ids.clone(),
+                failure_context: failure_context_from_outcome(&outcome),
+            },
+        );
         WorkerOutcome::Completed {
             eco_idx: unit.eco_idx,
             proposal: unit.proposal,
@@ -383,14 +519,25 @@ pub(super) fn process_proposal_unit(
         let mut members: Vec<Proposal> = Vec::with_capacity(1 + unit.lockstep_members.len());
         members.push(unit.proposal);
         members.extend(unit.lockstep_members);
-        let cohort_id = members[0].cohort.clone().unwrap_or_default();
-        let member_ids: Vec<String> = members.iter().map(|p| p.id.clone()).collect();
-        ctx.event_sink.emit(crate::events::Event::CohortCompleted {
-            cohort: cohort_id,
-            conclusion: outcome.conclusion.clone(),
-            member_ids,
-            duration_ms,
-        });
+        let event_unit = WorkUnit {
+            eco_idx: unit.eco_idx,
+            ecosystem_name: unit.ecosystem_name,
+            proposal: members[0].clone(),
+            lockstep_members: members[1..].to_vec(),
+            scan_root: scan_root.clone(),
+        };
+        emit_unit_completed(
+            ctx,
+            &event_unit,
+            CompletionEvidence {
+                conclusion: outcome.conclusion.clone(),
+                duration_ms,
+                notes: outcome.notes.clone(),
+                validated_workflows: workflow_strings(&outcome),
+                ci_forge_run_ids: outcome.ci_forge_run_ids.clone(),
+                failure_context: failure_context_from_outcome(&outcome),
+            },
+        );
         WorkerOutcome::CohortCompleted {
             eco_idx: unit.eco_idx,
             members,
@@ -434,6 +581,7 @@ pub(super) fn emit_run_started_event(
             to: p.to.clone(),
             tier: p.bump_tier.as_str().to_string(),
             ecosystem: p.ecosystem.clone(),
+            explanation: p.explanation.clone(),
             cohort: p.cohort.clone(),
         })
         .collect();
@@ -500,4 +648,196 @@ pub(super) fn cohort_display_name(cohort_id: &str) -> String {
         return c.display.to_string();
     }
     cohort_id.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::ecosystem::{DependencyEcosystem, EcosystemContext};
+    use crate::error::{Error, Result};
+    use crate::events::{Event, EventSink};
+    use crate::model::{
+        BumpTier, Classification, ConsumerId, Manifest, Proposal, ProposalKind, ValidationOutcome,
+    };
+    use crate::validator::{Validator, ValidatorExecutor};
+    use crate::worker_pool::Semaphore;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    struct FailingApplyEcosystem;
+
+    impl DependencyEcosystem for FailingApplyEcosystem {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn detect_manifests(&self, _repo: &Path) -> Result<Vec<Manifest>> {
+            Ok(Vec::new())
+        }
+
+        fn propose_updates(
+            &self,
+            _manifests: &[Manifest],
+            _repo: &Path,
+            _ctx: &EcosystemContext,
+        ) -> Result<Vec<Proposal>> {
+            Ok(Vec::new())
+        }
+
+        fn gate_workflows(&self, _proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
+            Ok(Vec::new())
+        }
+
+        fn affected_consumers(
+            &self,
+            _proposal: &Proposal,
+            _tree: &Path,
+        ) -> Result<Vec<ConsumerId>> {
+            Ok(Vec::new())
+        }
+
+        fn apply_proposal(&self, _proposal: &Proposal, _tree_path: &Path) -> Result<()> {
+            Err(Error::other("intentional apply failure"))
+        }
+
+        fn apply_merged(&self, _proposals: &[&Proposal], _tree_path: &Path) -> Result<()> {
+            Err(Error::other("intentional cohort apply failure"))
+        }
+
+        fn copy_back(
+            &self,
+            _proposal: &Proposal,
+            _sandbox: &Path,
+            _host: &Path,
+        ) -> Result<Vec<PathBuf>> {
+            Ok(Vec::new())
+        }
+
+        fn pr_body_fragment(&self, _proposal: &Proposal, _outcome: &ValidationOutcome) -> String {
+            String::new()
+        }
+    }
+
+    fn proposal(id: &str, subject: &str, cohort: Option<&str>) -> Proposal {
+        Proposal {
+            id: id.into(),
+            ecosystem: "test".into(),
+            kind: ProposalKind::Version,
+            subject: subject.into(),
+            from: "1.0.0".into(),
+            to: "2.0.0".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![PathBuf::from("Cargo.toml")],
+            notes: Vec::new(),
+            bump_tier: BumpTier::Breaking,
+            affected_consumers: Vec::new(),
+            explanation: None,
+            cohort: cohort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cohort_apply_failure_returns_all_members_and_terminal_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, ["init"]);
+        std::fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        git(repo, ["add", "Cargo.toml"]);
+        git(
+            repo,
+            [
+                "-c",
+                "user.email=assay@example.invalid",
+                "-c",
+                "user.name=assay",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        let primary = proposal("test-a", "a", Some("test-cohort"));
+        let sibling = proposal("test-b", "b", Some("test-cohort"));
+        let unit = WorkUnit {
+            eco_idx: 0,
+            ecosystem_name: "test",
+            proposal: primary,
+            lockstep_members: vec![sibling],
+            scan_root: repo.to_path_buf(),
+        };
+        let registry: Vec<Box<dyn DependencyEcosystem>> = vec![Box::new(FailingApplyEcosystem)];
+        let validator = Validator::new(ValidatorExecutor::Docker);
+        let git_mutex = Mutex::new(());
+        let sink = RecordingSink::default();
+        let semaphores: Vec<(&'static str, std::sync::Arc<Semaphore>)> = Vec::new();
+        let ctx = crate::worker_pool::WorkerContext {
+            semaphores,
+            git_mutex: &git_mutex,
+            member_gate: false,
+            event_sink: &sink,
+        };
+
+        let outcome =
+            process_proposal_unit(unit, &validator, &registry, repo, "assay-test-run", &ctx);
+
+        match outcome {
+            WorkerOutcome::PreValidationFailure {
+                proposals, summary, ..
+            } => {
+                assert_eq!(
+                    proposals.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+                    vec!["test-a", "test-b"]
+                );
+                assert!(summary.contains("intentional cohort apply failure"));
+            }
+            other => panic!("expected PreValidationFailure, got {other:?}"),
+        }
+        let events = sink.events.lock().unwrap();
+        assert!(matches!(events[0], Event::CohortValidating { .. }));
+        match events.last().unwrap() {
+            Event::CohortCompleted {
+                conclusion,
+                member_ids,
+                notes,
+                ..
+            } => {
+                assert_eq!(conclusion, "failure");
+                assert_eq!(
+                    member_ids,
+                    &vec!["test-a".to_string(), "test-b".to_string()]
+                );
+                assert!(
+                    notes
+                        .iter()
+                        .any(|note| note.contains("intentional cohort apply failure"))
+                );
+            }
+            other => panic!("expected CohortCompleted, got {other:?}"),
+        }
+    }
+
+    fn git<const N: usize>(repo: &Path, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git must start");
+        assert!(
+            output.status.success(),
+            "git failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

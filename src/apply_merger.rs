@@ -489,7 +489,16 @@ fn try_merged_apply_and_validate(
     let merge_tree = prepare_isolated_worktree(artifact_root, scan_root, run_id, &label)?;
     ecosystem.apply_merged(&proposals, &merge_tree)?;
     let synth = synthesize_merged_proposal(eco_idx, ecosystem, &proposals);
-    let workflows = collect_gate_workflows(ecosystem, &proposals, &merge_tree);
+    let validation_tree = if validator.needs_workflow_file() {
+        isolated_worktree_root_for_scan_root(scan_root, &merge_tree)?
+    } else {
+        merge_tree.clone()
+    };
+    let workflows = if validator.needs_workflow_file() {
+        collect_gate_workflows(ecosystem, &proposals, &validation_tree)
+    } else {
+        Vec::new()
+    };
     provenance.records.push(ProvenanceRecord {
         tool: "assay".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -500,10 +509,11 @@ fn try_merged_apply_and_validate(
         artifact_path: None,
         details: Some(serde_json::json!({
             "sandbox": merge_tree,
+            "validation_tree": validation_tree,
             "proposals": proposals.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
         })),
     });
-    let outcome = validator.validate(&synth, &merge_tree, &workflows)?;
+    let outcome = validator.validate(&synth, &validation_tree, &workflows)?;
     provenance.records.push(ProvenanceRecord {
         tool: "assay".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -670,6 +680,28 @@ pub fn prepare_isolated_worktree(
         _ => target_abs,
     };
     Ok(final_target)
+}
+
+fn isolated_worktree_root_for_scan_root(
+    scan_root: &Path,
+    sandbox_scan_root: &Path,
+) -> Result<PathBuf> {
+    let git_root = resolve_git_top_level(scan_root)?;
+    let rel_sub_dir = scan_root.canonicalize().ok().and_then(|c| {
+        git_root
+            .canonicalize()
+            .ok()
+            .and_then(|g| c.strip_prefix(&g).ok().map(Path::to_path_buf))
+    });
+    let mut root = sandbox_scan_root.to_path_buf();
+    if let Some(rel) = rel_sub_dir {
+        for component in rel.components() {
+            if matches!(component, std::path::Component::Normal(_)) {
+                root.pop();
+            }
+        }
+    }
+    Ok(root)
 }
 
 fn resolve_git_top_level(path: &Path) -> Result<PathBuf> {

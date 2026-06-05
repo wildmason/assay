@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 use crate::failure_context::{FailureCluster, FailureContext};
+use crate::model::BumpExplanation;
 
 /// One event emitted on the NDJSON stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +60,20 @@ pub enum Event {
         subject: String,
         conclusion: String,
         duration_ms: u64,
+        /// Human-readable validator notes. Especially important for
+        /// `unvalidated` conclusions where there is no stderr/failure
+        /// context, but the GUI still needs to explain why execution did
+        /// not produce a pass/fail verdict.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
+        /// Workflow paths that were actually executed as the proposal's
+        /// validation gate.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        validated_workflows: Vec<String>,
+        /// Underlying ci-forge run ids when the validator delegated to
+        /// `forge run`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ci_forge_run_ids: Vec<String>,
         /// Structured failure context. `Some(_)` on every `failure`
         /// conclusion (even unparseable stderr produces a
         /// `rule:"generic:unstructured"` context); `None` on
@@ -74,6 +89,19 @@ pub enum Event {
         conclusion: String,
         member_ids: Vec<String>,
         duration_ms: u64,
+        /// Human-readable validator notes shared by every cohort member.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notes: Vec<String>,
+        /// Workflow paths that were executed for the cohort gate.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        validated_workflows: Vec<String>,
+        /// Underlying ci-forge run ids when the validator delegated to
+        /// `forge run`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ci_forge_run_ids: Vec<String>,
+        /// Structured failure context, mirroring `ProposalCompleted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_context: Option<FailureContext>,
     },
     /// Final summary; the run is complete. Emitted once at the
     /// end. After this event, no further events are emitted on
@@ -102,6 +130,10 @@ pub struct EventProposal {
     pub to: String,
     pub tier: String,
     pub ecosystem: String,
+    /// Structured classifier rationale. Additive field: present when
+    /// the proposer or `--explain` populated `Proposal::explanation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<BumpExplanation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohort: Option<String>,
 }
@@ -196,6 +228,9 @@ mod tests {
             subject: "foo".into(),
             conclusion: "success".into(),
             duration_ms: 1234,
+            notes: Vec::new(),
+            validated_workflows: Vec::new(),
+            ci_forge_run_ids: Vec::new(),
             failure_context: None,
         };
         let s = serde_json::to_string(&evt).unwrap();
@@ -225,6 +260,9 @@ mod tests {
             subject: "foo".into(),
             conclusion: "failure".into(),
             duration_ms: 1234,
+            notes: Vec::new(),
+            validated_workflows: Vec::new(),
+            ci_forge_run_ids: Vec::new(),
             failure_context: Some(ctx.clone()),
         };
         let s = serde_json::to_string(&evt).unwrap();
@@ -251,6 +289,9 @@ mod tests {
             subject: "foo".into(),
             conclusion: "success".into(),
             duration_ms: 1234,
+            notes: Vec::new(),
+            validated_workflows: Vec::new(),
+            ci_forge_run_ids: Vec::new(),
             failure_context: None,
         };
         let s = serde_json::to_string(&evt).unwrap();
@@ -258,6 +299,77 @@ mod tests {
             !s.contains("failure_context"),
             "None must be elided from the wire format; got {s}"
         );
+    }
+
+    #[test]
+    fn proposal_completed_carries_validation_evidence() {
+        let evt = Event::ProposalCompleted {
+            id: "gha-actions-cache".into(),
+            subject: "actions/cache".into(),
+            conclusion: "unvalidated".into(),
+            duration_ms: 7,
+            notes: vec!["no affected workflow was identified".into()],
+            validated_workflows: vec![".github/workflows/ci.yml".into()],
+            ci_forge_run_ids: vec!["local-123".into()],
+            failure_context: None,
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("notes"));
+        assert!(s.contains("validated_workflows"));
+        assert!(s.contains("ci_forge_run_ids"));
+        let back: Event = serde_json::from_str(&s).unwrap();
+        match back {
+            Event::ProposalCompleted {
+                notes,
+                validated_workflows,
+                ci_forge_run_ids,
+                ..
+            } => {
+                assert_eq!(notes, vec!["no affected workflow was identified"]);
+                assert_eq!(validated_workflows, vec![".github/workflows/ci.yml"]);
+                assert_eq!(ci_forge_run_ids, vec!["local-123"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn cohort_completed_carries_validation_evidence() {
+        let evt = Event::CohortCompleted {
+            cohort: "angular-framework".into(),
+            conclusion: "failure".into(),
+            member_ids: vec!["npm-angular-core".into(), "npm-angular-common".into()],
+            duration_ms: 13,
+            notes: vec!["workflow .github/workflows/ci.yml concluded REGRESSION".into()],
+            validated_workflows: vec![".github/workflows/ci.yml".into()],
+            ci_forge_run_ids: vec!["forge-42".into()],
+            failure_context: Some(FailureContext::new(
+                "generic:unstructured",
+                "workflow failed",
+                Vec::new(),
+            )),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("notes"));
+        assert!(s.contains("validated_workflows"));
+        assert!(s.contains("ci_forge_run_ids"));
+        assert!(s.contains("failure_context"));
+        let back: Event = serde_json::from_str(&s).unwrap();
+        match back {
+            Event::CohortCompleted {
+                notes,
+                validated_workflows,
+                ci_forge_run_ids,
+                failure_context,
+                ..
+            } => {
+                assert_eq!(notes.len(), 1);
+                assert_eq!(validated_workflows, vec![".github/workflows/ci.yml"]);
+                assert_eq!(ci_forge_run_ids, vec!["forge-42"]);
+                assert!(failure_context.is_some());
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
@@ -345,12 +457,45 @@ mod tests {
             to: "2.0.0".into(),
             tier: "breaking".into(),
             ecosystem: "npm".into(),
+            explanation: None,
             cohort: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(
             !s.contains("cohort"),
             "stand-alone proposal should not serialize an empty cohort field; got: {s}"
+        );
+    }
+
+    #[test]
+    fn proposal_carries_explanation_when_present() {
+        let p = EventProposal {
+            id: "gha-actions-checkout-v6".into(),
+            subject: "actions/checkout".into(),
+            from: "v4".into(),
+            to: "v6".into(),
+            tier: "breaking".into(),
+            ecosystem: "github-actions".into(),
+            explanation: Some(BumpExplanation {
+                summary: "gha: major version changed (4 -> 6); breaking-by-spec".into(),
+                rule: "gha:major-bump".into(),
+                inputs: {
+                    let mut inputs = std::collections::BTreeMap::new();
+                    inputs.insert("from_tag".into(), "v4".into());
+                    inputs.insert("to_tag".into(), "v6".into());
+                    inputs
+                },
+                decision: "breaking".into(),
+            }),
+            cohort: None,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("explanation"));
+        assert!(s.contains("gha:major-bump"));
+        let back: EventProposal = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            back.explanation.as_ref().map(|e| e.rule.as_str()),
+            Some("gha:major-bump")
         );
     }
 

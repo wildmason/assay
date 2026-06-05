@@ -121,10 +121,11 @@ impl BumpTier {
 
 /// Structured explanation for *why* a proposal's [`BumpTier`] was chosen.
 ///
-/// Populated by the proposer when `--explain` is set so the operator can
-/// audit the classifier's verdict without re-running the analysis with
-/// debug logging. The reporter surfaces this inline beneath each
-/// proposal in the text format and inlines it in the JSON format.
+/// Populated by proposers for high-signal cases, and by the CLI when
+/// `--explain` is set, so the operator can audit the classifier's
+/// verdict without re-running the analysis with debug logging. The
+/// reporter surfaces breaking explanations inline by default, surfaces
+/// every explanation with `--explain`, and inlines them in JSON output.
 ///
 /// Lives on [`Proposal`] as `Option<BumpExplanation>` — `None` keeps
 /// receipt size flat when the operator didn't ask for explanations.
@@ -185,10 +186,11 @@ pub struct Proposal {
     /// `#[serde(default)]` for receipt back-compat with older runs.
     #[serde(default)]
     pub affected_consumers: Vec<ConsumerId>,
-    /// Structured "why this tier" explanation. Populated only when
-    /// `--explain` is set on the CLI; `None` otherwise. `#[serde(default)]`
-    /// so receipts written before `--explain` shipped still
-    /// deserialize cleanly.
+    /// Structured "why this tier" explanation. Populated by some
+    /// proposers for high-signal/default-visible cases and by the CLI
+    /// for all supported proposals when `--explain` is set.
+    /// `#[serde(default)]` so receipts written before explanations
+    /// shipped still deserialize cleanly.
     #[serde(default)]
     pub explanation: Option<BumpExplanation>,
     /// Framework cohort this proposal belongs to (`@angular/*`,

@@ -320,6 +320,29 @@ pub(super) fn prepare_apply_local_tree(
     Ok(final_target)
 }
 
+/// Given the subdirectory returned by [`prepare_apply_local_tree`],
+/// recover the sandbox's git worktree root. Single-root runs return
+/// `apply_tree` unchanged; subproject runs pop the same repo-relative
+/// path components that were appended during sandbox preparation.
+pub(super) fn apply_tree_worktree_root(scan_root: &Path, apply_tree: &Path) -> Result<PathBuf> {
+    let git_root = git_top_level(scan_root)?;
+    let rel_sub_dir = scan_root.canonicalize().ok().and_then(|c| {
+        git_root
+            .canonicalize()
+            .ok()
+            .and_then(|g| c.strip_prefix(&g).ok().map(Path::to_path_buf))
+    });
+    let mut root = apply_tree.to_path_buf();
+    if let Some(rel) = rel_sub_dir {
+        for component in rel.components() {
+            if matches!(component, std::path::Component::Normal(_)) {
+                root.pop();
+            }
+        }
+    }
+    Ok(root)
+}
+
 /// Resolve the top-level git repo root for `path` via
 /// `git rev-parse --show-toplevel`. Errors with a clear message when
 /// `path` isn't under any git checkout (the operator can't use

@@ -139,6 +139,15 @@ pub struct AnalyzeArgs {
     #[arg(long)]
     pub fail_fast: bool,
 
+    /// Keep only proposals classified as `breaking` after discovery.
+    /// Useful with `--validate` for the second-phase workflow where
+    /// the operator first scans every available upgrade, then asks
+    /// "which breaking-risk upgrades actually fail this repository's
+    /// gates?" Non-breaking proposals are omitted from the receipt and
+    /// validator work queue for this invocation.
+    #[arg(long = "only-breaking")]
+    pub only_breaking: bool,
+
     /// Suppress SHA-pin hardening proposals for tag-pinned GitHub
     /// Actions references. By default, every `actions/foo@vN` pin
     /// also gets a "pin to SHA at `vN.M.P`" proposal so workflows

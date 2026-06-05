@@ -24,7 +24,7 @@ use crate::model::{Classification, Proposal, ValidationOutcome};
 use crate::verdict_cache::DEFAULT_CACHE_TTL;
 use crate::verdict_cache::{
     CACHE_SCHEMA_VERSION, CacheEntry, CacheKey, CacheKeyInputs, CachedInputs, CachedVerdict,
-    VerdictCache, fingerprint_file, fingerprint_workspace_files,
+    VerdictCache, fingerprint_file, fingerprint_workspace_tree,
 };
 use crate::workflow_filter::WorkflowFilter;
 
@@ -51,29 +51,11 @@ const VALIDATOR_EVENT: &str = "push";
 /// forge-run entry that happens to share fingerprints.
 const TREE_MODE_EVENT: &str = "<tree-mode>";
 
-/// Set of canonical manifest + lockfile filenames hashed into the
-/// workspace fingerprint. A change to any of these produces a different
-/// cache key. Missing files contribute a stable "missing" marker so
-/// adding or removing a lockfile is also detected.
-const WORKSPACE_FINGERPRINT_FILES: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "package.json",
-    "package-lock.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-];
-
 /// Compute the workspace fingerprint for the prepared `workspace`
-/// directory. Hashes the canonical manifest + lockfile set; missing
-/// files contribute a stable "missing" marker.
+/// directory. Hashes the post-apply workspace tree, excluding transient
+/// artifact directories that should not affect a CI verdict.
 fn compute_workspace_fingerprint(workspace: &Path) -> String {
-    let paths: Vec<PathBuf> = WORKSPACE_FINGERPRINT_FILES
-        .iter()
-        .map(|name| workspace.join(name))
-        .collect();
-    let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
-    fingerprint_workspace_files(&refs)
+    fingerprint_workspace_tree(workspace)
 }
 
 // =============================================================================
@@ -286,6 +268,13 @@ impl Validator {
         self
     }
 
+    /// Whether the selected backend needs concrete workflow files.
+    /// Callers use this to choose between repo-root workflow validation
+    /// and package-root tree-mode validation.
+    pub fn needs_workflow_file(&self) -> bool {
+        self.backend.needs_workflow_file()
+    }
+
     /// Auto-select the right backend for `project_root` (plan §C.4.c
     /// selection logic).
     ///
@@ -419,8 +408,8 @@ impl Validator {
             })?;
 
         // Workspace fingerprint is computed once and reused across
-        // workflows — the manifest+lockfile state doesn't change while
-        // we iterate the gate workflows of a single proposal.
+        // workflows — the post-apply tree doesn't change while we
+        // iterate the gate workflows of a single proposal.
         let workspace_fingerprint = if self.cache.is_some() {
             compute_workspace_fingerprint(workspace)
         } else {
@@ -518,7 +507,7 @@ impl Validator {
     /// Returns the outcome with `cached_at_unix_secs` populated when a
     /// fresh cache entry covered the work.
     ///
-    /// `workspace_fingerprint` is the precomputed manifest+lockfile
+    /// `workspace_fingerprint` is the precomputed post-apply workspace
     /// digest at `workspace`. `event` is the GHA-style event label
     /// (workflow-bound: `push`; tree-mode: the tree-mode sentinel).
     /// `workflow_for_fp` is `Some(<file>)` for workflow-bound runs (the
@@ -2115,6 +2104,82 @@ mod tests {
             2,
             "lockfile mutation must invalidate the cache key"
         );
+    }
+
+    #[test]
+    fn source_file_change_invalidates_cache() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("src").join("lib.rs"),
+            b"pub fn value() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Pass);
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        std::fs::write(
+            workspace.join("src").join("lib.rs"),
+            b"pub fn value() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "source edits must invalidate the cache key"
+        );
+    }
+
+    #[test]
+    fn transient_build_artifacts_do_not_invalidate_cache() {
+        let (tmp, workspace, workflow) = fixture_workspace_with_manifest();
+        let (backend, calls) = CountingBackend::new(WorkflowResult::Pass);
+        let cache_dir = tmp.path().join(".assay").join("verdict-cache");
+        let cache = crate::verdict_cache::VerdictCache::new(cache_dir, DEFAULT_CACHE_TTL);
+        let validator = Validator::with_backend(Box::new(backend)).with_cache(cache);
+
+        validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        std::fs::create_dir_all(workspace.join("target").join("debug")).unwrap();
+        std::fs::write(
+            workspace.join("target").join("debug").join("artifact"),
+            b"noise",
+        )
+        .unwrap();
+        let outcome = validator
+            .validate(
+                &sample_proposal(),
+                &workspace,
+                std::slice::from_ref(&workflow),
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "ignored build artifacts should not invalidate cache hits"
+        );
+        assert_eq!(outcome.cached_workflow_count, 1);
     }
 
     #[test]

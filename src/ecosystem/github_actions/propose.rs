@@ -15,7 +15,8 @@ use crate::model::{BumpTier, Classification, Manifest, ManifestKind, Proposal, P
 use super::super::EcosystemName;
 use super::super::github_actions_api::{GitHubApiClient, ReleaseInfo};
 use super::tag_utils::{
-    count_version_segments, is_shortcut_ref, parse_action_tag, tag_specificity, truncate_tag,
+    count_version_segments, is_likely_commit_sha, is_shortcut_ref, parse_action_tag,
+    tag_specificity, truncate_tag,
 };
 use super::{ActionAggregate, PinKind, UsesKind, UsesReference};
 
@@ -102,7 +103,7 @@ pub(crate) fn aggregate_actions_from_manifests(manifests: &[Manifest]) -> Vec<Ac
 ///
 /// Tier classification reuses [`classify_action_bump`] against the
 /// best-known from-tag (the comment for SHA pins, the pin itself for
-/// tag pins) vs the resolved latest release tag.
+/// tag pins) vs the target tag Assay would write.
 pub(crate) fn build_action_proposals(
     manifests: &[Manifest],
     client: &GitHubApiClient,
@@ -176,7 +177,9 @@ pub(crate) fn build_action_proposals(
                     .with_target_tag(target_tag)
             }
         };
-        let tier = classify_action_bump(parts.from_tag_for_tier.as_deref(), &release.tag_name);
+        let tier = classify_action_bump(parts.from_tag_for_tier.as_deref(), &parts.target_tag);
+        let explanation =
+            explain_action_bump(parts.from_tag_for_tier.as_deref(), &parts.target_tag);
         let subject = format!("{}/{}", agg.owner, agg.repo);
         let id = format!(
             "gha-{}-{}-{}",
@@ -211,7 +214,7 @@ pub(crate) fn build_action_proposals(
             notes,
             bump_tier: tier,
             affected_consumers: Vec::new(),
-            explanation: None,
+            explanation: Some(explanation),
             cohort: None,
         });
     }
@@ -518,6 +521,25 @@ pub(crate) fn explain_action_bump(
         inputs,
         decision: "compatible".into(),
     }
+}
+
+/// Build a GHA explanation from a stored proposal. Fresh proposals carry
+/// their exact construction-time explanation, but `--explain` can also
+/// run against synthesized proposals or older test fixtures where only
+/// `from` / `to` / `notes` are available. Prefer the `tag:` note for
+/// SHA-target proposals and avoid treating commit SHAs as semver tags.
+pub(crate) fn explain_action_proposal(proposal: &Proposal) -> crate::model::BumpExplanation {
+    let to_tag = proposal
+        .notes
+        .iter()
+        .find_map(|n| n.strip_prefix("tag:"))
+        .unwrap_or(proposal.to.as_str());
+    let from_tag = if is_likely_commit_sha(&proposal.from) {
+        None
+    } else {
+        Some(proposal.from.as_str())
+    };
+    explain_action_bump(from_tag, to_tag)
 }
 
 fn sanitize_id_segment(input: &str) -> String {

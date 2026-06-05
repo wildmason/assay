@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::ecosystem::DependencyEcosystem;
 use crate::error::{Error, Result};
-use crate::model::Proposal;
+use crate::model::{BumpTier, Proposal};
 use crate::validator::{CustomBackend, Validator, ValidatorExecutor};
 use crate::workflow_filter::WorkflowFilter;
 
@@ -130,10 +130,22 @@ pub(super) fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
     }
 }
 
+/// Populate `proposal.explanation` for breaking proposals in
+/// `proposals`. This backs the default text report behavior where
+/// high-risk proposals show their rationale even without `--explain`.
+pub(super) fn populate_breaking_proposal_explanations(
+    proposals: &mut [Proposal],
+    ecosystem_name: &str,
+) {
+    populate_proposal_explanations_matching(proposals, ecosystem_name, |proposal| {
+        matches!(proposal.bump_tier, BumpTier::Breaking)
+    });
+}
+
 /// Populate `proposal.explanation` for each proposal in `proposals`
-/// by dispatching to the matching ecosystem's explainer. Called only
-/// when `--explain` is set; otherwise proposals retain their default
-/// `explanation: None`.
+/// by dispatching to the matching ecosystem's explainer. Called for
+/// `--explain`; proposers may also attach targeted explanations before
+/// this runs. Existing explanations are preserved.
 ///
 /// The dispatch keys on the ecosystem name (matching the strings
 /// `ecosystem.name()` returns: `"cargo"`, `"github-actions"`,
@@ -141,9 +153,19 @@ pub(super) fn workflow_filter_from_args(args: &AnalyzeArgs) -> WorkflowFilter {
 /// explainer fall through with `None` rather than panic — the
 /// reporter handles that gracefully (no rationale line printed).
 pub(super) fn populate_proposal_explanations(proposals: &mut [Proposal], ecosystem_name: &str) {
+    populate_proposal_explanations_matching(proposals, ecosystem_name, |_| true);
+}
+
+fn populate_proposal_explanations_matching(
+    proposals: &mut [Proposal],
+    ecosystem_name: &str,
+    should_populate: impl Fn(&Proposal) -> bool,
+) {
     use crate::ecosystem::{cargo as cargo_eco, github_actions as gha_eco, npm as npm_eco};
-    use crate::model::BumpTier;
     for proposal in proposals.iter_mut() {
+        if !should_populate(proposal) {
+            continue;
+        }
         // Skip proposals that carry their own explanation already —
         // the GHA SHA-pin proposer attaches `gha:tag-to-sha-pinning`
         // at construction time because the generic per-tier
@@ -163,10 +185,7 @@ pub(super) fn populate_proposal_explanations(proposals: &mut [Proposal], ecosyst
                 &proposal.from,
                 &proposal.to,
             )),
-            ("github-actions", _) => Some(gha_eco::explain_action_bump(
-                Some(&proposal.from),
-                &proposal.to,
-            )),
+            ("github-actions", _) => Some(gha_eco::explain_action_proposal(proposal)),
             ("npm", BumpTier::LockfileOnly) => Some(npm_eco::explain_npm_lockfile_only_bump(
                 &proposal.from,
                 &proposal.to,

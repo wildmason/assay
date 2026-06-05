@@ -37,12 +37,13 @@ use apply_pr::{perform_apply_pr, preflight_apply_pr_gh_auth, preflight_apply_pr_
 #[cfg(test)]
 use config_resolve::parse_cli_ignore;
 use config_resolve::{
-    build_validator, ecosystem_enabled, populate_proposal_explanations, resolve_ignore_list,
-    workflow_filter_from_args, zero_manifest_hint,
+    build_validator, ecosystem_enabled, populate_breaking_proposal_explanations,
+    populate_proposal_explanations, resolve_ignore_list, workflow_filter_from_args,
+    zero_manifest_hint,
 };
-#[cfg(test)]
-use git_ops::prepare_apply_local_tree;
 use git_ops::working_tree_dirty_path;
+#[cfg(test)]
+use git_ops::{apply_tree_worktree_root, prepare_apply_local_tree};
 #[cfg(test)]
 use git_ops::{partition_stageable_paths, porcelain_line_is_assay_artifact};
 use paths::{forward_slash_path, relative_prefix, strip_extended_length_prefix};
@@ -71,8 +72,8 @@ use crate::ecosystem::DependencyEcosystem;
 use crate::ecosystem::{EcosystemContext, default_registry};
 use crate::error::{Error, Result};
 use crate::model::{
-    AssayRunReceipt, Classification, Proposal, Provenance, ProvenanceRecord, RepositoryRef,
-    RunSummary,
+    AssayRunReceipt, BumpTier, Classification, Proposal, Provenance, ProvenanceRecord,
+    RepositoryRef, RunSummary,
 };
 #[cfg(test)]
 use crate::model::{Manifest, ManifestKind};
@@ -211,6 +212,7 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     let run_id = generate_run_id();
     let mut total_manifests = 0usize;
     let mut all_proposals: Vec<(usize, PathBuf, Proposal)> = Vec::new();
+    let mut filtered_non_breaking_proposals = 0usize;
     let mut provenance = Provenance::default();
     // Per-ecosystem manifest-count tally for the post-scan zero-result
     // hint. Honors the active --ecosystem filter (skipped ecosystems
@@ -312,13 +314,16 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
                 }
                 // --explain: attach a structured rationale to every
                 // proposal so the operator can audit why each was
-                // classified as it was. No-op when the flag isn't set;
-                // the proposers run the same classification logic
-                // regardless, this just persists the matching
-                // explanation for the receipt + reporter.
+                // classified as it was. Some proposers attach targeted
+                // explanations by default for high-signal cases; this
+                // fills in the rest for the receipt + reporter.
                 if args.explain {
                     populate_proposal_explanations(&mut proposals, ecosystem.name());
+                } else {
+                    populate_breaking_proposal_explanations(&mut proposals, ecosystem.name());
                 }
+                filtered_non_breaking_proposals +=
+                    apply_proposal_filters(&mut proposals, args.only_breaking);
                 for proposal in &proposals {
                     provenance.records.push(ProvenanceRecord {
                         tool: "assay".into(),
@@ -353,6 +358,27 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             total_manifests += manifests.len();
             *per_eco_manifest_count.entry(ecosystem.name()).or_insert(0) += manifests.len();
         }
+    }
+
+    if args.only_breaking {
+        provenance.records.push(ProvenanceRecord {
+            tool: "assay".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            stage: "filter.proposals".into(),
+            subject: "only-breaking".into(),
+            status: Classification::Exact,
+            summary: format!(
+                "kept {} breaking proposal(s); omitted {} non-breaking proposal(s)",
+                all_proposals.len(),
+                filtered_non_breaking_proposals
+            ),
+            artifact_path: None,
+            details: Some(serde_json::json!({
+                "filter": "only-breaking",
+                "kept_breaking": all_proposals.len(),
+                "omitted_non_breaking": filtered_non_breaking_proposals,
+            })),
+        });
     }
 
     // Zero-manifest hint for explicitly-filtered ecosystems. Only
@@ -489,27 +515,29 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             match outcome {
                 WorkerOutcome::PreValidationFailure {
                     eco_idx,
-                    proposal,
+                    proposals,
                     provenance: pr_records,
                     summary,
                 } => {
                     provenance.records.extend(pr_records);
-                    proposals_failed += 1;
-                    pre_validation_failures += 1;
-                    pre_validation_failure_rows.push(PreValidationFailureRow {
-                        eco_idx,
-                        proposal,
-                        summary,
-                    });
+                    proposals_failed += proposals.len();
+                    pre_validation_failures += proposals.len();
+                    for proposal in proposals {
+                        pre_validation_failure_rows.push(PreValidationFailureRow {
+                            eco_idx,
+                            proposal,
+                            summary: summary.clone(),
+                        });
+                    }
                 }
                 WorkerOutcome::ValidatorErrored {
                     eco_idx: _,
-                    proposal: _,
+                    proposals,
                     provenance: pr_records,
                     summary: _,
                 } => {
                     provenance.records.extend(pr_records);
-                    proposals_unvalidated += 1;
+                    proposals_unvalidated += proposals.len();
                 }
                 WorkerOutcome::Completed {
                     eco_idx,
@@ -741,8 +769,14 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
             "assay: tier breakdown: {} lockfile-only / {} compatible / {} breaking",
             lockfile_only, compatible, breaking,
         );
+        if args.only_breaking {
+            println!(
+                "assay: proposal filter: --only-breaking omitted {} non-breaking proposal(s)",
+                filtered_non_breaking_proposals,
+            );
+        }
         if (compatible + breaking) > 0 {
-            print_discovered_section(all_proposals.iter().map(|(_, _, p)| p));
+            print_discovered_section(all_proposals.iter().map(|(_, _, p)| p), args.explain);
         }
         // Validate / ApplyLocal / ApplyPr all run the validator and
         // share the same "validated N green / M red / K unvalidated"
@@ -909,6 +943,15 @@ fn analyze_command(args: AnalyzeArgs) -> Result<()> {
     Ok(())
 }
 
+fn apply_proposal_filters(proposals: &mut Vec<Proposal>, only_breaking: bool) -> usize {
+    if !only_breaking {
+        return 0;
+    }
+    let before = proposals.len();
+    proposals.retain(|p| matches!(p.bump_tier, BumpTier::Breaking));
+    before.saturating_sub(proposals.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,6 +1066,37 @@ mod tests {
             explanation: None,
             cohort: cohort.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn only_breaking_filter_keeps_breaking_and_omits_other_tiers() {
+        use crate::model::BumpTier;
+        let mut compatible = sample_proposal_for_unit("npm-compatible", "chalk", None);
+        compatible.bump_tier = BumpTier::Compatible;
+        let mut lockfile_only = sample_proposal_for_unit("npm-lockfile", "lodash", None);
+        lockfile_only.bump_tier = BumpTier::LockfileOnly;
+        let mut breaking = sample_proposal_for_unit("npm-breaking", "typescript", None);
+        breaking.bump_tier = BumpTier::Breaking;
+        let mut proposals = vec![compatible, lockfile_only, breaking];
+
+        let omitted = apply_proposal_filters(&mut proposals, true);
+
+        assert_eq!(omitted, 2);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].id, "npm-breaking");
+    }
+
+    #[test]
+    fn proposal_filter_is_noop_when_only_breaking_disabled() {
+        let mut proposals = vec![
+            sample_proposal_for_unit("npm-a", "chalk", None),
+            sample_proposal_for_unit("npm-b", "typescript", None),
+        ];
+
+        let omitted = apply_proposal_filters(&mut proposals, false);
+
+        assert_eq!(omitted, 0);
+        assert_eq!(proposals.len(), 2);
     }
 
     fn npm_eco_idx_in(registry: &[Box<dyn DependencyEcosystem>]) -> usize {
@@ -1881,6 +1955,7 @@ mod tests {
                 assert!(!args.apply_pr);
                 assert!(!args.unsafe_host_validation);
                 assert!(!args.force);
+                assert!(!args.only_breaking);
                 assert_eq!(args.executor, ExecutorChoice::Docker);
                 assert!(args.ecosystem.is_none());
             }
@@ -1932,6 +2007,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -1979,6 +2055,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subdirectory_apply_tree_can_recover_root_workflows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let project = repo.join("src-tauri");
+        let workflows_dir = repo.join(".github").join("workflows");
+        git(repo, ["init"]);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(
+            workflows_dir.join("ci.yml"),
+            "name: CI\non: pull_request\njobs: {}\n",
+        )
+        .unwrap();
+        git(repo, ["add", "."]);
+        git(
+            repo,
+            [
+                "-c",
+                "user.email=assay@example.invalid",
+                "-c",
+                "user.name=assay",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+
+        let apply_tree =
+            prepare_apply_local_tree(repo, &project, "assay-test-run", "cargo-serde").unwrap();
+        let validation_root = apply_tree_worktree_root(&project, &apply_tree).unwrap();
+        let proposal = sample_proposal_for_unit("cargo-serde", "serde", None);
+        let workflows = crate::ecosystem::cargo::CargoEcosystem
+            .gate_workflows(&proposal, &validation_root)
+            .unwrap();
+
+        assert!(apply_tree.ends_with("src-tauri"));
+        assert_eq!(
+            workflows,
+            vec![PathBuf::from(".github/workflows").join("ci.yml")]
+        );
+        assert!(validation_root.join(".github/workflows/ci.yml").is_file());
+    }
+
     fn git<const N: usize>(repo: &std::path::Path, args: [&str; N]) {
         let output = std::process::Command::new("git")
             .args(args)
@@ -2014,6 +2135,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -2064,6 +2186,13 @@ mod tests {
         let cli = parse_cli(["assay", "analyze"]);
         let Command::Analyze(args) = cli.command;
         assert!(!args.fail_fast);
+    }
+
+    #[test]
+    fn parse_cli_accepts_only_breaking_flag() {
+        let cli = parse_cli(["assay", "analyze", "--only-breaking"]);
+        let Command::Analyze(args) = cli.command;
+        assert!(args.only_breaking);
     }
 
     #[test]
@@ -2513,6 +2642,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -2622,6 +2752,38 @@ mod tests {
     }
 
     #[test]
+    fn populate_breaking_explanations_only_fills_breaking_proposals() {
+        use crate::model::{BumpTier, ProposalKind};
+        let compatible = Proposal {
+            id: "cargo-serde-1-0-228".into(),
+            ecosystem: "cargo".into(),
+            kind: ProposalKind::Version,
+            subject: "serde".into(),
+            from: "1.0.100".into(),
+            to: "1.0.228".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec![],
+            bump_tier: BumpTier::Compatible,
+            affected_consumers: vec![],
+            explanation: None,
+            cohort: None,
+        };
+        let mut breaking = compatible.clone();
+        breaking.id = "cargo-serde-2-0-0".into();
+        breaking.to = "2.0.0".into();
+        breaking.bump_tier = BumpTier::Breaking;
+        let mut proposals = vec![compatible, breaking];
+
+        populate_breaking_proposal_explanations(&mut proposals, "cargo");
+
+        assert!(proposals[0].explanation.is_none());
+        let exp = proposals[1].explanation.as_ref().unwrap();
+        assert_eq!(exp.rule, "cargo:caret-major-crossed");
+        assert_eq!(exp.decision, "breaking");
+    }
+
+    #[test]
     fn populate_explanations_fills_gha_proposals() {
         use crate::model::{BumpTier, ProposalKind};
         let mut proposals = vec![Proposal {
@@ -2643,6 +2805,31 @@ mod tests {
         let exp = proposals[0].explanation.as_ref().unwrap();
         assert_eq!(exp.rule, "gha:major-bump");
         assert_eq!(exp.decision, "breaking");
+    }
+
+    #[test]
+    fn populate_explanations_uses_gha_tag_note_for_sha_proposals() {
+        use crate::model::{BumpTier, ProposalKind};
+        let mut proposals = vec![Proposal {
+            id: "gha-actions-checkout-sha".into(),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: "0123456789abcdef0123456789abcdef01234567".into(),
+            to: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![],
+            notes: vec!["tag:v4.2.0".into()],
+            bump_tier: BumpTier::Breaking,
+            affected_consumers: vec![],
+            explanation: None,
+            cohort: None,
+        }];
+        populate_proposal_explanations(&mut proposals, "github-actions");
+        let exp = proposals[0].explanation.as_ref().unwrap();
+        assert_eq!(exp.rule, "gha:unknown-from");
+        assert_eq!(exp.inputs.get("to_tag").map(String::as_str), Some("v4.2.0"));
+        assert!(!exp.inputs.contains_key("from_tag"));
     }
 
     #[test]
@@ -2782,6 +2969,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -2859,6 +3047,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -2899,6 +3088,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -2953,6 +3143,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -4250,6 +4441,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -4288,6 +4480,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -4324,6 +4517,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,
@@ -4362,6 +4556,7 @@ mod tests {
             project: None,
             threads: None,
             fail_fast: false,
+            only_breaking: false,
             quiet: false,
             no_sha_pin_proposals: false,
             offline: false,

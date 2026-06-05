@@ -36,10 +36,10 @@ mod tag_utils;
 
 pub use apply::rewrite_uses_in_workflow;
 pub use manifest_discovery::collect_uses_references;
-pub(crate) use propose::{build_action_proposals, explain_action_bump, filter_ignored_actions};
+pub(crate) use propose::{build_action_proposals, explain_action_proposal, filter_ignored_actions};
 
 #[cfg(test)]
-use propose::{aggregate_actions_from_manifests, classify_action_bump};
+use propose::{aggregate_actions_from_manifests, classify_action_bump, explain_action_bump};
 #[cfg(test)]
 use tag_utils::{count_version_segments, is_likely_commit_sha, tag_specificity, truncate_tag};
 
@@ -154,10 +154,21 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
         Ok(filter_ignored_actions(proposals, &ctx.ignored_subjects))
     }
 
-    fn gate_workflows(&self, _proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
-        // A `uses:` bump only affects the workflows that reference it; the
-        // Validator narrows the set after consulting `Proposal.manifest_paths`.
-        Ok(Vec::new())
+    fn gate_workflows(&self, proposal: &Proposal, _repo: &Path) -> Result<Vec<PathBuf>> {
+        // A `uses:` bump should validate the workflow files that actually
+        // reference the action. Composite-action manifests can also contain
+        // `uses:` entries, but they are not runnable workflows themselves;
+        // keep those as "unvalidated" until assay learns how to resolve
+        // workflow -> local composite-action call graphs.
+        let mut workflows: Vec<PathBuf> = proposal
+            .manifest_paths
+            .iter()
+            .filter(|path| is_workflow_manifest_path(path))
+            .cloned()
+            .collect();
+        workflows.sort();
+        workflows.dedup();
+        Ok(workflows)
     }
 
     fn affected_consumers(
@@ -258,6 +269,26 @@ impl DependencyEcosystem for GitHubActionsEcosystem {
             classification = outcome.classification.as_str(),
         )
     }
+}
+
+fn is_workflow_manifest_path(path: &Path) -> bool {
+    let is_yaml = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
+    if !is_yaml {
+        return false;
+    }
+
+    let mut components = path.components().filter_map(|component| match component {
+        std::path::Component::Normal(part) => part.to_str(),
+        std::path::Component::CurDir => None,
+        _ => None,
+    });
+    matches!(
+        (components.next(), components.next()),
+        (Some(".github"), Some("workflows"))
+    )
 }
 
 /// Whether an action is currently pinned by SHA or by tag.
@@ -714,6 +745,66 @@ jobs:
             manifests[0].kind,
             ManifestKind::CompositeActionYaml
         ));
+    }
+
+    #[test]
+    fn gate_workflows_returns_manifest_workflows_for_action_bump() {
+        let proposal = Proposal {
+            id: "gha-actions-checkout".into(),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: "v4".into(),
+            to: "v6".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![
+                PathBuf::from(".github/workflows/release.yml"),
+                PathBuf::from(".github/workflows/ci.yml"),
+                PathBuf::from(".github/workflows/ci.yml"),
+            ],
+            notes: Vec::new(),
+            bump_tier: BumpTier::Breaking,
+            affected_consumers: Vec::new(),
+            explanation: None,
+            cohort: None,
+        };
+
+        let workflows = GitHubActionsEcosystem
+            .gate_workflows(&proposal, Path::new("."))
+            .unwrap();
+
+        assert_eq!(
+            workflows,
+            vec![
+                PathBuf::from(".github/workflows/ci.yml"),
+                PathBuf::from(".github/workflows/release.yml")
+            ]
+        );
+    }
+
+    #[test]
+    fn gate_workflows_does_not_treat_composite_action_manifest_as_runnable_workflow() {
+        let proposal = Proposal {
+            id: "gha-actions-checkout".into(),
+            ecosystem: "github-actions".into(),
+            kind: ProposalKind::ActionPin,
+            subject: "actions/checkout".into(),
+            from: "v4".into(),
+            to: "v6".into(),
+            initial_classification: Classification::Exact,
+            manifest_paths: vec![PathBuf::from(".github/actions/build/action.yml")],
+            notes: Vec::new(),
+            bump_tier: BumpTier::Breaking,
+            affected_consumers: Vec::new(),
+            explanation: None,
+            cohort: None,
+        };
+
+        let workflows = GitHubActionsEcosystem
+            .gate_workflows(&proposal, Path::new("."))
+            .unwrap();
+
+        assert!(workflows.is_empty());
     }
 
     // -------------------------------------------------------------------------
@@ -1229,6 +1320,55 @@ jobs:
         assert!(
             proposals.iter().all(|p| p.to != info.commit_sha),
             "no SHA-pin proposal should appear when sha_pin_proposals=false"
+        );
+    }
+
+    #[test]
+    fn build_action_proposals_explains_sha_bump_from_tag_comment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = crate::ecosystem::github_actions_api::GitHubApiClient::new()
+            .with_binary(std::path::PathBuf::from("__never_invoked__"))
+            .with_cache_root(tmp.path().to_path_buf())
+            .with_offline_mode(true);
+        let info = crate::ecosystem::github_actions_api::ReleaseInfo {
+            tag_name: "v1".into(),
+            commit_sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+        };
+        client
+            .write_release_cache("dtolnay", "rust-toolchain", &info)
+            .unwrap();
+
+        let current_sha = "0123456789abcdef0123456789abcdef01234567";
+        let m = manifest_with_uses(
+            ".github/workflows/ci.yml",
+            vec![sha_pinned_ref(
+                "dtolnay",
+                "rust-toolchain",
+                current_sha,
+                Some("1.85.0"),
+            )],
+        );
+        let proposals = build_action_proposals(&[m], &client, false);
+
+        let proposal = proposals
+            .iter()
+            .find(|p| p.subject == "dtolnay/rust-toolchain")
+            .expect("expected rust-toolchain proposal");
+        assert_eq!(proposal.from, current_sha);
+        assert_eq!(proposal.to, info.commit_sha);
+        assert_eq!(proposal.bump_tier, BumpTier::Breaking);
+        let explanation = proposal
+            .explanation
+            .as_ref()
+            .expect("GitHub Actions proposals should carry rationale");
+        assert_eq!(explanation.rule, "gha:ref-shape-loosening");
+        assert_eq!(
+            explanation.inputs.get("from_tag").map(String::as_str),
+            Some("1.85.0")
+        );
+        assert_eq!(
+            explanation.inputs.get("to_tag").map(String::as_str),
+            Some("v1")
         );
     }
 

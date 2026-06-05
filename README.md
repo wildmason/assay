@@ -47,6 +47,14 @@ Validate every proposal against the project's CI workflows without committing or
 assay analyze --validate
 ```
 
+After a dry run surfaces major-version or other breaking-risk bumps, validate just those high-risk proposals:
+
+```sh
+assay analyze --validate --only-breaking
+```
+
+`Breaking` is a risk classification, not proof that the repository fails. `--only-breaking` applies only those proposals in isolated sandboxes and runs the repo gates so the report can distinguish "breaking risk, no regression observed" from "breaking risk, failed this repo's CI".
+
 Then commit the validated-green set to the current branch:
 
 ```sh
@@ -111,9 +119,11 @@ Every proposal is tagged with a `BumpTier`:
 - `Compatible` — within caret-compat group (same major for `1.0+`, same minor for `0.x`) but outside the current constraint; needs manifest edit.
 - `Breaking` — crosses semver boundaries; needs manifest edit AND is breaking-by-spec.
 
+Use `--validate --only-breaking` to turn that risk classification into repo-specific evidence. A passing validation means "no regression observed under this repo's configured gates"; it does not prove the dependency is universally safe.
+
 ### Verdict cache
 
-Validator outcomes are content-addressed on `(post-apply manifest hash, post-apply lockfile hash, workflow hash, backend, event)` and cached under `<repo>/.assay/verdict-cache/`. Identical post-apply state on a re-run short-circuits the gate workflow entirely. Only deterministic verdicts (`Pass` / `Regression`) are cached — `SetupFailure` / `Timeout` are environment-dependent and always re-run.
+Validator outcomes are content-addressed on `(post-apply workspace tree hash, workflow hash, backend, event)` and cached under `<repo>/.assay/verdict-cache/`. Identical post-apply state on a re-run short-circuits the gate workflow entirely; source, test, manifest, lockfile, and workflow edits invalidate the key. Only deterministic verdicts (`Pass` / `Regression`) are cached — `SetupFailure` / `Timeout` are environment-dependent and always re-run.
 
 ```sh
 # First run: 0 cached / 3 fresh
@@ -129,7 +139,9 @@ assay analyze --validate --cache-ttl 30m
 
 ### `--explain` mode
 
-Every proposal gets a structured rationale rendered inline:
+Breaking proposals render their structured rationale by default. Use
+`--explain` when you want every proposal to include the classifier rule
+that produced its tier:
 
 ```sh
 assay analyze --explain
@@ -140,7 +152,7 @@ assay analyze --explain
       [cargo:caret-major-1-plus] cargo: 1.0+ band — caret groups by major; both versions share major=1, so only the manifest pin keeps cargo from bumping (Compatible)
 ```
 
-Stable rule keys (`cargo:caret-major-1-plus`, `gha:ref-shape-loosening`, `npm:caret-0-x-minor-crossed`, etc.) make the classifier output greppable and audit-friendly. Receipts persist the full `BumpExplanation { rule, summary, inputs, decision }` for downstream tooling.
+Stable rule keys (`cargo:caret-major-1-plus`, `gha:ref-shape-loosening`, `npm:caret-0-x-minor-crossed`, etc.) make the classifier output greppable and audit-friendly. Receipts persist the full `BumpExplanation { rule, summary, inputs, decision }` whenever a rationale is attached.
 
 ### `--member-gate` mode
 

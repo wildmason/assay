@@ -10,9 +10,9 @@
 //! The cache short-circuits that. The key is a SHA-256 over
 //! `(schema_version, backend_name, event, workspace_fingerprint,
 //! workflow_fingerprint)` where the two fingerprints are themselves
-//! SHA-256 over the post-apply manifest+lockfile contents and the
-//! workflow file content (or the canonicalized backend command list for
-//! tree-mode backends). On hit the cached outcome is rendered into a
+//! SHA-256 over the post-apply workspace tree and the workflow file
+//! content (or the canonicalized backend command list for tree-mode
+//! backends). On hit the cached outcome is rendered into a
 //! `WorkflowOutcome` and tagged `cached_at` so the report can surface it.
 //!
 //! Only deterministic verdicts (`Pass` and `Regression`) are cached.
@@ -35,7 +35,7 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Inputs that derive a [`CacheKey`]. Caller is responsible for hashing
-/// the manifest+lockfile contents into `workspace_fingerprint` and the
+/// the post-apply workspace tree into `workspace_fingerprint` and the
 /// workflow file content (or backend command signature) into
 /// `workflow_fingerprint` first.
 #[derive(Debug, Clone)]
@@ -234,8 +234,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// SHA-256 fingerprint of the post-apply workspace state — manifest
-/// and lockfile contents in the order they're provided. Files that
+/// SHA-256 fingerprint of selected post-apply workspace files in the
+/// order they're provided. Files that
 /// don't exist contribute an empty section, so a missing lockfile
 /// produces a stable (different) fingerprint from a present-but-empty
 /// one.
@@ -246,7 +246,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// fingerprint would change every invocation and the cache would never
 /// hit. Ordering of the input slice is significant — callers must
 /// supply files in a stable order across runs (the validator uses the
-/// `WORKSPACE_FINGERPRINT_FILES` constant).
+/// a stable order).
 pub fn fingerprint_workspace_files(files: &[&Path]) -> String {
     let mut hasher = Sha256::new();
     for file in files {
@@ -268,6 +268,116 @@ pub fn fingerprint_workspace_files(files: &[&Path]) -> String {
         hasher.update([0u8]);
     }
     hex_encode(&hasher.finalize())
+}
+
+/// SHA-256 fingerprint of the post-apply workspace tree.
+///
+/// This is intentionally broader than the historical manifest+lockfile
+/// fingerprint: validation verdicts are only reusable when the source,
+/// tests, config, manifests, and locks visible to the gate are identical.
+/// Transient/generated directories are skipped so local build artifacts
+/// do not make the cache useless.
+pub fn fingerprint_workspace_tree(root: &Path) -> String {
+    let mut files = Vec::new();
+    collect_fingerprint_files(root, root, &mut files);
+    files.sort_by(|a, b| a.relative.cmp(&b.relative));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"assay:workspace-tree:v1");
+    hasher.update([0u8]);
+    for file in files {
+        hasher.update(
+            file.relative
+                .to_string_lossy()
+                .replace('\\', "/")
+                .as_bytes(),
+        );
+        hasher.update([0u8]);
+        match file.kind {
+            FingerprintFileKind::Regular(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    hasher.update(b"file");
+                    hasher.update([0u8]);
+                    hasher.update((bytes.len() as u64).to_le_bytes());
+                    hasher.update(&bytes);
+                }
+                Err(_) => {
+                    hasher.update(b"unreadable");
+                }
+            },
+            FingerprintFileKind::SymlinkTarget(target) => {
+                hasher.update(b"symlink");
+                hasher.update([0u8]);
+                hasher.update(target.to_string_lossy().replace('\\', "/").as_bytes());
+            }
+        }
+        hasher.update([0u8]);
+    }
+    hex_encode(&hasher.finalize())
+}
+
+#[derive(Debug)]
+struct FingerprintFile {
+    relative: PathBuf,
+    kind: FingerprintFileKind,
+}
+
+#[derive(Debug)]
+enum FingerprintFileKind {
+    Regular(PathBuf),
+    SymlinkTarget(PathBuf),
+}
+
+fn collect_fingerprint_files(root: &Path, dir: &Path, out: &mut Vec<FingerprintFile>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let relative = path
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.clone());
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if should_skip_fingerprint_path(&name, &meta) {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_fingerprint_files(root, &path, out);
+        } else if meta.is_file() {
+            out.push(FingerprintFile {
+                relative,
+                kind: FingerprintFileKind::Regular(path),
+            });
+        } else if let Ok(target) = std::fs::read_link(&path) {
+            out.push(FingerprintFile {
+                relative,
+                kind: FingerprintFileKind::SymlinkTarget(target),
+            });
+        }
+    }
+}
+
+fn should_skip_fingerprint_path(name: &std::ffi::OsStr, meta: &std::fs::Metadata) -> bool {
+    if matches!(name.to_str(), Some(".git")) {
+        return true;
+    }
+    meta.is_dir()
+        && matches!(
+            name.to_str(),
+            Some(".assay")
+                | Some(".ci-forge")
+                | Some("target")
+                | Some("node_modules")
+                | Some("dist")
+                | Some("build")
+                | Some("coverage")
+        )
 }
 
 /// SHA-256 fingerprint of a single file's contents. Returns the

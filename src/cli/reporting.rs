@@ -49,7 +49,10 @@ pub(super) fn tier_counts<'a>(
 ///   breaking (crosses semver-major; manifest edit applied):
 ///     serde  1.0.215 -> 2.0.0
 /// ```
-pub(super) fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &'a Proposal>) {
+pub(super) fn print_discovered_section<'a>(
+    proposals: impl IntoIterator<Item = &'a Proposal>,
+    show_all_explanations: bool,
+) {
     use crate::model::BumpTier;
     let mut lockfile_only: Vec<&Proposal> = Vec::new();
     let mut compatible: Vec<&Proposal> = Vec::new();
@@ -78,7 +81,7 @@ pub(super) fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &
             return;
         }
         println!("  {label}:");
-        print_group_with_cohorts(&group);
+        print_group_with_cohorts(&group, show_all_explanations);
     };
     if lockfile_has_cohort {
         print_group("lockfile-only", lockfile_only);
@@ -95,7 +98,7 @@ pub(super) fn print_discovered_section<'a>(proposals: impl IntoIterator<Item = &
 /// project has half a dozen lockfile-only minor bumps; previously the
 /// reader had to mentally regroup them. See the 2026-05-20 dogfood
 /// against slate/aegis/wildmason.dev where this gap surfaced 3×.
-fn print_group_with_cohorts(group: &[&Proposal]) {
+fn print_group_with_cohorts(group: &[&Proposal], show_all_explanations: bool) {
     use std::collections::BTreeMap;
     let mut by_cohort: BTreeMap<String, Vec<&Proposal>> = BTreeMap::new();
     let mut standalone: Vec<&Proposal> = Vec::new();
@@ -116,12 +119,12 @@ fn print_group_with_cohorts(group: &[&Proposal]) {
         if members.len() == 1 {
             standalone.push(members.into_iter().next().unwrap());
         } else {
-            print_cohort_block(&cohort_id, &members);
+            print_cohort_block(&cohort_id, &members, show_all_explanations);
         }
     }
     standalone.sort_by(|a, b| a.subject.cmp(&b.subject));
     for p in standalone {
-        print_single_proposal_line(p);
+        print_single_proposal_line(p, show_all_explanations);
     }
 }
 
@@ -130,7 +133,7 @@ fn print_group_with_cohorts(group: &[&Proposal]) {
 /// different versions (e.g. `@angular/cdk` lags `@angular/core` by 2
 /// patches in some Angular releases) and a single version when they
 /// all converge.
-fn print_cohort_block(cohort_id: &str, members: &[&Proposal]) {
+fn print_cohort_block(cohort_id: &str, members: &[&Proposal], show_all_explanations: bool) {
     let display = crate::ecosystem::npm_cohorts::KNOWN_COHORTS
         .iter()
         .find(|c| c.id == cohort_id)
@@ -156,22 +159,30 @@ fn print_cohort_block(cohort_id: &str, members: &[&Proposal]) {
         }
         line.push_str(&format_consumers_suffix(&p.affected_consumers));
         println!("{line}");
-        if let Some(exp) = &p.explanation {
+        if should_print_explanation(p, show_all_explanations)
+            && let Some(exp) = &p.explanation
+        {
             println!("        [{}] {}", exp.rule, exp.summary);
         }
     }
 }
 
-fn print_single_proposal_line(p: &Proposal) {
+fn print_single_proposal_line(p: &Proposal, show_all_explanations: bool) {
     let mut line = format!("    {}  {} -> {}", p.subject, p.from, p.to);
     if !p.notes.is_empty() {
         line.push_str(&format!("  [{}]", p.notes.join(", ")));
     }
     line.push_str(&format_consumers_suffix(&p.affected_consumers));
     println!("{line}");
-    if let Some(exp) = &p.explanation {
+    if should_print_explanation(p, show_all_explanations)
+        && let Some(exp) = &p.explanation
+    {
         println!("      [{}] {}", exp.rule, exp.summary);
     }
+}
+
+fn should_print_explanation(p: &Proposal, show_all_explanations: bool) -> bool {
+    show_all_explanations || matches!(p.bump_tier, crate::model::BumpTier::Breaking)
 }
 
 /// Display a set of version strings as either a single value (when

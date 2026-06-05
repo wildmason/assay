@@ -55,7 +55,7 @@ pub(super) enum WorkerOutcome {
     /// could run.
     PreValidationFailure {
         eco_idx: usize,
-        proposal: Proposal,
+        proposals: Vec<Proposal>,
         provenance: Vec<ProvenanceRecord>,
         /// One-line reason carried separately from the provenance
         /// records so the reporter can render per-failed-proposal
@@ -66,7 +66,7 @@ pub(super) enum WorkerOutcome {
     /// recognized manifest).
     ValidatorErrored {
         eco_idx: usize,
-        proposal: Proposal,
+        proposals: Vec<Proposal>,
         provenance: Vec<ProvenanceRecord>,
         summary: String,
     },
